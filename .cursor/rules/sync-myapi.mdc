@@ -1,0 +1,31 @@
+---
+description: 代码变更后同步到 C:\Users\zhuxd\myapi 再 git 推送
+alwaysApply: true
+---
+
+# 开发与 Git 提交目录
+
+- **开发目录**：本仓库 `financial-product-bs`（工作区）
+- **Git 提交目录**：`C:\Users\zhuxd\myapi`（推送到 GitHub / Render）
+
+完成会影响部署的功能改动后，**必须**将代码同步到 myapi，再让用户在 myapi 内 commit/push（除非用户明确只在工作区提交）。
+
+## 同步方式
+
+运行（PowerShell，仓库根目录）：
+
+```powershell
+.\scripts\Sync-ToMyapi.ps1
+```
+
+脚本会镜像复制到 myapi，**保留**目标 `.git`，**不复制** `.env`、`.venv`、`server-data`、`.turso` 等。
+
+## 助手职责
+
+在会话中修改了应用代码、模板、脚本或 `render.yaml` 后：
+
+1. 执行 `Sync-ToMyapi.ps1`（或等价的 `Copy-Item` / `robocopy`，规则同上）
+2. 告知用户到 `~/myapi` 执行 `git status` → `git add` → `commit` → `push`
+3. 不要只改工作区而不同步 myapi
+
+用户未要求时**不要**代替用户 `git commit`，除非用户明确要求提交。
