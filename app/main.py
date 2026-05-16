@@ -1364,8 +1364,15 @@ def on_startup():
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    init_database()
-    wind_sql.init_wind_backend()
+    try:
+        init_database()
+    except Exception as e:
+        _log.critical("数据库初始化失败（请检查 TURSO_DATABASE_URL / TURSO_AUTH_TOKEN）: %s", e)
+        raise
+    try:
+        wind_sql.init_wind_backend()
+    except Exception as e:
+        _log.warning("Wind 初始化异常（已忽略，服务继续启动）: %s", e)
     from app.db import SessionLocalFactory
 
     db = SessionLocalFactory()
@@ -1408,12 +1415,22 @@ def on_startup():
 
     _svc._job_running = False
 
-    cron_parts = settings.daily_job_cron.split()
-    trigger = CronTrigger(
-        minute=cron_parts[0], hour=cron_parts[1], day=cron_parts[2], month=cron_parts[3], day_of_week=cron_parts[4]
-    )
-    scheduler.add_job(_scheduled_update, trigger=trigger, id="daily_update", replace_existing=True)
-    scheduler.start()
+    cron_raw = (settings.daily_job_cron or "").split()
+    if len(cron_raw) != 5:
+        _log.warning(
+            "DAILY_JOB_CRON 格式无效（需 5 段：分 时 日 月 星期），已跳过定时任务: %r",
+            settings.daily_job_cron,
+        )
+    else:
+        trigger = CronTrigger(
+            minute=cron_raw[0],
+            hour=cron_raw[1],
+            day=cron_raw[2],
+            month=cron_raw[3],
+            day_of_week=cron_raw[4],
+        )
+        scheduler.add_job(_scheduled_update, trigger=trigger, id="daily_update", replace_existing=True)
+        scheduler.start()
 
 
 @app.on_event("shutdown")

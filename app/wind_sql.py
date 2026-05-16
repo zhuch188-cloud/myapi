@@ -93,9 +93,12 @@ def init_wind_backend() -> str:
     except Exception as e:
         _wind_engine = None
         _wind_ready = False
-        raise RuntimeError(
-            f"Wind 远程 SQL Server 连接失败（已禁用 MySQL 回退）。请检查网络、账号与 ODBC 驱动。原因: {e}"
-        ) from e
+        logger.warning(
+            "Wind: SQL Server 连接失败，已跳过（Render/Linux 通常无 ODBC 驱动或内网不可达；"
+            "「立即更新」等依赖 Wind 的功能暂不可用）。原因: %s",
+            e,
+        )
+        return "disabled"
     return "mssql"
 
 
