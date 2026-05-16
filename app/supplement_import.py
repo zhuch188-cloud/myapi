@@ -49,7 +49,7 @@ _ENTITY_COLUMN_CANDIDATES = [
 ]
 
 
-def default_company_profile_exlsx_path() -> str:
+def default_company_profile_xlsx_path() -> str:
     from app.server_files import resolve_supplement_upload_path
 
     server_p = resolve_supplement_upload_path(CODE_COMPANY_PROFILE_EXCEL)
