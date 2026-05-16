@@ -59,15 +59,24 @@ def _wind_code_key(code) -> str:
 
 
 def _row_sql_date(v: object) -> date | None:
-    """MySQL DATE/DATETIME 等转为 date，便于比较调仓日与快照日。"""
+    """库表 DATE/TEXT 等转为 date，便于比较调仓日与快照日（Turso 常返回 str）。"""
     if v is None:
         return None
     if isinstance(v, datetime):
         return v.date()
     if isinstance(v, date):
         return v
+    s = str(v).strip()
+    if not s:
+        return None
+    compact = s.replace("-", "").replace("/", "")[:8]
+    if len(compact) == 8 and compact.isdigit():
+        try:
+            return datetime.strptime(compact, "%Y%m%d").date()
+        except ValueError:
+            pass
     try:
-        return datetime.fromisoformat(str(v).strip()[:10]).date()
+        return datetime.fromisoformat(s[:10]).date()
     except ValueError:
         return None
 
@@ -1259,7 +1268,9 @@ def _batch_nav_mysql_plans(db: Session, strategy_ids: list[str], _mode_l: str) -
         rb_map: dict[date, list[tuple[str, float]]] = {}
         code_set: set[str] = set()
         for r in rows:
-            rd = r["rebalance_date"]
+            rd = _row_sql_date(r["rebalance_date"])
+            if rd is None:
+                continue
             sc = str(r["stock_code"]).strip().upper()
             w = float(r.get("holding_weight") or 0.0)
             rb_map.setdefault(rd, []).append((sc, w))
