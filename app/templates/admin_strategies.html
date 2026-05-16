@@ -147,8 +147,27 @@
         selectedSidSet = new Set();
         strategyMap = new Map(items.map((x) => [String(x.strategy_id || ""), x]));
         document.getElementById("adminCfgTable").innerHTML = `
-          <thead><tr><th>勾选</th><th>可见</th><th>策略ID</th><th>显示名</th><th>分类</th><th>调仓频率</th><th>文件目录</th><th>文件名</th><th>权重模式</th><th>基准代码</th><th>基准名称</th><th>状态</th><th>来源</th><th>备注</th><th>更新时间</th></tr></thead>
-          <tbody>${items.map(i => `<tr><td><input type="checkbox" class="sid-check" value="${i.strategy_id||""}" data-sid="${i.strategy_id||""}" onchange="onSidCheck(this)" onclick="onSidCheck(this)" /></td><td>${i.is_visible ? "是" : "否"}</td><td>${i.strategy_id||"-"}</td><td>${i.strategy_name||"-"}</td><td>${i.strategy_category||""}</td><td>${i.rebalance_frequency||""}</td><td>${i.file_dir||""}</td><td>${i.file_name||"-"}</td><td>holding（固定）</td><td>${i.benchmark_code||"-"}</td><td>${i.benchmark_name||"-"}</td><td>${i.status||"-"}</td><td>${i.source||"-"}</td><td>${i.remark||""}</td><td>${i.updated_at||"-"}</td></tr>`).join("")}</tbody>`;
+          <thead><tr><th>勾选</th><th>可见</th><th>策略ID</th><th>显示名</th><th>分类</th><th>调仓频率</th><th>文件目录</th><th>文件名</th><th>文件存在</th><th>基准代码</th><th>基准名称</th><th>状态</th><th>来源</th><th>备注</th><th>文件时间</th></tr></thead>
+          <tbody>${items.map(i => {
+            const fileOk = !!i.file_exists;
+            return `<tr>
+              <td><input type="checkbox" class="sid-check" value="${esc(i.strategy_id||"")}" data-sid="${esc(i.strategy_id||"")}" onchange="onSidCheck(this)" onclick="onSidCheck(this)" /></td>
+              <td>${i.is_visible ? "是" : "否"}</td>
+              <td>${esc(i.strategy_id||"-")}</td>
+              <td>${esc(i.strategy_name||"-")}</td>
+              <td>${esc(i.strategy_category||"")}</td>
+              <td>${esc(i.rebalance_frequency||"")}</td>
+              <td>${esc(i.file_dir||"")}</td>
+              <td>${esc(i.file_name||"-")}</td>
+              <td style="color:${fileOk ? "#0a7a2f" : "#c62828"}">${fileOk ? "是" : "否"}</td>
+              <td>${esc(i.benchmark_code||"-")}</td>
+              <td>${esc(i.benchmark_name||"-")}</td>
+              <td>${esc(i.status||"-")}</td>
+              <td>${esc(i.source||"-")}</td>
+              <td>${esc(i.remark||"")}</td>
+              <td>${esc(i.file_mtime || (fileOk ? "" : "—"))}</td>
+            </tr>`;
+          }).join("")}</tbody>`;
         refreshSelectedInfo();
       }
       function onSidCheck(el) {

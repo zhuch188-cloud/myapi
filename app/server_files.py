@@ -207,6 +207,23 @@ def match_strategy_id_for_upload_filename(
     return None
 
 
+def strategy_excel_file_status(file_dir: str | None, file_name: str | None) -> dict[str, Any]:
+    """解析策略 Excel 是否存在及本机修改时间（用于管理端列表展示）。"""
+    fn = (file_name or "").strip()
+    if not fn:
+        return {"file_exists": False, "file_path": "", "file_mtime": None}
+    try:
+        path = resolve_strategy_excel_path(file_dir, fn)
+    except ValueError:
+        return {"file_exists": False, "file_path": "", "file_mtime": None}
+    p = Path(path)
+    if not p.is_file():
+        return {"file_exists": False, "file_path": path, "file_mtime": None}
+    st = p.stat()
+    mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return {"file_exists": True, "file_path": path, "file_mtime": mtime}
+
+
 def resolve_strategy_excel_path(file_dir: str | None, file_name: str) -> str:
     """
     解析策略 Excel 绝对路径。

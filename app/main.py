@@ -1439,22 +1439,19 @@ def _scheduled_update():
 @app.get("/health")
 def health():
     wind_ok = wind_sql.use_remote_sqlserver()
+    wind_st = wind_sql.wind_status()
     turso_url = (settings.turso_database_url or "").strip()
     db_ready = is_ready()
     err = boot_error()
     return {
-        "ok": db_ready and not err,
+        "ok": db_ready and not err and (not wind_st.get("configured") or wind_ok),
         "db_ready": db_ready,
         "db_error": err,
         "service": "strategy-showcase-python",
         "turso_configured": bool(turso_url and (settings.turso_auth_token or "").strip()),
         "wind_data_source": "sqlserver" if wind_ok else "disabled",
         "wind_sqlserver_ready": wind_ok,
-        "wind_sqlserver": {
-            "server": settings.wind_sqlserver_server,
-            "port": settings.wind_sqlserver_port,
-            "database": settings.wind_sqlserver_database,
-        },
+        "wind_sqlserver": wind_st,
     }
 
 
@@ -3325,7 +3322,17 @@ def list_admin_strategies(user=Depends(require_roles("admin", "editor")), db: Se
             """
         )
     ).mappings().all()
-    return {"items": [dict(r) for r in rows]}
+    from app.server_files import strategy_excel_file_status
+
+    items: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        st = strategy_excel_file_status(d.get("file_dir"), d.get("file_name"))
+        d["file_exists"] = bool(st.get("file_exists"))
+        d["file_mtime"] = st.get("file_mtime")
+        d["file_resolved_path"] = st.get("file_path") or ""
+        items.append(d)
+    return {"items": items}
 
 
 @app.get("/api/admin/strategies/export")

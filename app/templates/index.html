@@ -226,8 +226,8 @@
           const t = document.getElementById("adminCfgTable");
           t.innerHTML = `
             <thead><tr>
-              <th>策略ID</th><th>显示名</th><th>文件目录</th><th>文件名</th><th>权重模式</th>
-              <th>基准代码</th><th>基准名称</th><th>可见</th><th>状态</th><th>更新时间</th>
+              <th>策略ID</th><th>显示名</th><th>文件目录</th><th>文件名</th><th>文件存在</th>
+              <th>基准代码</th><th>基准名称</th><th>可见</th><th>状态</th><th>文件时间</th>
             </tr></thead>
             <tbody>
               ${items.map(i => `<tr>
@@ -235,12 +235,12 @@
                 <td>${i.strategy_name || "-"}</td>
                 <td>${i.file_dir || ""}</td>
                 <td>${i.file_name || "-"}</td>
-                <td>holding（固定）</td>
+                <td>${i.file_exists ? "是" : "否"}</td>
                 <td>${i.benchmark_code || "-"}</td>
                 <td>${i.benchmark_name || "-"}</td>
                 <td>${i.is_visible ? "是" : "否"}</td>
                 <td>${i.status || "-"}</td>
-                <td>${i.updated_at || "-"}</td>
+                <td>${i.file_mtime || (i.file_exists ? "" : "—")}</td>
               </tr>`).join("")}
             </tbody>
           `;

@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 _wind_engine: Engine | None = None
 _wind_ready: bool = False
+_wind_last_error: str | None = None
 
 
 def _parse_sqlserver_host_port(server_raw: str, default_port: int) -> tuple[str, int]:
@@ -40,9 +41,37 @@ def _normalize_odbc_driver(driver_raw: str) -> str:
     return d
 
 
+def wind_status() -> dict[str, Any]:
+    """供 /health 展示：含解析后的 host/port 与最近一次连接错误。"""
+    server_raw = (settings.wind_sqlserver_server or "").strip()
+    host, port = _parse_sqlserver_host_port(
+        server_raw, int(settings.wind_sqlserver_port or 1433)
+    )
+    drivers: list[str] = []
+    try:
+        import pyodbc
+
+        drivers = list(pyodbc.drivers())
+    except Exception as ex:
+        drivers = [f"(pyodbc.drivers failed: {ex})"]
+    return {
+        "configured": bool(server_raw),
+        "ready": use_remote_sqlserver(),
+        "host": host,
+        "port": port,
+        "database": (settings.wind_sqlserver_database or "winddb").strip(),
+        "driver": _normalize_odbc_driver(
+            settings.wind_sqlserver_driver or "ODBC Driver 17 for SQL Server"
+        ),
+        "odbc_drivers_installed": drivers,
+        "last_error": _wind_last_error,
+    }
+
+
 def init_wind_backend() -> str:
     """应用启动时调用：已配置服务器则连接 SQL Server；未配置则跳过（便于本地仅连 MySQL）。"""
-    global _wind_engine, _wind_ready
+    global _wind_engine, _wind_ready, _wind_last_error
+    _wind_last_error = None
     if _wind_ready and _wind_engine is not None:
         return "mssql"
     server_raw = (settings.wind_sqlserver_server or "").strip()
@@ -93,9 +122,11 @@ def init_wind_backend() -> str:
     except Exception as e:
         _wind_engine = None
         _wind_ready = False
+        _wind_last_error = str(e)
         logger.warning(
-            "Wind: SQL Server 连接失败，已跳过（Render/Linux 通常无 ODBC 驱动或内网不可达；"
-            "「立即更新」等依赖 Wind 的功能暂不可用）。原因: %s",
+            "Wind: SQL Server 连接失败（%s:%s），已跳过；原因: %s",
+            host,
+            port,
             e,
         )
         return "disabled"
