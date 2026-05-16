@@ -56,10 +56,16 @@
         </div>
         <div class="row">
           <input id="strategyDataUploadFile" type="file" accept=".xlsx,.xls,.xlsm" style="display:none" />
-          <button type="button" class="secondary" onclick="document.getElementById('strategyDataUploadFile').click()">选择策略 Excel</button>
-          <button type="button" class="secondary" onclick="uploadStrategyDataFile()">上传到服务器（覆盖）</button>
-          <span class="muted" style="font-size:12px">需先填 strategy_id；上传后自动更新 file_dir/file_name（Render 上为 strategies/策略ID/）</span>
+          <input id="strategyBatchUploadFiles" type="file" accept=".xlsx,.xls,.xlsm" multiple style="display:none" />
+          <button type="button" class="secondary" onclick="document.getElementById('strategyDataUploadFile').click()">选择单个 Excel</button>
+          <button type="button" class="secondary" onclick="uploadStrategyDataFile()">上传单个（覆盖）</button>
+          <button type="button" class="secondary" onclick="document.getElementById('strategyBatchUploadFiles').click()">选择多个 Excel</button>
+          <button type="button" class="secondary" onclick="batchUploadStrategyDataFiles()">批量上传到服务器</button>
+          <button type="button" class="secondary" onclick="normalizeUploadPaths()">修正全部 file_dir</button>
         </div>
+        <p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45;">
+          单条：填写 <code>strategy_id</code>，或<strong>仅勾选 1 个策略</strong>后上传。批量：文件名与 CSV 中 <code>file_name</code> 一致即可自动匹配。成功后 <code>file_dir</code> 为 <code>strategies/策略ID</code>（勿填 <code>./server-data</code>）。
+        </p>
         <div class="row" style="align-items:flex-start;flex-wrap:wrap;">
           <div class="muted" style="font-size:13px;line-height:1.5;max-width:720px;">
             <strong>权重模式</strong>：固定为 <code>holding</code>（<strong>持仓权重</strong>）。净值与持仓日快照均按持仓权重计算；Excel 仍可含「行业中性权重」列仅作记录，不参与净值。
@@ -307,11 +313,48 @@
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+      function resolveUploadStrategyId() {
+        let sid = (document.getElementById("strategy_id").value || "").trim();
+        if (sid) return sid;
+        const ids = selectedStrategyIds();
+        if (ids.length === 1) return ids[0];
+        return "";
+      }
+      async function normalizeUploadPaths() {
+        const msg = document.getElementById("msg");
+        try {
+          msg.textContent = "修正路径中…";
+          const ret = await api("/api/admin/strategies/normalize-upload-paths", { method: "POST" });
+          msg.textContent = `已修正 ${ret.updated || 0} 条 file_dir`;
+          loadAdminStrategies();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      async function batchUploadStrategyDataFiles() {
+        const msg = document.getElementById("msg");
+        const list = document.getElementById("strategyBatchUploadFiles").files;
+        if (!list || !list.length) { msg.textContent = "请先选择多个 Excel"; return; }
+        const fd = new FormData();
+        for (let i = 0; i < list.length; i++) fd.append("files", list[i]);
+        try {
+          msg.textContent = `批量上传 ${list.length} 个文件…`;
+          const res = await fetch("/api/admin/strategies/batch-upload-data-files", {
+            method: "POST",
+            headers: authHeaders({}),
+            body: fd,
+          });
+          if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+          const ret = await res.json();
+          const fails = (ret.results || []).filter((x) => !x.ok);
+          msg.textContent = `批量完成：成功 ${ret.uploaded || 0}，失败 ${ret.failed || 0}` +
+            (fails.length ? `；例：${fails[0].filename} — ${fails[0].error}` : "");
+          loadAdminStrategies();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
       async function uploadStrategyDataFile() {
         const msg = document.getElementById("msg");
-        const sid = (document.getElementById("strategy_id").value || "").trim();
+        const sid = resolveUploadStrategyId();
         const f = document.getElementById("strategyDataUploadFile").files && document.getElementById("strategyDataUploadFile").files[0];
-        if (!sid) { msg.textContent = "请先填写 strategy_id"; return; }
+        if (!sid) { msg.textContent = "请填写 strategy_id，或在列表中仅勾选 1 个策略"; return; }
         if (!f) { msg.textContent = "请先选择 Excel 文件"; return; }
         const fd = new FormData();
         fd.append("file", f);

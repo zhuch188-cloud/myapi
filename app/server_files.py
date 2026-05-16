@@ -166,6 +166,47 @@ def strategy_relative_dir(strategy_id: str) -> str:
     return f"strategies/{strategy_id.strip()}"
 
 
+def normalize_strategy_file_dir(strategy_id: str, file_dir: str | None) -> str:
+    """
+    Render（SERVER_UPLOAD_ROOT）下统一为 strategies/{strategy_id}；
+    忽略 CSV 里误填的 ./server-data、server-data 等。
+    """
+    sid = (strategy_id or "").strip()
+    fd = (file_dir or "").strip().replace("\\", "/").strip("/")
+    if not server_upload_enabled():
+        return fd
+    if not sid:
+        return fd
+    low = fd.lower()
+    if not fd or low in (".", "server-data", "./server-data") or not fd.startswith("strategies/"):
+        return strategy_relative_dir(sid)
+    return fd
+
+
+def match_strategy_id_for_upload_filename(
+    filename: str,
+    *,
+    configs: list[dict[str, Any]],
+) -> str | None:
+    """按 file_name 精确匹配，其次用文件名主干匹配 strategy_id。"""
+    fn = sanitize_filename(filename or "")
+    if not fn:
+        return None
+    by_name = {str(c.get("file_name") or "").strip(): str(c.get("strategy_id") or "").strip() for c in configs}
+    sid = by_name.get(fn)
+    if sid:
+        return sid
+    low_map = {k.lower(): v for k, v in by_name.items() if k}
+    sid = low_map.get(fn.lower())
+    if sid:
+        return sid
+    stem = Path(fn).stem
+    id_set = {str(c.get("strategy_id") or "").strip() for c in configs}
+    if stem in id_set:
+        return stem
+    return None
+
+
 def resolve_strategy_excel_path(file_dir: str | None, file_name: str) -> str:
     """
     解析策略 Excel 绝对路径。
@@ -183,6 +224,46 @@ def resolve_strategy_excel_path(file_dir: str | None, file_name: str) -> str:
     base = Path(str(settings.strategy_root_dir).strip()).expanduser()
     p = (base / fd / fn) if fd else (base / fn)
     return os.path.normpath(str(p))
+
+
+async def batch_upload_strategy_data_files(
+    uploads: list[UploadFile],
+    configs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """多文件上传：按 strategy_configs.file_name 或「文件名主干=strategy_id」匹配。"""
+    if not server_upload_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="未配置 SERVER_UPLOAD_ROOT，无法在服务器批量保存策略 Excel",
+        )
+    results: list[dict[str, Any]] = []
+    uploaded = 0
+    for upload in uploads:
+        raw_name = upload.filename or ""
+        sid = match_strategy_id_for_upload_filename(raw_name, configs=configs)
+        if not sid:
+            results.append(
+                {
+                    "ok": False,
+                    "filename": raw_name,
+                    "error": "未匹配到 strategy_id（请保证文件名与配置中 file_name 一致，或命名为 CL1.xlsx 等形式）",
+                }
+            )
+            continue
+        try:
+            ret = await upload_strategy_data_file(sid, upload)
+            uploaded += 1
+            results.append({"ok": True, "filename": raw_name, **ret})
+        except HTTPException as ex:
+            results.append({"ok": False, "filename": raw_name, "strategy_id": sid, "error": ex.detail})
+        except Exception as ex:
+            results.append({"ok": False, "filename": raw_name, "strategy_id": sid, "error": str(ex)})
+    return {
+        "ok": uploaded > 0,
+        "uploaded": uploaded,
+        "failed": len(results) - uploaded,
+        "results": results,
+    }
 
 
 async def upload_strategy_data_file(strategy_id: str, upload: UploadFile) -> dict[str, Any]:

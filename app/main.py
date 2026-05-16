@@ -21,11 +21,13 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
+from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
 from app.bg_threads import spawn_daemon
+from app.boot import boot_error, is_ready, start_background_boot
+from app.db import DatabaseNotReadyError
 
 _log = logging.getLogger(__name__)
 from app.access_logging import UserAccessLogMiddleware
@@ -67,11 +69,33 @@ from app.supplement_import import (
     run_import_by_code,
 )
 
-app = FastAPI(title=settings.app_name)
+_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+scheduler = BackgroundScheduler()
+
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+    start_background_boot(scheduler, _scheduled_update)
+    yield
+    if scheduler.running:
+        scheduler.shutdown()
+
+
+app = FastAPI(title=settings.app_name, lifespan=_app_lifespan)
 app.add_middleware(UserAccessLogMiddleware)
 app.add_middleware(SlidingJWTAccessMiddleware)
-templates = Jinja2Templates(directory="app/templates")
-scheduler = BackgroundScheduler()
+templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+
+@app.exception_handler(DatabaseNotReadyError)
+def _database_not_ready_handler(_request: Request, exc: DatabaseNotReadyError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
 _SID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _AUTO_USERNAME_PREFIX = "8"
 _AUTO_USERNAME_LEN = 9
@@ -729,6 +753,12 @@ def _risk_summary_from_login_counts(*, fail24h: int, success24h: int, fail7d: in
     return {"score": score, "level": level, "reasons": reasons}
 
 
+def _normalize_strategy_file_dir(strategy_id: str, file_dir: str | None) -> str:
+    from app.server_files import normalize_strategy_file_dir
+
+    return normalize_strategy_file_dir(strategy_id, file_dir)
+
+
 def _normalize_file_name(raw: str) -> str:
     """规范化 file_name：仅文件名、去空白、压缩重复片段、限制长度。"""
     s = str(raw or "").strip().replace("\\", "/")
@@ -1358,87 +1388,6 @@ def _require_visible_strategy(db: Session, strategy_id: str) -> dict:
     return dict(row)
 
 
-@app.on_event("startup")
-def on_startup():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
-    try:
-        init_database()
-    except Exception as e:
-        _log.critical("数据库初始化失败（请检查 TURSO_DATABASE_URL / TURSO_AUTH_TOKEN）: %s", e)
-        raise
-    try:
-        wind_sql.init_wind_backend()
-    except Exception as e:
-        _log.warning("Wind 初始化异常（已忽略，服务继续启动）: %s", e)
-    from app.db import SessionLocalFactory
-
-    db = SessionLocalFactory()
-    try:
-        db.execute(
-            text(
-                f"""
-                UPDATE strategy_update_jobs
-                SET status='FAILED', finished_at={sql_now()},
-                    message='stale RUNNING cleared on server startup'
-                WHERE status='RUNNING'
-                """
-            )
-        )
-        db.execute(
-            text(
-                """
-                UPDATE data_import_batches
-                SET status='FAILED',
-                    message=COALESCE(message, '') || '（服务重启：入队后未执行，已标失败；请重新导入或点续传）'
-                WHERE status='QUEUED'
-                """
-            )
-        )
-        db.execute(
-            text(
-                """
-                UPDATE data_import_batches
-                SET status='FAILED',
-                    message=COALESCE(message, '') || '（服务重启：导入中断，已标失败；可点续传）'
-                WHERE status='RUNNING'
-                """
-            )
-        )
-        db.commit()
-    finally:
-        db.close()
-
-    import app.services as _svc
-
-    _svc._job_running = False
-
-    cron_raw = (settings.daily_job_cron or "").split()
-    if len(cron_raw) != 5:
-        _log.warning(
-            "DAILY_JOB_CRON 格式无效（需 5 段：分 时 日 月 星期），已跳过定时任务: %r",
-            settings.daily_job_cron,
-        )
-    else:
-        trigger = CronTrigger(
-            minute=cron_raw[0],
-            hour=cron_raw[1],
-            day=cron_raw[2],
-            month=cron_raw[3],
-            day_of_week=cron_raw[4],
-        )
-        scheduler.add_job(_scheduled_update, trigger=trigger, id="daily_update", replace_existing=True)
-        scheduler.start()
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    if scheduler.running:
-        scheduler.shutdown()
-
-
 _SCHEDULED_UPDATE_MAX_ATTEMPTS = 5
 """每日定时任务内，单次调度最多执行更新次数（含首次）；失败后间隔几秒再试，避免瞬时故障。"""
 _SCHEDULED_UPDATE_RETRY_SLEEP_SEC = 8
@@ -1490,9 +1439,15 @@ def _scheduled_update():
 @app.get("/health")
 def health():
     wind_ok = wind_sql.use_remote_sqlserver()
+    turso_url = (settings.turso_database_url or "").strip()
+    db_ready = is_ready()
+    err = boot_error()
     return {
-        "ok": True,
+        "ok": db_ready and not err,
+        "db_ready": db_ready,
+        "db_error": err,
         "service": "strategy-showcase-python",
+        "turso_configured": bool(turso_url and (settings.turso_auth_token or "").strip()),
         "wind_data_source": "sqlserver" if wind_ok else "disabled",
         "wind_sqlserver_ready": wind_ok,
         "wind_sqlserver": {
@@ -1500,7 +1455,6 @@ def health():
             "port": settings.wind_sqlserver_port,
             "database": settings.wind_sqlserver_database,
         },
-        "business_db_host": settings.db_host,
     }
 
 
@@ -3315,7 +3269,7 @@ def upsert_strategy(
             "name": payload["strategy_name"],
             "source": payload.get("source", ""),
             "remark": payload.get("remark"),
-            "dir": payload.get("file_dir", ""),
+            "dir": _normalize_strategy_file_dir(strategy_id, payload.get("file_dir", "")),
             "file": normalized_file_name,
             "mode": _strategy_weight_display_mode_store(),
             "bcode": payload["benchmark_code"],
@@ -3327,6 +3281,33 @@ def upsert_strategy(
     )
     db.commit()
     return {"ok": True}
+
+
+@app.post("/api/admin/strategies/normalize-upload-paths")
+def admin_normalize_strategy_upload_paths(
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    """将 file_dir 统一为 strategies/{strategy_id}（修正 CSV 误填 ./server-data 等）。"""
+    _ = user
+    rows = db.execute(text("SELECT strategy_id, file_dir FROM strategy_configs")).mappings().all()
+    updated = 0
+    for r in rows:
+        sid = str(r.get("strategy_id") or "").strip()
+        if not sid:
+            continue
+        new_dir = _normalize_strategy_file_dir(sid, r.get("file_dir"))
+        old_dir = str(r.get("file_dir") or "").strip()
+        if new_dir != old_dir:
+            db.execute(
+                text(
+                    "UPDATE strategy_configs SET file_dir=:fd, updated_at=datetime('now') WHERE strategy_id=:sid"
+                ),
+                {"fd": new_dir, "sid": sid},
+            )
+            updated += 1
+    db.commit()
+    return {"ok": True, "updated": updated}
 
 
 @app.get("/api/admin/strategies")
@@ -3461,7 +3442,7 @@ async def import_admin_strategies(
                 "name": str(r.get("strategy_name") or "").strip(),
                 "source": str(r.get("source") or "").strip(),
                 "remark": str(r.get("remark") or "").strip(),
-                "dir": str(r.get("file_dir") or "").strip(),
+                "dir": _normalize_strategy_file_dir(sid, str(r.get("file_dir") or "")),
                 "file": _normalize_file_name(str(r.get("file_name") or "").strip()),
                 "mode": _strategy_weight_display_mode_store(),
                 "bcode": str(r.get("benchmark_code") or "").strip(),
@@ -4120,6 +4101,59 @@ async def admin_strategy_upload_data_file(
         action="admin_strategy_upload_data_file",
         actor_user_id=user.get("id"),
         detail={"strategy_id": sid, "path": ret.get("path")},
+        request=request,
+    )
+    db.commit()
+    return ret
+
+
+@app.post("/api/admin/strategies/batch-upload-data-files")
+async def admin_batch_strategy_upload_data_files(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    """
+    批量上传策略 Excel：按配置表 file_name 匹配 strategy_id（或文件名主干等于 strategy_id）。
+    """
+    from app.server_files import batch_upload_strategy_data_files
+
+    _ = user
+    if not files:
+        raise HTTPException(status_code=400, detail="no files")
+    configs = [
+        dict(r)
+        for r in db.execute(
+            text("SELECT strategy_id, file_name FROM strategy_configs")
+        ).mappings().all()
+    ]
+    ret = await batch_upload_strategy_data_files(files, configs)
+    for item in ret.get("results") or []:
+        if not item.get("ok"):
+            continue
+        sid = str(item.get("strategy_id") or "").strip()
+        if not sid:
+            continue
+        db.execute(
+            text(
+                """
+                UPDATE strategy_configs
+                SET file_dir=:fd, file_name=:fn, updated_at=datetime('now')
+                WHERE strategy_id=:sid
+                """
+            ),
+            {
+                "fd": item.get("file_dir") or _normalize_strategy_file_dir(sid, ""),
+                "fn": item.get("file_name") or "",
+                "sid": sid,
+            },
+        )
+    _audit_log(
+        db,
+        action="admin_strategy_batch_upload_data_files",
+        actor_user_id=user.get("id"),
+        detail={"uploaded": ret.get("uploaded"), "failed": ret.get("failed")},
         request=request,
     )
     db.commit()

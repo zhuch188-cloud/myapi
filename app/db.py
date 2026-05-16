@@ -538,9 +538,19 @@ _SCHEMA_STATEMENTS = [
 SessionLocalFactory = None
 
 
+class DatabaseNotReadyError(Exception):
+    """Turso 尚未完成后台初始化（Render 冷启动）。"""
+
+
 def get_session():
     if SessionLocalFactory is None:
-        raise RuntimeError("Database not initialized")
+        from app.boot import boot_error, is_ready
+
+        if boot_error():
+            raise DatabaseNotReadyError(f"数据库启动失败: {boot_error()}")
+        if not is_ready():
+            raise DatabaseNotReadyError("数据库正在初始化，请约 1～2 分钟后重试")
+        raise DatabaseNotReadyError("Database not initialized")
     db = SessionLocalFactory()
     try:
         yield db
