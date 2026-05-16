@@ -5,7 +5,7 @@ Python B/S system for strategy presentation, authorization, and behavior trackin
 ## Stack
 
 - Backend: FastAPI
-- DB: MySQL (`strategy_showcase_dev`)
+- DB: Turso (libSQL)
 - Scheduler: APScheduler (daily `02:00` + manual trigger)
 - Frontend: server-rendered HTML + responsive CSS
 

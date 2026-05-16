@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 import re
 import io
 import time
+import logging
 import csv
 import math
 import statistics
@@ -16,6 +17,7 @@ import hashlib
 import os
 import secrets
 import string
+from pathlib import Path
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -23,8 +25,21 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.config import settings
+from app.bg_threads import spawn_daemon
+
+_log = logging.getLogger(__name__)
 from app.access_logging import UserAccessLogMiddleware
 from app.db import init_database, get_session
+from app.update_lock import strategy_update_mutex
+from app.sql_dialect import (
+    list_table_columns,
+    quote_ident as _sql_quote_ident,
+    sql_curdate,
+    sql_hours_ago,
+    sql_minutes_ago,
+    sql_now,
+    sql_timestampdiff_hours,
+)
 from app.mail import send_contact_us_message, send_password_reset_email, smtp_send_test
 from app.auth import SlidingJWTAccessMiddleware, create_access_token, get_current_user, require_roles, norm_user_status
 from app import ark_client, stock_trend, wind_holders, wind_income, wind_sql
@@ -35,11 +50,20 @@ from app.services import (
     rebuild_nav_series,
     run_admin_sync_background_task,
     run_update,
+    create_strategy_import_job,
+    get_strategy_import_job_row,
+    run_strategy_import_background_task,
+    strategy_import_job_is_resumable,
 )
 from app.supplement_import import (
     CODE_COMPANY_PROFILE_EXCEL,
+    DataImportBatchNotFoundError,
+    DataImportBatchNotResumableError,
     ImportDefinitionNotFoundError,
+    batch_is_resumable,
     default_company_profile_xlsx_path,
+    get_data_import_batch_row,
+    resume_data_import_batch,
     run_import_by_code,
 )
 
@@ -210,6 +234,8 @@ class AdminDataImportRunPayload(BaseModel):
     # 与导入文件表头一致；单列或多列（多列时按顺序拼接为唯一键写入 stock_code）；不写入动态列
     unique_source_column: str = Field(default="", max_length=512)
     unique_source_columns: list[str] = Field(default_factory=list)
+    # 默认后台导入，避免远程 Turso 大批量写入导致 HTTP 超时
+    background: bool = True
 
 
 def _norm_profile_nickname(raw: str) -> str | None:
@@ -665,7 +691,7 @@ def _site_setting_upsert(db: Session, key: str, value: str) -> None:
             """
             INSERT INTO site_settings (setting_key, setting_value)
             VALUES (:k, :v)
-            ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)
+            ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value
             """
         ),
         {"k": key[:64], "v": str(value)[:255]},
@@ -1081,10 +1107,6 @@ _SUPPLEMENT_PROFILE_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _sql_quote_ident(name: str) -> str:
-    return "`" + str(name).replace("`", "``") + "`"
-
-
 def _supplement_profile_db_column(exist: set[str], logical: str) -> str | None:
     for cand in _SUPPLEMENT_PROFILE_COLUMN_ALIASES.get(logical, (logical,)):
         if cand in exist:
@@ -1100,16 +1122,7 @@ def _fetch_supplement_company_profile(db: Session, stock_code_raw: str) -> dict[
     except ValueError:
         return out
     sc_key = sc[:512]
-    rows = db.execute(
-        text(
-            """
-            SELECT COLUMN_NAME AS c
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'supplement_company_profiles'
-            """
-        )
-    ).fetchall()
-    exist = {str(r[0]) for r in rows}
+    exist = list_table_columns(db, "supplement_company_profiles")
     pairs: list[tuple[str, str]] = []
     for logical in _SUPPLEMENT_PROFILE_LABELS:
         col = _supplement_profile_db_column(exist, logical)
@@ -1347,6 +1360,10 @@ def _require_visible_strategy(db: Session, strategy_id: str) -> dict:
 
 @app.on_event("startup")
 def on_startup():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     init_database()
     wind_sql.init_wind_backend()
     from app.db import SessionLocalFactory
@@ -1355,10 +1372,30 @@ def on_startup():
     try:
         db.execute(
             text(
-                """
+                f"""
                 UPDATE strategy_update_jobs
-                SET status='FAILED', finished_at=NOW(),
+                SET status='FAILED', finished_at={sql_now()},
                     message='stale RUNNING cleared on server startup'
+                WHERE status='RUNNING'
+                """
+            )
+        )
+        db.execute(
+            text(
+                """
+                UPDATE data_import_batches
+                SET status='FAILED',
+                    message=COALESCE(message, '') || '（服务重启：入队后未执行，已标失败；请重新导入或点续传）'
+                WHERE status='QUEUED'
+                """
+            )
+        )
+        db.execute(
+            text(
+                """
+                UPDATE data_import_batches
+                SET status='FAILED',
+                    message=COALESCE(message, '') || '（服务重启：导入中断，已标失败；可点续传）'
                 WHERE status='RUNNING'
                 """
             )
@@ -1805,7 +1842,7 @@ def auth_register(request: Request, payload: RegisterPayload, db: Session = Depe
                       password_is_system_generated, password_changed_at,
                       nickname, contact_phone, contact_email
                     ) VALUES (
-                      :u, :p, 'viewer', 'org-client', 'active', 0, NOW(),
+                      :u, :p, 'viewer', 'org-client', 'active', 0, datetime('now'),
                       :nk, :ph, :em
                     )
                     """
@@ -1958,7 +1995,7 @@ def auth_reset_password(payload: ResetPasswordPayload, db: Session = Depends(get
         text(
             """
             SELECT id, user_id FROM password_reset_tokens
-            WHERE token_hash=:h AND used_at IS NULL AND expires_at > NOW()
+            WHERE token_hash=:h AND used_at IS NULL AND expires_at > datetime('now')
             LIMIT 1
             """
         ),
@@ -1975,7 +2012,7 @@ def auth_reset_password(payload: ResetPasswordPayload, db: Session = Depends(get
             SET password=:p,
                 password_is_system_generated=0,
                 password_changed_at=:now_dt,
-                updated_at=NOW()
+                updated_at=datetime('now')
             WHERE id=:id
             """
         ),
@@ -2112,8 +2149,8 @@ def auth_profile_put(
                     profile_bio=:bio,
                     password=:pwd,
                     password_is_system_generated=0,
-                    password_changed_at=NOW(),
-                    updated_at=NOW()
+                    password_changed_at=datetime('now'),
+                    updated_at=datetime('now')
                 WHERE id=:id
                 """
             ),
@@ -2135,7 +2172,7 @@ def auth_profile_put(
                     contact_phone=:ph,
                     contact_email=:em,
                     profile_bio=:bio,
-                    updated_at=NOW()
+                    updated_at=datetime('now')
                 WHERE id=:id
                 """
             ),
@@ -2414,7 +2451,7 @@ def follow_strategy(
     db.execute(
         text(
             """
-            INSERT IGNORE INTO user_strategy_follows (username, strategy_id)
+            INSERT OR IGNORE INTO user_strategy_follows (username, strategy_id)
             VALUES (:u, :sid)
             """
         ),
@@ -3240,19 +3277,19 @@ def upsert_strategy(
             ) VALUES (
               :sid,:visible,:name,:source,:remark,:dir,:file,:mode,:bcode,:bname,:intro,:scat,:rfreq,'enabled'
             )
-            ON DUPLICATE KEY UPDATE
-              is_visible=VALUES(is_visible),
-              strategy_name=VALUES(strategy_name),
-              source=VALUES(source),
-              remark=VALUES(remark),
-              file_dir=VALUES(file_dir),
-              file_name=VALUES(file_name),
-              weight_display_mode=VALUES(weight_display_mode),
-              benchmark_code=VALUES(benchmark_code),
-              benchmark_name=VALUES(benchmark_name),
-              strategy_intro=VALUES(strategy_intro),
-              strategy_category=VALUES(strategy_category),
-              rebalance_frequency=VALUES(rebalance_frequency)
+            ON CONFLICT(strategy_id) DO UPDATE SET
+              is_visible=excluded.is_visible,
+              strategy_name=excluded.strategy_name,
+              source=excluded.source,
+              remark=excluded.remark,
+              file_dir=excluded.file_dir,
+              file_name=excluded.file_name,
+              weight_display_mode=excluded.weight_display_mode,
+              benchmark_code=excluded.benchmark_code,
+              benchmark_name=excluded.benchmark_name,
+              strategy_intro=excluded.strategy_intro,
+              strategy_category=excluded.strategy_category,
+              rebalance_frequency=excluded.rebalance_frequency
             """
         ),
         {
@@ -3386,19 +3423,19 @@ async def import_admin_strategies(
                 ) VALUES (
                   :sid,:visible,:name,:source,:remark,:dir,:file,:mode,:bcode,:bname,:intro,:scat,:rfreq,'enabled'
                 )
-                ON DUPLICATE KEY UPDATE
-                  is_visible=VALUES(is_visible),
-                  strategy_name=VALUES(strategy_name),
-                  source=VALUES(source),
-                  remark=VALUES(remark),
-                  file_dir=VALUES(file_dir),
-                  file_name=VALUES(file_name),
-                  weight_display_mode=VALUES(weight_display_mode),
-                  benchmark_code=VALUES(benchmark_code),
-                  benchmark_name=VALUES(benchmark_name),
-                  strategy_intro=VALUES(strategy_intro),
-                  strategy_category=VALUES(strategy_category),
-                  rebalance_frequency=VALUES(rebalance_frequency)
+                ON CONFLICT(strategy_id) DO UPDATE SET
+                  is_visible=excluded.is_visible,
+                  strategy_name=excluded.strategy_name,
+                  source=excluded.source,
+                  remark=excluded.remark,
+                  file_dir=excluded.file_dir,
+                  file_name=excluded.file_name,
+                  weight_display_mode=excluded.weight_display_mode,
+                  benchmark_code=excluded.benchmark_code,
+                  benchmark_name=excluded.benchmark_name,
+                  strategy_intro=excluded.strategy_intro,
+                  strategy_category=excluded.strategy_category,
+                  rebalance_frequency=excluded.rebalance_frequency
                 """
             ),
             {
@@ -3479,18 +3516,63 @@ def delete_strategies(
 
 @app.post("/api/admin/import")
 def admin_import(
+    background_tasks: BackgroundTasks,
     payload: dict | None = None,
     user=Depends(require_roles("admin", "editor")),
     db: Session = Depends(get_session),
 ):
-    _ = user
-    selected_ids = (payload or {}).get("strategy_ids") or []
+    body = payload or {}
+    selected_ids = body.get("strategy_ids") or []
     if selected_ids and not isinstance(selected_ids, list):
         raise HTTPException(status_code=400, detail="strategy_ids must be a list")
-    mode = str((payload or {}).get("import_mode") or "full").strip().lower()
+    mode = str(body.get("import_mode") or "full").strip().lower()
     if mode not in ("full", "incremental"):
         raise HTTPException(status_code=400, detail="import_mode must be full or incremental")
-    return import_strategy_files(db, selected_strategy_ids=selected_ids, import_mode=mode)
+    ids = [str(x).strip() for x in selected_ids if str(x or "").strip()]
+    resume_job_id = body.get("resume_job_id")
+    if resume_job_id is not None:
+        job_id = int(resume_job_id)
+        job = get_strategy_import_job_row(db, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="strategy import job not found")
+        if not strategy_import_job_is_resumable(job):
+            raise HTTPException(status_code=400, detail="该导入任务不可续传")
+        db.execute(
+            text(
+                "UPDATE strategy_import_jobs SET status='QUEUED', message='续传已入队' WHERE id=:id"
+            ),
+            {"id": job_id},
+        )
+        db.commit()
+        background_tasks.add_task(run_strategy_import_background_task, job_id, resume=True)
+        return {
+            "ok": True,
+            "queued": True,
+            "resumed": True,
+            "import_job_id": job_id,
+            "message": f"已续传策略导入任务 #{job_id}，请轮询 GET /api/admin/import-jobs/{job_id}",
+        }
+    if bool(body.get("background")):
+        if not ids:
+            raise HTTPException(
+                status_code=400,
+                detail="background import requires non-empty strategy_ids",
+            )
+        job_id = create_strategy_import_job(
+            db,
+            strategy_ids=ids,
+            import_mode=mode,
+            triggered_by=str(user.get("username") or "admin"),
+        )
+        db.commit()
+        background_tasks.add_task(run_strategy_import_background_task, job_id, resume=False)
+        return {
+            "ok": True,
+            "queued": True,
+            "import_job_id": job_id,
+            "message": f"已入队策略导入任务 #{job_id}，请轮询 GET /api/admin/import-jobs/{job_id}",
+        }
+    return import_strategy_files(db, selected_strategy_ids=ids, import_mode=mode)
 
 
 @app.post("/api/admin/sync")
@@ -3532,11 +3614,11 @@ def admin_sync(
         text(
             """
             UPDATE admin_sync_jobs
-            SET status='FAILED', finished_at=NOW(),
-                message=CONCAT(COALESCE(message, ''), '（僵尸RUNNING：后台未正常结束，已自动标记失败）')
+            SET status='FAILED', finished_at=datetime('now'),
+                message=COALESCE(message, '') || '（僵尸RUNNING：后台未正常结束，已自动标记失败）'
             WHERE status='RUNNING'
               AND started_at IS NOT NULL
-              AND started_at < DATE_SUB(NOW(), INTERVAL :mins MINUTE)
+              AND started_at < datetime('now', printf('-%d minutes', :mins))
             """
         ),
         {"mins": sync_stale_mins},
@@ -3546,8 +3628,8 @@ def admin_sync(
         text(
             """
             UPDATE admin_sync_jobs
-            SET status='FAILED', finished_at=NOW(), message='排队超时（未在 2 分钟内启动），请重试'
-            WHERE status='QUEUED' AND created_at < DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+            SET status='FAILED', finished_at=datetime('now'), message='排队超时（未在 2 分钟内启动），请重试'
+            WHERE status='QUEUED' AND created_at < datetime('now', '-2 minutes')
             """
         )
     )
@@ -3583,7 +3665,7 @@ def admin_sync(
         text(
             """
             INSERT INTO admin_sync_jobs (status, stage, message, strategy_ids_json, import_mode, triggered_by)
-            VALUES ('QUEUED', 'queued', :msg, CAST(:sj AS JSON), :im, :by)
+            VALUES ('QUEUED', 'queued', :msg, :sj, :im, :by)
             """
         ),
         {"msg": "任务已入队，即将在后台执行", "sj": sj, "im": import_mode, "by": username},
@@ -3602,6 +3684,43 @@ def admin_sync(
     }
 
 
+@app.get("/api/admin/sync-jobs")
+def admin_list_sync_jobs(
+    limit: int = 20,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
+    rows = db.execute(
+        text(
+            """
+            SELECT id, status, stage, message, import_mode, triggered_by,
+                   created_at, finished_at, result_json, checkpoint_json
+            FROM admin_sync_jobs
+            ORDER BY id DESC
+            LIMIT :lim
+            """
+        ),
+        {"lim": int(limit)},
+    ).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        try:
+            rj = d.get("result_json")
+            rj_obj = json.loads(rj) if isinstance(rj, str) and rj.strip() else {}
+            d["resumable"] = bool(
+                str(d.get("status") or "").upper() == "FAILED"
+                and (rj_obj.get("resumable") or d.get("checkpoint_json"))
+            )
+        except json.JSONDecodeError:
+            d["resumable"] = False
+        items.append(d)
+    return {"items": items}
+
+
 @app.get("/api/admin/sync-jobs/{job_id}")
 def admin_get_sync_job(
     job_id: int,
@@ -3613,7 +3732,8 @@ def admin_get_sync_job(
         text(
             """
             SELECT id, status, stage, message, import_mode, triggered_by,
-                   created_at, started_at, finished_at, result_json, strategy_ids_json
+                   created_at, started_at, finished_at, result_json, strategy_ids_json,
+                   checkpoint_json
             FROM admin_sync_jobs
             WHERE id=:id
             """
@@ -3622,7 +3742,114 @@ def admin_get_sync_job(
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="sync job not found")
-    return dict(row)
+    d = dict(row)
+    try:
+        rj = d.get("result_json")
+        if isinstance(rj, str) and rj.strip():
+            rj_obj = json.loads(rj)
+            d["resumable"] = bool(
+                not rj_obj.get("ok")
+                and (rj_obj.get("resumable") or d.get("checkpoint_json"))
+            )
+        else:
+            d["resumable"] = str(d.get("status") or "").upper() == "FAILED" and bool(
+                d.get("checkpoint_json")
+            )
+    except json.JSONDecodeError:
+        d["resumable"] = False
+    return d
+
+
+@app.post("/api/admin/sync-jobs/{job_id}/resume")
+def admin_sync_job_resume(
+    job_id: int,
+    background_tasks: BackgroundTasks,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    row = db.execute(
+        text(
+            """
+            SELECT id, status, strategy_ids_json, import_mode, checkpoint_json
+            FROM admin_sync_jobs
+            WHERE id=:id
+            """
+        ),
+        {"id": job_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="sync job not found")
+    st = str(row.get("status") or "").upper()
+    if st not in ("FAILED",):
+        raise HTTPException(status_code=400, detail=f"仅 FAILED 任务可续传（当前 {st}）")
+    if not row.get("checkpoint_json"):
+        raise HTTPException(status_code=400, detail="无断点记录，请重新发起同步")
+    row_run = db.execute(text("SELECT id FROM admin_sync_jobs WHERE status='RUNNING' LIMIT 1")).first()
+    if row_run and int(row_run[0]) != job_id:
+        raise HTTPException(status_code=409, detail=f"已有同步任务 RUNNING id={row_run[0]}")
+    ids = json.loads(str(row.get("strategy_ids_json") or "[]"))
+    import_mode = str(row.get("import_mode") or "incremental")
+    username = str(user.get("username") or "admin")
+    db.execute(
+        text(
+            "UPDATE admin_sync_jobs SET status='QUEUED', message='续传已入队', finished_at=NULL WHERE id=:id"
+        ),
+        {"id": job_id},
+    )
+    db.commit()
+    background_tasks.add_task(
+        run_admin_sync_background_task, job_id, username, ids, import_mode, resume=True
+    )
+    return {
+        "ok": True,
+        "queued": True,
+        "resumed": True,
+        "sync_job_id": job_id,
+        "message": f"已续传同步任务 #{job_id}，请轮询 GET /api/admin/sync-jobs/{job_id}",
+    }
+
+
+@app.get("/api/admin/import-jobs/{job_id}")
+def admin_get_import_job(
+    job_id: int,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    job = get_strategy_import_job_row(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="import job not found")
+    job["resumable"] = strategy_import_job_is_resumable(job)
+    return job
+
+
+@app.get("/api/admin/import-jobs")
+def admin_list_import_jobs(
+    limit: int = 30,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
+    rows = db.execute(
+        text(
+            """
+            SELECT id, status, import_mode, strategy_ids_json, completed_strategy_ids_json,
+                   imported_count, failed_count, message, triggered_by, created_at, finished_at
+            FROM strategy_import_jobs
+            ORDER BY id DESC
+            LIMIT :lim
+            """
+        ),
+        {"lim": int(limit)},
+    ).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["resumable"] = strategy_import_job_is_resumable(d)
+        items.append(d)
+    return {"items": items}
 
 
 @app.post("/api/admin/update")
@@ -3635,18 +3862,15 @@ def admin_update(
 ):
     """
     在返回前同步插入 RUNNING 任务并返回 job_id，避免前端在后台线程尚未 INSERT 时
-    把历史 SUCCESS/FAILED 误判为本次更新结果；并用 GET_LOCK 避免并发下重复插入。
+    把历史 SUCCESS/FAILED 误判为本次更新结果；进程内互斥避免并发下重复插入。
     """
     username = user["username"]
     selected_ids = (payload or {}).get("strategy_ids") or []
     if selected_ids and not isinstance(selected_ids, list):
         raise HTTPException(status_code=400, detail="strategy_ids must be a list")
 
-    lock_ok = db.execute(text("SELECT GET_LOCK('fpbs_strategy_update', 20)")).scalar()
-    if int(lock_ok or 0) != 1:
-        raise HTTPException(status_code=503, detail="更新排队繁忙，请数秒后重试")
     job_id: int | None = None
-    try:
+    with strategy_update_mutex():
         row = db.execute(
             text("SELECT id FROM strategy_update_jobs WHERE status='RUNNING' LIMIT 1")
         ).first()
@@ -3665,9 +3889,6 @@ def admin_update(
             ),
             {"by": username, "st": started},
         ).lastrowid
-        db.commit()
-    finally:
-        db.execute(text("SELECT RELEASE_LOCK('fpbs_strategy_update')"))
         db.commit()
 
     def _run_update_task(jid: int) -> None:
@@ -3771,12 +3992,121 @@ def admin_data_import_definitions(
         elif mj is None:
             d["meta_json"] = {}
         raw_fp = (d.get("default_file_path") or "").strip()
-        if not raw_fp and d.get("code") == CODE_COMPANY_PROFILE_EXCEL:
+        from app.server_files import file_stat, resolve_supplement_upload_path, server_upload_enabled
+
+        server_p = resolve_supplement_upload_path(str(d.get("code") or ""))
+        d["server_upload_enabled"] = server_upload_enabled()
+        d["server_file"] = file_stat(server_p) if server_p else None
+        if server_p and server_p.is_file():
+            d["effective_default_path"] = str(server_p)
+        elif not raw_fp and d.get("code") == CODE_COMPANY_PROFILE_EXCEL:
             d["effective_default_path"] = default_company_profile_xlsx_path()
         else:
             d["effective_default_path"] = raw_fp or None
         items.append(d)
-    return {"items": items}
+    return {"items": items, "server_upload_enabled": server_upload_enabled()}
+
+
+@app.get("/api/admin/data-import/server-file")
+def admin_data_import_server_file(
+    code: str,
+    user=Depends(require_roles("admin", "editor")),
+):
+    _ = user
+    from app.server_files import file_stat, resolve_supplement_upload_path, server_upload_enabled, upload_root
+
+    c = (code or "").strip()
+    if not c:
+        raise HTTPException(status_code=400, detail="code required")
+    p = resolve_supplement_upload_path(c)
+    return {
+        "code": c,
+        "server_upload_enabled": server_upload_enabled(),
+        "upload_root": str(upload_root()) if upload_root() else None,
+        "file": file_stat(p) if p else None,
+    }
+
+
+@app.post("/api/admin/data-import/upload")
+async def admin_data_import_upload(
+    request: Request,
+    code: str = Form(...),
+    file: UploadFile = File(...),
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    """上传补充数据文件到服务器（有则覆盖）；导入时优先读该文件。"""
+    from app.server_files import upload_supplement_file
+
+    c = (code or "").strip()
+    if not c:
+        raise HTTPException(status_code=400, detail="code required")
+    ret = await upload_supplement_file(c, file)
+    path = str(ret.get("path") or "")
+    db.execute(
+        text(
+            """
+            UPDATE data_import_definitions
+            SET default_file_path=:p, updated_at=datetime('now')
+            WHERE code=:c
+            """
+        ),
+        {"p": path[:1024], "c": c},
+    )
+    _audit_log(
+        db,
+        action="admin_data_import_upload",
+        actor_user_id=user.get("id"),
+        detail={"code": c, "path": path, "size_bytes": (ret.get("file") or {}).get("size_bytes")},
+        request=request,
+    )
+    db.commit()
+    ret["default_file_path_updated"] = True
+    return ret
+
+
+@app.post("/api/admin/strategies/{strategy_id}/upload-data-file")
+async def admin_strategy_upload_data_file(
+    strategy_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    """上传策略 Excel 到服务器（有则覆盖），并更新 strategy_configs 的 file_dir/file_name。"""
+    from app.server_files import upload_strategy_data_file
+
+    sid = (strategy_id or "").strip()
+    row = db.execute(
+        text("SELECT strategy_id FROM strategy_configs WHERE strategy_id=:sid LIMIT 1"),
+        {"sid": sid},
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="strategy not found")
+    ret = await upload_strategy_data_file(sid, file)
+    db.execute(
+        text(
+            """
+            UPDATE strategy_configs
+            SET file_dir=:fd, file_name=:fn, updated_at=datetime('now')
+            WHERE strategy_id=:sid
+            """
+        ),
+        {
+            "fd": ret["file_dir"],
+            "fn": ret["file_name"],
+            "sid": sid,
+        },
+    )
+    _audit_log(
+        db,
+        action="admin_strategy_upload_data_file",
+        actor_user_id=user.get("id"),
+        detail={"strategy_id": sid, "path": ret.get("path")},
+        request=request,
+    )
+    db.commit()
+    return ret
 
 
 @app.get("/api/admin/data-import/batches")
@@ -3788,11 +4118,36 @@ def admin_data_import_batches(
     _ = user
     if limit < 1 or limit > 200:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    stale_mins = max(5, int(getattr(settings, "supplement_import_stale_running_minutes", 12)))
+    db.execute(
+        text(
+            """
+            UPDATE data_import_batches
+            SET status='FAILED',
+                message=COALESCE(message, '') || '（超过5分钟仍为QUEUED：后台未启动，请重启服务后重新导入或续传）'
+            WHERE status='QUEUED'
+              AND created_at < datetime('now', '-5 minutes')
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            UPDATE data_import_batches
+            SET status='FAILED',
+                message=COALESCE(message, '') || '（超过 ' || CAST(:mins AS TEXT) || ' 分钟无进度更新，可能远程写入卡住；请点续传或配置 TURSO_LOCAL_REPLICA）'
+            WHERE status='RUNNING'
+              AND COALESCE(progress_at, created_at) < datetime('now', printf('-%d minutes', :mins))
+            """
+        ),
+        {"mins": stale_mins},
+    )
+    db.commit()
     rows = db.execute(
         text(
             """
             SELECT id, definition_code, source_file_path, status, rows_ok, rows_fail,
-                   message, actor_user_id, created_at
+                   rows_total, resume_from_row, message, actor_user_id, created_at, progress_at
             FROM data_import_batches
             ORDER BY id DESC
             LIMIT :lim
@@ -3800,26 +4155,305 @@ def admin_data_import_batches(
         ),
         {"lim": int(limit)},
     ).mappings().all()
-    return {"items": [dict(x) for x in rows]}
+    items = []
+    for x in rows:
+        d = dict(x)
+        d["resumable"] = batch_is_resumable(d)
+        items.append(d)
+    return {"items": items}
+
+
+@app.get("/api/admin/data-import/batches/{batch_id}")
+def admin_data_import_batch_detail(
+    batch_id: int,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    batch = get_data_import_batch_row(db, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="batch not found")
+    batch["resumable"] = batch_is_resumable(batch)
+    return batch
+
+
+_active_data_import_batches: set[int] = set()
+
+
+def _mark_data_import_batch_running(db: Session, batch_id: int, message: str) -> None:
+    db.execute(
+        text(
+            """
+            UPDATE data_import_batches
+            SET status='RUNNING', message=:m, progress_at=datetime('now')
+            WHERE id=:id
+            """
+        ),
+        {"m": message[:65000], "id": batch_id},
+    )
+    db.commit()
+
+
+def _background_data_import_task(
+    batch_id: int,
+    code: str,
+    file_path: str,
+    actor_user_id: int | None,
+    unique_source_column: str | None,
+    unique_source_columns: list[str],
+) -> None:
+    from app.db import SessionLocalFactory
+
+    if batch_id in _active_data_import_batches:
+        _log.warning("data import batch %s skipped: already running in this process", batch_id)
+        return
+    _active_data_import_batches.add(batch_id)
+    if SessionLocalFactory is None:
+        _active_data_import_batches.discard(batch_id)
+        raise RuntimeError("数据库未初始化（SessionLocalFactory 为空）")
+    db = SessionLocalFactory()
+    try:
+        _mark_data_import_batch_running(db, batch_id, "后台线程已启动，正在读取文件并准备导入…")
+        _log.info("data import batch %s: running import code=%s path=%s", batch_id, code, file_path)
+        run_import_by_code(
+            db,
+            code=code,
+            file_path=file_path,
+            actor_user_id=actor_user_id,
+            unique_source_column=unique_source_column,
+            unique_source_columns=unique_source_columns,
+            existing_batch_id=batch_id,
+        )
+        _log.info("data import batch %s: finished ok", batch_id)
+    except Exception as e:
+        _log.exception("data import batch %s failed", batch_id)
+        try:
+            batch = get_data_import_batch_row(db, batch_id)
+            rr = int((batch or {}).get("resume_from_row") or 0)
+            db.execute(
+                text(
+                    """
+                    UPDATE data_import_batches
+                    SET status='FAILED', message=:m
+                    WHERE id=:id AND status IN ('QUEUED', 'RUNNING')
+                    """
+                ),
+                {
+                    "m": (
+                        f"导入失败（可从第 {rr + 1} 行续传）：{str(e)[:64000]}"
+                        if rr > 0
+                        else str(e)[:65000]
+                    ),
+                    "id": batch_id,
+                },
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+        raise
+    finally:
+        db.close()
+        _active_data_import_batches.discard(batch_id)
+
+
+def _background_data_import_resume_task(batch_id: int, actor_user_id: int | None) -> None:
+    from app.db import SessionLocalFactory
+
+    if batch_id in _active_data_import_batches:
+        _log.warning("data import resume batch %s skipped: already running", batch_id)
+        return
+    _active_data_import_batches.add(batch_id)
+    if SessionLocalFactory is None:
+        _active_data_import_batches.discard(batch_id)
+        raise RuntimeError("数据库未初始化（SessionLocalFactory 为空）")
+    db = SessionLocalFactory()
+    try:
+        _mark_data_import_batch_running(db, batch_id, "续传线程已启动…")
+        resume_data_import_batch(db, batch_id, actor_user_id)
+    except Exception as e:
+        try:
+            batch = get_data_import_batch_row(db, batch_id)
+            rr = int((batch or {}).get("resume_from_row") or 0)
+            db.execute(
+                text(
+                    """
+                    UPDATE data_import_batches
+                    SET status='FAILED', message=:m
+                    WHERE id=:id AND status IN ('QUEUED', 'RUNNING')
+                    """
+                ),
+                {
+                    "m": (
+                        f"续传失败（可从第 {rr + 1} 行再试）：{str(e)[:64000]}"
+                        if rr > 0
+                        else str(e)[:65000]
+                    ),
+                    "id": batch_id,
+                },
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+        _active_data_import_batches.discard(batch_id)
+
+
+@app.post("/api/admin/data-import/batches/{batch_id}/resume")
+def admin_data_import_resume(
+    batch_id: int,
+    background_tasks: BackgroundTasks,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    batch = get_data_import_batch_row(db, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="batch not found")
+    if not batch_is_resumable(batch):
+        raise HTTPException(status_code=400, detail="该批次不可续传（已成功、无进度或源文件不可用）")
+    actor_id = int(user["id"]) if user.get("id") is not None else None
+    rr = int(batch.get("resume_from_row") or 0)
+    db.execute(
+        text(
+            """
+            UPDATE data_import_batches
+            SET status='QUEUED', message=:m
+            WHERE id=:id
+            """
+        ),
+        {
+            "m": f"续传已入队，将从第 {rr + 1} 行继续",
+            "id": batch_id,
+        },
+    )
+    db.commit()
+    spawn_daemon(
+        f"data-import-resume-{batch_id}",
+        _background_data_import_resume_task,
+        batch_id,
+        actor_id,
+    )
+    return {
+        "ok": True,
+        "queued": True,
+        "resumed": True,
+        "batch_id": batch_id,
+        "resume_from_row": rr,
+        "message": f"已续传批次 #{batch_id}，将从第 {rr + 1} 行继续",
+    }
+
+
+def _enqueue_data_import_batch(
+    db: Session,
+    *,
+    code: str,
+    file_path: str | None,
+    actor_user_id: int | None,
+) -> tuple[int, str]:
+    """校验定义与本地文件，创建 QUEUED 批次，返回 (batch_id, 解析后的路径)。"""
+    row = db.execute(
+        text(
+            """
+            SELECT code, display_name, default_file_path, enabled
+            FROM data_import_definitions
+            WHERE code = :c
+            LIMIT 1
+            """
+        ),
+        {"c": code},
+    ).mappings().first()
+    if not row:
+        raise ImportDefinitionNotFoundError()
+    if not int(row.get("enabled") or 0):
+        raise ValueError("import definition disabled")
+
+    from app.server_files import resolve_supplement_import_path
+    from app.supplement_import import CODE_COMPANY_PROFILE_EXCEL, default_company_profile_xlsx_path
+
+    fallback = default_company_profile_xlsx_path() if code == CODE_COMPANY_PROFILE_EXCEL else ""
+    path = resolve_supplement_import_path(
+        definition_code=code,
+        explicit_path=file_path,
+        default_file_path=(row.get("default_file_path") or ""),
+        fallback_path=fallback,
+    )
+    if not path:
+        raise ValueError("import file path empty")
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+
+    db.execute(
+        text(
+            """
+            INSERT INTO data_import_batches
+            (definition_code, source_file_path, status, rows_ok, rows_fail, message, actor_user_id)
+            VALUES (:dc, :fp, 'QUEUED', 0, 0, :m, :uid)
+            """
+        ),
+        {
+            "dc": code,
+            "fp": str(path)[:1024],
+            "m": "任务已入队，后台线程即将启动",
+            "uid": actor_user_id,
+        },
+    )
+    bid_row = db.execute(text("SELECT last_insert_rowid() AS id")).mappings().first()
+    batch_id = int(bid_row["id"]) if bid_row and bid_row.get("id") is not None else 0
+    if not batch_id:
+        raise RuntimeError("创建导入批次失败")
+    return batch_id, path
 
 
 @app.post("/api/admin/data-import/run")
 def admin_data_import_run(
     request: Request,
+    background_tasks: BackgroundTasks,
     payload: AdminDataImportRunPayload,
     user=Depends(require_roles("admin", "editor")),
     db: Session = Depends(get_session),
 ):
     code = (payload.code or "").strip()
     fp = (payload.file_path or "").strip() or None
+    usc = [str(x).strip() for x in (payload.unique_source_columns or []) if str(x).strip()]
+    ucol = (payload.unique_source_column or "").strip() or None
+    actor_id = int(user["id"]) if user.get("id") is not None else None
+
     try:
-        usc = [str(x).strip() for x in (payload.unique_source_columns or []) if str(x).strip()]
+        if payload.background:
+            batch_id, resolved_path = _enqueue_data_import_batch(
+                db, code=code, file_path=fp, actor_user_id=actor_id
+            )
+            _audit_log(
+                db,
+                action="admin_data_import_run",
+                actor_user_id=user.get("id"),
+                detail={"code": code, "file_path": resolved_path, "batch_id": batch_id, "queued": True},
+                request=request,
+            )
+            db.commit()
+            spawn_daemon(
+                f"data-import-{batch_id}",
+                _background_data_import_task,
+                batch_id,
+                code,
+                resolved_path,
+                actor_id,
+                ucol,
+                usc,
+            )
+            return {
+                "ok": True,
+                "queued": True,
+                "batch_id": batch_id,
+                "message": "已提交后台导入。请在本页「最近批次」查看 RUNNING/SUCCESS；完成后刷新列表。",
+            }
+
         out = run_import_by_code(
             db,
             code=code,
             file_path=fp,
-            actor_user_id=int(user["id"]) if user.get("id") is not None else None,
-            unique_source_column=(payload.unique_source_column or "").strip() or None,
+            actor_user_id=actor_id,
+            unique_source_column=ucol,
             unique_source_columns=usc if usc else None,
         )
     except ImportDefinitionNotFoundError:
@@ -3944,7 +4578,7 @@ def admin_access_overview(
             """
             SELECT COUNT(*) AS c
             FROM user_devices
-            WHERE revoked_at IS NULL AND device_token_expires_at > NOW()
+            WHERE revoked_at IS NULL AND device_token_expires_at > datetime('now')
             """
         )
     ).mappings().first()
@@ -3953,12 +4587,12 @@ def admin_access_overview(
     def _login_bucket(hours: int) -> dict:
         agg = db.execute(
             text(
-                """
+                f"""
                 SELECT
                   SUM(CASE WHEN result='SUCCESS' THEN 1 ELSE 0 END) AS ok_n,
                   SUM(CASE WHEN result='FAIL' THEN 1 ELSE 0 END) AS fail_n
                 FROM login_events
-                WHERE created_at >= NOW() - INTERVAL :hrs HOUR
+                WHERE created_at >= {sql_hours_ago(':hrs')}
                 """
             ),
             {"hrs": hours},
@@ -3966,12 +4600,12 @@ def admin_access_overview(
         ad = dict(agg or {})
         du = db.execute(
             text(
-                """
+                f"""
                 SELECT COUNT(DISTINCT user_id) AS c
                 FROM login_events
                 WHERE result='SUCCESS'
                   AND user_id IS NOT NULL
-                  AND created_at >= NOW() - INTERVAL :hrs HOUR
+                  AND created_at >= {sql_hours_ago(':hrs')}
                 """
             ),
             {"hrs": hours},
@@ -3994,7 +4628,7 @@ def admin_access_overview(
             SELECT ip, COUNT(*) AS cnt
             FROM login_events
             WHERE result='FAIL'
-              AND created_at >= NOW() - INTERVAL 24 HOUR
+              AND created_at >= datetime('now', '-24 hours')
               AND ip IS NOT NULL
               AND TRIM(ip) <> ''
             GROUP BY ip
@@ -4011,7 +4645,7 @@ def admin_access_overview(
             SELECT reason, COUNT(*) AS cnt
             FROM login_events
             WHERE result='FAIL'
-              AND created_at >= NOW() - INTERVAL 24 HOUR
+              AND created_at >= datetime('now', '-24 hours')
             GROUP BY reason
             ORDER BY cnt DESC
             LIMIT 10
@@ -4028,7 +4662,7 @@ def admin_access_overview(
             SELECT COALESCE(SUM(u.api_requests), 0) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date = CURDATE()
+            WHERE u.usage_date = date('now')
             """
         )
     ).mappings().first()
@@ -4038,7 +4672,7 @@ def admin_access_overview(
             SELECT COALESCE(SUM(u.api_requests), 0) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+            WHERE u.usage_date >= date('now', '-6 days')
             """
         )
     ).mappings().first()
@@ -4048,7 +4682,7 @@ def admin_access_overview(
             SELECT COALESCE(SUM(u.api_requests), 0) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+            WHERE u.usage_date >= date('now', '-29 days')
             """
         )
     ).mappings().first()
@@ -4062,7 +4696,7 @@ def admin_access_overview(
             SELECT COUNT(DISTINCT u.user_id) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+            WHERE u.usage_date >= date('now', '-6 days')
             """
         )
     ).mappings().first()
@@ -4072,7 +4706,7 @@ def admin_access_overview(
             SELECT COUNT(DISTINCT u.user_id) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+            WHERE u.usage_date >= date('now', '-29 days')
             """
         )
     ).mappings().first()
@@ -4090,7 +4724,7 @@ def admin_access_overview(
             INNER JOIN users usr ON usr.id = le.user_id AND usr.role = 'viewer'
             WHERE le.result = 'SUCCESS'
               AND le.user_id IS NOT NULL
-              AND le.created_at >= NOW() - INTERVAL 7 DAY
+              AND le.created_at >= datetime('now', '-7 days')
             """
         )
     ).mappings().first()
@@ -4105,7 +4739,7 @@ def admin_access_overview(
             SELECT COUNT(*) AS c
             FROM user_devices d
             INNER JOIN users u ON u.id = d.user_id AND u.role = 'viewer'
-            WHERE d.revoked_at IS NULL AND d.device_token_expires_at > NOW()
+            WHERE d.revoked_at IS NULL AND d.device_token_expires_at > datetime('now')
             """
         )
     ).mappings().first()
@@ -4113,12 +4747,12 @@ def admin_access_overview(
 
     idle_row = db.execute(
         text(
-            """
-            SELECT AVG(TIMESTAMPDIFF(HOUR, d.last_seen_at, NOW())) AS h
+            f"""
+            SELECT AVG({sql_timestampdiff_hours('d.last_seen_at')}) AS h
             FROM user_devices d
             INNER JOIN users u ON u.id = d.user_id AND u.role = 'viewer'
             WHERE d.revoked_at IS NULL
-              AND d.device_token_expires_at > NOW()
+              AND d.device_token_expires_at > datetime('now')
               AND d.last_seen_at IS NOT NULL
             """
         )
@@ -4308,7 +4942,7 @@ def admin_user_detail(
               device_token_expires_at,
               CASE
                 WHEN revoked_at IS NOT NULL THEN 'revoked'
-                WHEN device_token_expires_at <= NOW() THEN 'expired'
+                WHEN device_token_expires_at <= datetime('now') THEN 'expired'
                 ELSE 'active'
               END AS session_state
             FROM user_devices
@@ -4339,11 +4973,11 @@ def admin_user_detail(
         text(
             """
             SELECT
-              SUM(CASE WHEN created_at >= NOW() - INTERVAL 24 HOUR AND result='FAIL' THEN 1 ELSE 0 END) AS fail_24h,
-              SUM(CASE WHEN created_at >= NOW() - INTERVAL 24 HOUR AND result='SUCCESS' THEN 1 ELSE 0 END) AS ok_24h,
-              SUM(CASE WHEN created_at >= NOW() - INTERVAL 7 DAY AND result='FAIL' THEN 1 ELSE 0 END) AS fail_7d,
-              SUM(CASE WHEN created_at >= NOW() - INTERVAL 7 DAY AND result='SUCCESS' THEN 1 ELSE 0 END) AS ok_7d,
-              SUM(CASE WHEN created_at >= NOW() - INTERVAL 30 DAY AND result='FAIL' THEN 1 ELSE 0 END) AS fail_30d,
+              SUM(CASE WHEN created_at >= datetime('now', '-24 hours') AND result='FAIL' THEN 1 ELSE 0 END) AS fail_24h,
+              SUM(CASE WHEN created_at >= datetime('now', '-24 hours') AND result='SUCCESS' THEN 1 ELSE 0 END) AS ok_24h,
+              SUM(CASE WHEN created_at >= datetime('now', '-7 days') AND result='FAIL' THEN 1 ELSE 0 END) AS fail_7d,
+              SUM(CASE WHEN created_at >= datetime('now', '-7 days') AND result='SUCCESS' THEN 1 ELSE 0 END) AS ok_7d,
+              SUM(CASE WHEN created_at >= datetime('now', '-30 days') AND result='FAIL' THEN 1 ELSE 0 END) AS fail_30d,
               MAX(CASE WHEN result='SUCCESS' THEN created_at END) AS last_ok_at,
               MAX(CASE WHEN result='FAIL' THEN created_at END) AS last_fail_at
             FROM login_events
@@ -4433,7 +5067,7 @@ def admin_user_status(
     if target_status not in ("active", "disabled", "locked"):
         raise HTTPException(status_code=400, detail="invalid status")
     db.execute(
-        text("UPDATE users SET status=:st, updated_at=NOW() WHERE id=:id"),
+        text("UPDATE users SET status=:st, updated_at=datetime('now') WHERE id=:id"),
         {"st": target_status, "id": user_id},
     )
     _audit_log(
@@ -4463,7 +5097,7 @@ def admin_reset_password(
             SET password=:p,
                 password_is_system_generated=1,
                 password_changed_at=NULL,
-                updated_at=NOW()
+                updated_at=datetime('now')
             WHERE id=:id
             """
         ),
@@ -4488,7 +5122,7 @@ def admin_revoke_devices(
     db: Session = Depends(get_session),
 ):
     db.execute(
-        text("UPDATE user_devices SET revoked_at=NOW() WHERE user_id=:id AND revoked_at IS NULL"),
+        text("UPDATE user_devices SET revoked_at=datetime('now') WHERE user_id=:id AND revoked_at IS NULL"),
         {"id": user_id},
     )
     _audit_log(

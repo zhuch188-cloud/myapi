@@ -24,6 +24,7 @@
       th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; }
       .scroll { overflow-x: auto; }
       td.msg-cell { white-space: normal; word-break: break-word; max-width: 420px; }
+      th[title] { cursor: help; text-decoration: underline dotted #94a3b8; text-underline-offset: 2px; }
     </style>
   </head>
   <body>
@@ -42,18 +43,27 @@
       <div class="card">
         <h4 style="margin:0 0 8px">补充数据导入</h4>
         <p class="muted" style="margin:0 0 10px">
-          支持 <strong>.xlsx / .xls / .xlsm / .csv</strong>。导入类型在 <code>data_import_definitions</code> 中配置；数据写入 <code>supplement_company_profiles</code>。
-          <strong>唯一键</strong>由导入文件中的<strong>列名</strong>指定（与表头一致）：可多列，多列时按顺序取值、规范化后拼接写入 <code>stock_code</code>（最长 512），库唯一键 <code>(definition_code, stock_code)</code> 相同则<strong>更新</strong>；唯一键列不再重复存为动态列，其余表头各对应一列（TEXT）。
-          默认可在 <code>meta_json.unique_source_columns</code>（数组，优先）或 <code>meta_json.unique_source_column</code>（字符串，支持英文逗号/中文逗号分隔多列）中配置；空则自动识别证券代码类列。
+          支持 <strong>.xlsx / .xls / .xlsm / .csv</strong>。任务在<strong>后台</strong>执行。
+          <strong>已扫行</strong> = 文件读到第几行；<strong>写入成功</strong> = 唯一键有效且已入库（≠ 库表总行数，相同键只更新）。
+          纯远程 Turso 时单批写入约 0.5～2 分钟，<strong>已扫行/写入成功 暂时不变属正常</strong>，摘会出现「正在写入远程库…」。
+          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，可点<strong>续传</strong>。
+          Render 部署请配置 <code>SERVER_UPLOAD_ROOT</code>，先上传再导入（同区写 Turso）。
         </p>
+        <div class="row">
+          <label>① 上传</label>
+          <input id="supplementUploadFile" type="file" accept=".xlsx,.xls,.xlsm,.csv" style="display:none" />
+          <button type="button" class="secondary" onclick="document.getElementById('supplementUploadFile').click()">选择文件</button>
+          <button type="button" class="secondary" onclick="uploadSupplementToServer()">上传到服务器（覆盖）</button>
+          <span id="serverFileStatus" class="muted"></span>
+        </div>
         <div class="row">
           <label>导入类型</label>
           <select id="defCode" onchange="onDefinitionChange()"></select>
-          <button type="button" class="secondary" onclick="fillDefaultPath()">填入默认路径</button>
+          <button type="button" class="secondary" onclick="fillDefaultPath()">填入路径</button>
         </div>
         <div class="row" style="margin-top:8px;align-items:flex-start">
-          <label style="padding-top:8px">文件路径</label>
-          <textarea id="filePath" placeholder="留空则使用库中默认路径；支持 .xlsx/.xls/.csv"></textarea>
+          <label style="padding-top:8px">② 路径</label>
+          <textarea id="filePath" placeholder="留空则优先读服务器已上传文件；本机开发可填本地绝对路径"></textarea>
         </div>
         <div class="row" style="margin-top:8px">
           <label>唯一键列</label>
@@ -70,7 +80,10 @@
         <div class="scroll"><table id="defTb"></table></div>
       </div>
       <div class="card">
-        <h4 style="margin:0 0 8px">最近批次</h4>
+        <h4 style="margin:0 0 4px">最近批次</h4>
+        <p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45">
+          列「已扫行」与「写入成功」可能相差很大（大量行唯一键为空会计入「跳过」）。卡在某一数字时先看摘要是否含「正在写入远程库」。
+        </p>
         <div class="scroll"><table id="batchTb"></table></div>
       </div>
     </div>
@@ -78,11 +91,27 @@
 {% include 'partials/js_fetch_err.html' %}
       let token = localStorage.getItem("token") || "";
       let definitions = [];
+      let serverUploadEnabled = false;
       function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: "Bearer " + token } : {}) }; }
       function ensureAuth() { if (!token) location.href = "/admin-login"; }
       function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); localStorage.removeItem("device_token"); location.href = "/admin-login"; }
       function esc(s) {
         return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      }
+      function formatBatchStatusLine(b, batchId) {
+        const st = String(b.status || "");
+        const rr = Number(b.resume_from_row || 0);
+        const rt = b.rows_total != null ? Number(b.rows_total) : null;
+        const ok = b.rows_ok ?? 0;
+        const fail = b.rows_fail ?? 0;
+        const scan = rt != null ? `${rr}/${rt}` : String(rr);
+        const tail = (b.message || "").trim();
+        let line = `批次 #${batchId} · ${st} · 已扫行 ${scan} · 写入成功 ${ok} · 跳过 ${fail}`;
+        if (st === "RUNNING" && tail.includes("正在写入远程库")) {
+          line += " · 远程写入中（请等待 1～2 分钟）";
+        }
+        if (tail) line += ` — ${tail.slice(0, 160)}`;
+        return line;
       }
       async function api(path, options = {}) {
         const opts = { ...options };
@@ -129,27 +158,66 @@
           return esc(String(m.unique_source_column));
         return "（自动）";
       }
-      function onDefinitionChange() {
-        fillDefaultPath();
-        const code = (document.getElementById("defCode").value || "").trim();
-        const d = (definitions || []).find(x => x.code === code);
-        document.getElementById("uniqueCol").value = defaultUniqueColFromMeta(d);
-      }
       function fillDefaultPath() {
         const code = (document.getElementById("defCode").value || "").trim();
         const d = (definitions || []).find(x => x.code === code);
         const p = (d && (d.effective_default_path || d.default_file_path)) || "";
         document.getElementById("filePath").value = p;
       }
+      function formatServerFileHint(sf) {
+        if (!sf) return "服务器上尚无文件，请先上传";
+        return `服务器文件：${sf.size_mb} MB · 更新于 ${sf.modified_at || "-"}`;
+      }
+      async function refreshServerFileStatus() {
+        const el = document.getElementById("serverFileStatus");
+        const code = (document.getElementById("defCode").value || "").trim();
+        if (!code) { el.textContent = ""; return; }
+        try {
+          const d = await api("/api/admin/data-import/server-file?code=" + encodeURIComponent(code));
+          el.textContent = formatServerFileHint(d.file);
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
+      async function uploadSupplementToServer() {
+        const msg = document.getElementById("runMsg");
+        const code = (document.getElementById("defCode").value || "").trim();
+        const ipt = document.getElementById("supplementUploadFile");
+        const f = ipt.files && ipt.files[0];
+        if (!code) { msg.textContent = "请选择导入类型"; return; }
+        if (!f) { msg.textContent = "请先选择文件"; return; }
+        const fd = new FormData();
+        fd.append("code", code);
+        fd.append("file", f);
+        try {
+          msg.textContent = "上传中…";
+          const res = await fetch("/api/admin/data-import/upload", {
+            method: "POST",
+            headers: authHeaders({}),
+            body: fd,
+          });
+          const raw = await res.text();
+          let body = null;
+          try { body = raw ? JSON.parse(raw) : null; } catch (_) { body = { detail: raw }; }
+          if (!res.ok) throw new Error((body && body.detail) || raw || `HTTP ${res.status}`);
+          document.getElementById("filePath").value = body.path || "";
+          msg.textContent = `已上传并覆盖：${body.path || ""}`;
+          await loadDefinitions();
+          await refreshServerFileStatus();
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
       async function loadDefinitions() {
         const d = await api("/api/admin/data-import/definitions");
         definitions = d.items || [];
+        serverUploadEnabled = !!d.server_upload_enabled;
         fillDefSelect();
         const rows = definitions.map(x => {
           return `<tr>
           <td>${esc(x.code)}</td>
           <td>${esc(x.display_name)}</td>
-          <td>${esc(x.effective_default_path || x.default_file_path || "-")}</td>
+          <td class="msg-cell">${esc(x.effective_default_path || x.default_file_path || "-")}${x.server_file ? `<br/><span class="muted">已上传 ${x.server_file.size_mb}MB</span>` : ""}</td>
           <td>${displayUniqueColMeta(x)}</td>
           <td>${Number(x.enabled) ? "是" : "否"}</td>
           <td class="msg-cell">${esc(x.description || "-")}</td>
@@ -162,22 +230,90 @@
           fillDefaultPath();
         }
         onDefinitionChange();
+        await refreshServerFileStatus();
       }
+      function onDefinitionChange() {
+        fillDefaultPath();
+        const code = (document.getElementById("defCode").value || "").trim();
+        const d = (definitions || []).find(x => x.code === code);
+        document.getElementById("uniqueCol").value = defaultUniqueColFromMeta(d);
+        refreshServerFileStatus();
+      }
+      const TERMINAL_BATCH = new Set(["SUCCESS", "FAILED"]);
+
+      async function resumeBatch(batchId) {
+        const msg = document.getElementById("runMsg");
+        try {
+          const ret = await api(`/api/admin/data-import/batches/${batchId}/resume`, { method: "POST" });
+          msg.textContent = ret.message || `批次 #${batchId} 续传已提交`;
+          await pollBatchUntilDone(batchId);
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      let highlightBatchId = 0;
+
+      async function fetchBatchById(batchId) {
+        const d = await api("/api/admin/data-import/batches?limit=80");
+        return (d.items || []).find(b => Number(b.id) === Number(batchId)) || null;
+      }
+
       async function loadBatches() {
         const d = await api("/api/admin/data-import/batches?limit=50");
         const items = d.items || [];
         document.getElementById("batchTb").innerHTML = `
-          <thead><tr><th>ID</th><th>类型</th><th>文件</th><th>状态</th><th>成功</th><th>失败</th><th>时间</th><th>摘要</th></tr></thead>
-          <tbody>${items.map(b => `<tr>
+          <thead><tr>
+            <th>ID</th><th>类型</th><th>状态</th>
+            <th title="Excel 已扫描到的行号（含唯一键无效、未写入的行）">已扫行</th>
+            <th title="唯一键有效且已 UPSERT 的行数；不等于 supplement_company_profiles 表总行数">写入成功</th>
+            <th title="唯一键为空或拼不出，未写入">跳过</th>
+            <th>时间</th><th>摘要</th><th>操作</th>
+          </tr></thead>
+          <tbody>${items.map(b => {
+            const hi = highlightBatchId && Number(b.id) === Number(highlightBatchId);
+            const rowStyle = hi ? ' style="background:#eef4ff"' : "";
+            const rt = b.rows_total != null ? Number(b.rows_total) : null;
+            const rr = Number(b.resume_from_row || 0);
+            const scanned = rt != null ? `${rr} / ${rt}` : (rr > 0 ? String(rr) : "—");
+            const resumeBtn = b.resumable
+              ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="resumeBatch(${b.id})">续传</button>`
+              : "";
+            return `<tr${rowStyle}>
             <td>${b.id}</td>
             <td>${esc(b.definition_code)}</td>
-            <td>${esc(b.source_file_path)}</td>
             <td>${esc(b.status)}</td>
+            <td>${esc(scanned)}</td>
             <td>${b.rows_ok ?? 0}</td>
             <td>${b.rows_fail ?? 0}</td>
             <td>${esc(b.created_at)}</td>
-            <td class="msg-cell">${esc((b.message || "").slice(0, 500))}</td>
-          </tr>`).join("") || "<tr><td colspan='8' class='muted'>暂无批次</td></tr>"}</tbody>`;
+            <td class="msg-cell">${esc((b.message || "").slice(0, 400))}</td>
+            <td>${resumeBtn}</td>
+          </tr>`;
+          }).join("") || "<tr><td colspan='9' class='muted'>暂无批次</td></tr>"}</tbody>`;
+        return items;
+      }
+
+      async function pollBatchUntilDone(batchId) {
+        const msg = document.getElementById("runMsg");
+        highlightBatchId = batchId;
+        const maxTicks = 7200;
+        for (let i = 0; i < maxTicks; i++) {
+          const b = await fetchBatchById(batchId);
+          await loadBatches();
+          if (b) {
+            msg.textContent = formatBatchStatusLine(b, batchId);
+            if (TERMINAL_BATCH.has(String(b.status || ""))) {
+              highlightBatchId = 0;
+              return b;
+            }
+          } else {
+            msg.textContent = `批次 #${batchId} 处理中…`;
+          }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        highlightBatchId = 0;
+        msg.textContent = `批次 #${batchId} 仍在执行；若超过 12 分钟无变化请刷新列表后点续传`;
+        return null;
       }
       async function loadAll() {
         const msg = document.getElementById("runMsg");
@@ -192,6 +328,7 @@
       }
       async function runImport() {
         const msg = document.getElementById("runMsg");
+        const btn = document.querySelector('button[onclick="runImport()"]');
         const code = (document.getElementById("defCode").value || "").trim();
         if (!code) { msg.textContent = "请选择导入类型"; return; }
         const file_path = (document.getElementById("filePath").value || "").trim();
@@ -199,16 +336,24 @@
         const unique_source_columns = rawU
           ? rawU.split(/[,，;；]/).map(s => s.trim()).filter(Boolean)
           : [];
-        msg.textContent = "导入中…";
+        msg.textContent = "提交任务…";
+        if (btn) btn.disabled = true;
         try {
           const ret = await api("/api/admin/data-import/run", {
             method: "POST",
-            body: JSON.stringify({ code, file_path, unique_source_columns }),
+            body: JSON.stringify({ code, file_path, unique_source_columns, background: true }),
           });
-          msg.textContent = ret.message || JSON.stringify(ret);
-          await loadBatches();
+          if (ret.queued && ret.batch_id) {
+            msg.textContent = ret.message || `批次 #${ret.batch_id} 已入队`;
+            await pollBatchUntilDone(ret.batch_id);
+          } else {
+            msg.textContent = ret.message || JSON.stringify(ret);
+            await loadBatches();
+          }
         } catch (e) {
           msg.textContent = formatFetchError(e);
+        } finally {
+          if (btn) btn.disabled = false;
         }
       }
       ensureAuth();

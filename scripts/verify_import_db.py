@@ -8,17 +8,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from app.config import settings
-from app.db import DB_URL
+from app.db import create_app_engine
 
 
 def main() -> None:
     root = Path(settings.strategy_root_dir)
     print("STRATEGY_ROOT_DIR:", root, "| exists:", root.is_dir())
 
-    engine = create_engine(DB_URL, pool_pre_ping=True)
+    engine = create_app_engine()
     with engine.connect() as c:
         cfgs = c.execute(
             text(
@@ -116,7 +116,7 @@ def main() -> None:
 
 
 def simulate_rebalance_queries() -> None:
-    engine = create_engine(DB_URL, pool_pre_ping=True)
+    engine = create_app_engine()
     with engine.connect() as c:
         rows = c.execute(
             text(
@@ -146,7 +146,7 @@ def simulate_rebalance_queries() -> None:
 
 
 def holding_detail() -> None:
-    engine = create_engine(DB_URL, pool_pre_ping=True)
+    engine = create_app_engine()
     with engine.connect() as c:
         r = c.execute(
             text(
@@ -161,9 +161,10 @@ def holding_detail() -> None:
         r2 = c.execute(
             text(
                 """
-                SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.statistics
-                WHERE table_schema = DATABASE() AND table_name = 'strategy_holding_daily'
-                  AND INDEX_NAME = 'uk_daily' ORDER BY SEQ_IN_INDEX
+                SELECT name AS index_name, seq AS seq_in_index
+                FROM pragma_index_list('strategy_holding_daily')
+                WHERE name = 'uk_daily'
+                ORDER BY seq
                 """
             )
         ).fetchall()

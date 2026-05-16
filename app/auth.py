@@ -10,6 +10,7 @@ from starlette.responses import Response
 
 from app.config import settings
 from app.db import get_session
+from app.sql_dialect import sql_curdate, sql_now
 
 # 响应头：携带 JWT 的成功请求由中间件写入新令牌，前端 fetch 包装器写入 localStorage
 ACCESS_TOKEN_RENEWAL_HEADER = "X-Access-Token-Renewal"
@@ -36,10 +37,10 @@ def _record_viewer_activity(db: Session, user_id: int, request: Request) -> None
     try:
         db.execute(
             text(
-                """
+                f"""
                 INSERT INTO user_usage_daily (user_id, usage_date, api_requests)
-                VALUES (:uid, CURDATE(), 1)
-                ON DUPLICATE KEY UPDATE api_requests = api_requests + 1
+                VALUES (:uid, {sql_curdate()}, 1)
+                ON CONFLICT(user_id, usage_date) DO UPDATE SET api_requests = api_requests + 1
                 """
             ),
             {"uid": user_id},
@@ -51,9 +52,9 @@ def _record_viewer_activity(db: Session, user_id: int, request: Request) -> None
             ua = (request.headers.get("user-agent", "") or "")[:512]
             db.execute(
                 text(
-                    """
+                    f"""
                     UPDATE user_devices
-                    SET last_seen_at=NOW(), ip_last=:ip, ua=:ua
+                    SET last_seen_at={sql_now()}, ip_last=:ip, ua=:ua
                     WHERE user_id=:uid AND device_token_hash=:h AND revoked_at IS NULL
                     """
                 ),

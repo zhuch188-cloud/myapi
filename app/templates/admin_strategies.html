@@ -54,6 +54,12 @@
           <input id="file_dir" placeholder="file_dir 可空" />
           <input id="file_name" placeholder="file_name.xlsx" />
         </div>
+        <div class="row">
+          <input id="strategyDataUploadFile" type="file" accept=".xlsx,.xls,.xlsm" style="display:none" />
+          <button type="button" class="secondary" onclick="document.getElementById('strategyDataUploadFile').click()">选择策略 Excel</button>
+          <button type="button" class="secondary" onclick="uploadStrategyDataFile()">上传到服务器（覆盖）</button>
+          <span class="muted" style="font-size:12px">需先填 strategy_id；上传后自动更新 file_dir/file_name（Render 上为 strategies/策略ID/）</span>
+        </div>
         <div class="row" style="align-items:flex-start;flex-wrap:wrap;">
           <div class="muted" style="font-size:13px;line-height:1.5;max-width:720px;">
             <strong>权重模式</strong>：固定为 <code>holding</code>（<strong>持仓权重</strong>）。净值与持仓日快照均按持仓权重计算；Excel 仍可含「行业中性权重」列仅作记录，不参与净值。
@@ -90,18 +96,28 @@
           <button class="secondary" onclick="editSelectedStrategy()">编辑勾选项</button>
           <button onclick="syncSelected('incremental')">增量导入并提取（勾选）</button>
           <button class="secondary" onclick="syncSelected('full')">全量导入并提取（勾选）</button>
+          <button class="secondary" onclick="importSelected('incremental')">仅增量导入 Excel（勾选）</button>
+          <button class="secondary" onclick="importSelected('full')">仅全量导入 Excel（勾选）</button>
           <button class="secondary" onclick="updateLatestSelected()">仅更新最新交易日（勾选）</button>
           <button class="secondary" onclick="deleteSelected()">删除策略（勾选）</button>
           <span id="selectedInfo" class="muted">已勾选 0 个</span>
           <span id="jobMsg" class="muted"></span>
         </div>
         <p class="muted" style="margin:0;font-size:12px;line-height:1.45;">
-          「导入并提取」在后台执行并支持进度轮询，避免长时间占用一条 HTTP 连接导致浏览器报 Failed to fetch（服务端可能仍在写库）。若需排障可 JSON 传 <code>synchronous:true</code> 走同步（易超时）。
+          「导入并提取」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：失败后在下方任务表点「续传」。全量/增量指导入持仓表的方式，与是否重建净值无关（「导入并提取」会额外做净值与快照）。
         </p>
       </div>
       <div class="card">
         <h4>策略配置列表</h4>
         <div class="scroll"><table id="adminCfgTable"></table></div>
+      </div>
+      <div class="card">
+        <h4>策略 Excel 导入任务 <button type="button" class="secondary" onclick="loadImportJobs()">刷新</button></h4>
+        <div class="scroll"><table id="importJobTb"></table></div>
+      </div>
+      <div class="card">
+        <h4>导入并提取任务 <button type="button" class="secondary" onclick="loadSyncJobs()">刷新</button></h4>
+        <div class="scroll"><table id="syncJobTb"></table></div>
       </div>
     </div>
     <script>
@@ -266,9 +282,11 @@
               const tail = st.message ? ` — ${st.message}` : "";
               msg.textContent = `#${st.id} ${st.status}${stg}${tail}`;
               if (st.status !== "QUEUED" && st.status !== "RUNNING") {
+                await loadSyncJobs();
                 const rj = parseSyncResultJson(st.result_json) || {};
                 if (!rj.ok) {
-                  msg.textContent = `执行失败（${rj.stage || st.stage || ""}）：${(rj.errors || []).join("；") || "未知原因"}`;
+                  const hint = st.resumable ? " — 可在下方「导入并提取任务」点续传" : "";
+                  msg.textContent = `执行失败（${rj.stage || st.stage || ""}）：${(rj.errors || []).join("；") || "未知原因"}${hint}`;
                 } else {
                   msg.textContent = `执行成功：导入 ${rj.imported != null ? rj.imported : "—"} 个策略并完成最新交易日提取`;
                   loadAdminStrategies();
@@ -289,6 +307,114 @@
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+      async function uploadStrategyDataFile() {
+        const msg = document.getElementById("msg");
+        const sid = (document.getElementById("strategy_id").value || "").trim();
+        const f = document.getElementById("strategyDataUploadFile").files && document.getElementById("strategyDataUploadFile").files[0];
+        if (!sid) { msg.textContent = "请先填写 strategy_id"; return; }
+        if (!f) { msg.textContent = "请先选择 Excel 文件"; return; }
+        const fd = new FormData();
+        fd.append("file", f);
+        try {
+          msg.textContent = "上传中…";
+          const res = await fetch("/api/admin/strategies/" + encodeURIComponent(sid) + "/upload-data-file", {
+            method: "POST",
+            headers: authHeaders({}),
+            body: fd,
+          });
+          if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+          const body = await res.json();
+          document.getElementById("file_dir").value = body.file_dir || "";
+          document.getElementById("file_name").value = body.file_name || "";
+          msg.textContent = `已上传：${body.path || ""}`;
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      function esc(s) {
+        return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      }
+      async function pollImportJob(jobId) {
+        const msg = document.getElementById("jobMsg");
+        const deadline = Date.now() + 120 * 60 * 1000;
+        while (Date.now() < deadline) {
+          const j = await api("/api/admin/import-jobs/" + encodeURIComponent(String(jobId)));
+          msg.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
+          await loadImportJobs();
+          if (j.status !== "QUEUED" && j.status !== "RUNNING") return j;
+          await sleep(2000);
+        }
+        msg.textContent += "（轮询超时）";
+        return null;
+      }
+      async function importSelected(importMode) {
+        const ids = selectedStrategyIds();
+        const msg = document.getElementById("jobMsg");
+        if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
+        try {
+          msg.textContent = `${importMode === "full" ? "全量" : "增量"}导入已提交…`;
+          const ret = await api("/api/admin/import", {
+            method: "POST",
+            body: JSON.stringify({ strategy_ids: ids, import_mode: importMode, background: true }),
+          });
+          if (ret.import_job_id != null) await pollImportJob(ret.import_job_id);
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      async function resumeImportJob(jobId) {
+        const msg = document.getElementById("jobMsg");
+        try {
+          const ret = await api("/api/admin/import", {
+            method: "POST",
+            body: JSON.stringify({ resume_job_id: jobId }),
+          });
+          msg.textContent = ret.message || `续传任务 #${jobId}`;
+          if (ret.import_job_id != null) await pollImportJob(ret.import_job_id);
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      async function loadImportJobs() {
+        const d = await api("/api/admin/import-jobs?limit=30");
+        const items = d.items || [];
+        document.getElementById("importJobTb").innerHTML = `
+          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>进度</th><th>说明</th><th>操作</th></tr></thead>
+          <tbody>${items.map(j => {
+            const all = (() => { try { return JSON.parse(j.strategy_ids_json || "[]").length; } catch (_) { return "?"; } })();
+            const done = (() => { try { return JSON.parse(j.completed_strategy_ids_json || "[]").length; } catch (_) { return 0; } })();
+            const btn = j.resumable ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="resumeImportJob(${j.id})">续传</button>` : "";
+            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${done}/${all}</td><td>${esc((j.message||"").slice(0,120))}</td><td>${btn}</td></tr>`;
+          }).join("") || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
+      }
+      async function pollSyncJob(jobId) {
+        const msg = document.getElementById("jobMsg");
+        const deadline = Date.now() + 120 * 60 * 1000;
+        while (Date.now() < deadline) {
+          const st = await api("/api/admin/sync-jobs/" + encodeURIComponent(String(jobId)));
+          const stg = st.stage ? ` · ${st.stage}` : "";
+          msg.textContent = `#${st.id} ${st.status}${stg}${st.message ? " — " + st.message : ""}`;
+          await loadSyncJobs();
+          if (st.status !== "QUEUED" && st.status !== "RUNNING") return st;
+          await sleep(2000);
+        }
+        msg.textContent += "（轮询超时）";
+        return null;
+      }
+      async function resumeSyncJob(jobId) {
+        const msg = document.getElementById("jobMsg");
+        try {
+          const ret = await api(`/api/admin/sync-jobs/${jobId}/resume`, { method: "POST" });
+          msg.textContent = ret.message || `续传同步 #${jobId}`;
+          await pollSyncJob(jobId);
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      async function loadSyncJobs() {
+        const d = await api("/api/admin/sync-jobs?limit=20");
+        const items = d.items || [];
+        document.getElementById("syncJobTb").innerHTML = `
+          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>阶段</th><th>说明</th><th>操作</th></tr></thead>
+          <tbody>${items.map(j => {
+            const btn = j.resumable ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="resumeSyncJob(${j.id})">续传</button>` : "";
+            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.stage||"-")}</td><td>${esc((j.message||"").slice(0,120))}</td><td>${btn}</td></tr>`;
+          }).join("") || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
+      }
       async function updateLatestSelected() {
         const ids = selectedStrategyIds();
         const msg = document.getElementById("jobMsg");
@@ -371,6 +497,8 @@
       const pf = JSON.parse(localStorage.getItem("profile") || "{}");
       document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
       loadAdminStrategies();
+      loadImportJobs();
+      loadSyncJobs();
     </script>
 {% include 'partials/site_disclaimer.html' %}
   </body>

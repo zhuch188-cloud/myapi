@@ -20,11 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-from app.db import DB_URL
+from app.db import create_app_engine
 
 
 def _quoted(ids: list[str]) -> str:
@@ -73,7 +73,7 @@ def _run_nav_and_python(db: Session, quoted: str, ids: list[str]) -> tuple[float
 
 
 def main() -> None:
-    engine = create_engine(DB_URL, pool_pre_ping=True)
+    engine = create_app_engine()
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     db: Session = SessionLocal()
     try:

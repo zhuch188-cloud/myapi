@@ -16,6 +16,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from app.config import settings
 from app import wind_bulk, wind_sql
+from app.sql_dialect import sql_minutes_ago, sql_now
 
 _log = logging.getLogger(__name__)
 _job_running = False
@@ -25,11 +26,10 @@ _SID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 def _strategy_excel_path(file_dir: str | None, file_name: str) -> str:
-    """策略 Excel 绝对路径（Windows 下统一为反斜杠，避免 D:/dir\\file 混排）。"""
-    base = Path(str(settings.strategy_root_dir).strip()).expanduser()
-    fd = (file_dir or "").strip().replace("\\", "/").strip("/")
-    p = (base / fd / file_name) if fd else (base / file_name)
-    return os.path.normpath(str(p))
+    """策略 Excel 绝对路径（支持 SERVER_UPLOAD_ROOT 下 strategies/ 与本地 STRATEGY_ROOT_DIR）。"""
+    from app.server_files import resolve_strategy_excel_path
+
+    return resolve_strategy_excel_path(file_dir, file_name)
 
 
 def _safe_return(a: float | None, b: float | None) -> float | None:
@@ -138,7 +138,7 @@ def _excel_meta_strategy_labels(df: pd.DataFrame) -> dict[str, str]:
 
 
 def _mysql_lock_contention(exc: BaseException) -> bool:
-    """InnoDB 1205 lock wait timeout / 1213 deadlock，可短重试。"""
+    """库锁等待 / 死锁（MySQL InnoDB 或 SQLite database is locked），可短重试。"""
     if isinstance(exc, OperationalError):
         orig = getattr(exc, "orig", None)
         if orig is not None and getattr(orig, "args", ()):
@@ -149,7 +149,13 @@ def _mysql_lock_contention(exc: BaseException) -> bool:
             if code in (1205, 1213):
                 return True
     s = str(exc).lower()
-    return "1205" in s or "1213" in s or "lock wait timeout" in s or "deadlock" in s
+    return (
+        "1205" in s
+        or "1213" in s
+        or "lock wait timeout" in s
+        or "deadlock" in s
+        or "database is locked" in s
+    )
 
 
 def _format_update_job_failure_message(exc: BaseException) -> str:
@@ -160,7 +166,7 @@ def _format_update_job_failure_message(exc: BaseException) -> str:
     if _mysql_lock_contention(exc):
         extra = (
             " 【排查】与「导入/同步」或其它会话同时写 strategy_positions、"
-            "strategy_holding_daily 等表时易触发 InnoDB 锁等待；请错开执行。"
+            "strategy_holding_daily 等表时易触发库锁等待；请错开执行。"
         )
     elif "gone away" in low or "lost connection to mysql" in low:
         extra = " 【排查】MySQL 连接中断，检查 max_allowed_packet / wait_timeout / 网络后重试。"
@@ -463,9 +469,9 @@ def _import_write_positions_one_strategy(
                 INSERT INTO strategy_positions
                 (strategy_id, rebalance_date, stock_code, holding_weight, industry_neutral_weight)
                 VALUES (:sid, :rdate, :scode, :hw, :iw)
-                ON DUPLICATE KEY UPDATE
-                  holding_weight=VALUES(holding_weight),
-                  industry_neutral_weight=VALUES(industry_neutral_weight)
+                ON CONFLICT(strategy_id, rebalance_date, stock_code) DO UPDATE SET
+                  holding_weight=excluded.holding_weight,
+                  industry_neutral_weight=excluded.industry_neutral_weight
                 """
             ),
             {"sid": sid, "rdate": rebalance, "scode": code, "hw": holding, "iw": industry_w},
@@ -504,13 +510,184 @@ def normalize_code(code) -> str:
     return text_code
 
 
+def _json_str_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    try:
+        v = json.loads(str(raw))
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+    except json.JSONDecodeError:
+        pass
+    return []
+
+
+def _sync_load_checkpoint(raw: Any) -> dict[str, Any]:
+    if not raw:
+        return {"completed_import": [], "completed_nav": [], "stage": "import"}
+    try:
+        ck = json.loads(str(raw)) if not isinstance(raw, dict) else raw
+        if not isinstance(ck, dict):
+            return {"completed_import": [], "completed_nav": [], "stage": "import"}
+        return {
+            "completed_import": _json_str_list(ck.get("completed_import")),
+            "completed_nav": _json_str_list(ck.get("completed_nav")),
+            "stage": str(ck.get("stage") or "import"),
+        }
+    except json.JSONDecodeError:
+        return {"completed_import": [], "completed_nav": [], "stage": "import"}
+
+
+def _sync_save_checkpoint(
+    db: Session,
+    sync_job_id: int,
+    *,
+    completed_import: list[str],
+    completed_nav: list[str],
+    stage: str,
+    do_commit: bool = True,
+) -> None:
+    body = json.dumps(
+        {
+            "completed_import": completed_import,
+            "completed_nav": completed_nav,
+            "stage": stage,
+        },
+        ensure_ascii=False,
+    )
+    db.execute(
+        text("UPDATE admin_sync_jobs SET checkpoint_json=:c WHERE id=:id"),
+        {"c": body, "id": sync_job_id},
+    )
+    if do_commit:
+        db.commit()
+
+
+def _strategy_import_job_touch(
+    db: Session,
+    job_id: int,
+    *,
+    status: str | None = None,
+    message: str | None = None,
+    completed_ids: list[str] | None = None,
+    imported: int | None = None,
+    failed: int | None = None,
+    errors: list[str] | None = None,
+    do_commit: bool = True,
+) -> None:
+    sets: list[str] = []
+    params: dict[str, Any] = {"id": job_id}
+    if status is not None:
+        sets.append("status=:st")
+        params["st"] = status
+    if message is not None:
+        sets.append("message=:msg")
+        params["msg"] = (message or "")[:6000]
+    if completed_ids is not None:
+        sets.append("completed_strategy_ids_json=:cj")
+        params["cj"] = json.dumps(completed_ids, ensure_ascii=False)
+    if imported is not None:
+        sets.append("imported_count=:ic")
+        params["ic"] = int(imported)
+    if failed is not None:
+        sets.append("failed_count=:fc")
+        params["fc"] = int(failed)
+    if errors is not None:
+        sets.append("errors_json=:ej")
+        params["ej"] = json.dumps(errors[:50], ensure_ascii=False)
+    if not sets:
+        return
+    db.execute(
+        text(f"UPDATE strategy_import_jobs SET {', '.join(sets)} WHERE id=:id"),
+        params,
+    )
+    if do_commit:
+        db.commit()
+
+
+def create_strategy_import_job(
+    db: Session,
+    *,
+    strategy_ids: list[str],
+    import_mode: str,
+    triggered_by: str,
+) -> int:
+    ids = [str(x).strip() for x in strategy_ids if str(x).strip()]
+    res = db.execute(
+        text(
+            """
+            INSERT INTO strategy_import_jobs
+            (status, import_mode, strategy_ids_json, completed_strategy_ids_json,
+             imported_count, failed_count, message, triggered_by)
+            VALUES ('QUEUED', :im, :sj, '[]', 0, 0, :msg, :by)
+            """
+        ),
+        {
+            "im": import_mode,
+            "sj": json.dumps(ids, ensure_ascii=False),
+            "msg": "任务已入队，等待后台执行",
+            "by": triggered_by,
+        },
+    )
+    job_id = int(res.lastrowid or 0)
+    if not job_id:
+        raise RuntimeError("创建策略导入任务失败")
+    return job_id
+
+
+def get_strategy_import_job_row(db: Session, job_id: int) -> dict[str, Any] | None:
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT id, status, import_mode, strategy_ids_json, completed_strategy_ids_json,
+                       imported_count, failed_count, errors_json, message, triggered_by,
+                       created_at, started_at, finished_at
+                FROM strategy_import_jobs
+                WHERE id = :id
+                LIMIT 1
+                """
+            ),
+            {"id": job_id},
+        )
+        .mappings()
+        .first()
+    )
+    return dict(row) if row else None
+
+
+def strategy_import_job_is_resumable(job: dict[str, Any]) -> bool:
+    st = str(job.get("status") or "").upper()
+    if st == "SUCCESS":
+        return False
+    all_ids = set(_json_str_list(job.get("strategy_ids_json")))
+    done = set(_json_str_list(job.get("completed_strategy_ids_json")))
+    return bool(all_ids - done) and st in ("FAILED", "RUNNING", "QUEUED", "PARTIAL")
+
+
 def import_strategy_files(
     db: Session,
     selected_strategy_ids: list[str] | None = None,
     import_mode: str = "full",
     do_commit: bool = True,
+    *,
+    skip_strategy_ids: set[str] | None = None,
+    sync_job_id: int | None = None,
+    strategy_import_job_id: int | None = None,
 ) -> dict:
     selected_set = {str(x).strip() for x in (selected_strategy_ids or []) if str(x).strip()}
+    skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
+
+    if strategy_import_job_id:
+        job = get_strategy_import_job_row(db, int(strategy_import_job_id))
+        if not job:
+            return {"imported": 0, "failed": 1, "errors": ["strategy import job not found"]}
+        selected_set = set(_json_str_list(job.get("strategy_ids_json")))
+        skip |= set(_json_str_list(job.get("completed_strategy_ids_json")))
+        import_mode = str(job.get("import_mode") or import_mode)
+
     if selected_set:
         quoted = ",".join("'" + s.replace("'", "''") + "'" for s in sorted(selected_set))
         sql = (
@@ -520,8 +697,11 @@ def import_strategy_files(
     else:
         sql = "SELECT strategy_id, file_dir, file_name FROM strategy_configs WHERE status='enabled'"
     configs = db.execute(text(sql)).mappings().all()
-    imported, failed = 0, 0
+    imported_new = 0
+    failed = 0
     errors: list[str] = []
+    completed: set[str] = set(skip)
+
     if selected_set:
         found_set = {str(c.get("strategy_id") or "").strip() for c in configs}
         missing = sorted(selected_set - found_set)
@@ -529,13 +709,16 @@ def import_strategy_files(
             failed += 1
             errors.append(f"{sid}: 配置不存在或未启用，未执行导入")
 
-    staged_rows: list[tuple[str, list[tuple[date, str, float | None, float | None]], dict[str, str]]] = []
+    total_targets = len(selected_set) if selected_set else len(configs)
+
     for c in configs:
         file_path = _strategy_excel_path(c.get("file_dir"), c["file_name"])
         sid = str(c.get("strategy_id") or "").strip()
         if not sid:
             failed += 1
             errors.append(f"(空ID) ({c.get('file_name') or ''}): strategy_id 为空，未执行导入")
+            continue
+        if sid in skip:
             continue
         if not _SID_PATTERN.match(sid):
             failed += 1
@@ -553,7 +736,6 @@ def import_strategy_files(
             for col in ("调整日期", "证券代码"):
                 if col not in df.columns:
                     raise ValueError(f"缺少列: {col}")
-            # 日期列容错：个别空值按列 ffill/bfill（无合并单元格时等价于原列）
             dt = pd.to_datetime(df["调整日期"], errors="coerce")
             dt = dt.ffill().bfill()
             df = df.assign(_rebalance_dt=dt)
@@ -575,53 +757,79 @@ def import_strategy_files(
                     else None
                 )
                 rows_to_write.append((rebalance, code, holding, industry_w))
-            staged_rows.append((sid, rows_to_write, label_meta))
-            imported += 1
-        except Exception as ex:
-            failed += 1
-            errors.append(f"{sid} ({c['file_name']}): {ex}")
 
-    if failed > 0:
-        if do_commit:
-            db.rollback()
-        return {"imported": imported, "failed": failed, "errors": errors[:50]}
-
-    try:
-        if do_commit:
-            # 每策略单独提交：缩短持锁时间，避免与 run_update 等长事务互相 1205
-            for sid, rows_to_write, label_meta in staged_rows:
-                for attempt in range(4):
-                    try:
-                        _import_write_positions_one_strategy(
-                            db, sid, rows_to_write, label_meta, import_mode
-                        )
+            for attempt in range(4):
+                try:
+                    _import_write_positions_one_strategy(
+                        db, sid, rows_to_write, label_meta, import_mode
+                    )
+                    if do_commit:
                         db.commit()
-                        break
-                    except OperationalError as oe:
-                        if not _mysql_lock_contention(oe) or attempt >= 3:
+                    break
+                except OperationalError as oe:
+                    if not _mysql_lock_contention(oe) or attempt >= 3:
+                        if do_commit:
                             db.rollback()
-                            raise
+                        raise
+                    if do_commit:
                         db.rollback()
-                        time.sleep(0.25 * (2**attempt))
-        else:
-            for sid, rows_to_write, label_meta in staged_rows:
-                _import_write_positions_one_strategy(
-                    db, sid, rows_to_write, label_meta, import_mode
-                )
-            db.commit()
-    except Exception as ex:
-        if do_commit:
-            db.rollback()
-        hint = ""
-        if _mysql_lock_contention(ex):
-            hint = "（可能与「数据更新」或其它导入并发，请错开执行或稍后重试）"
-        return {
-            "imported": imported,
-            "failed": imported,
-            "errors": [f"写库失败{hint}: {ex}"],
-        }
+                    time.sleep(0.25 * (2**attempt))
 
-    return {"imported": imported, "failed": failed, "errors": errors[:50]}
+            imported_new += 1
+            completed.add(sid)
+            done_list = sorted(completed)
+            prog_msg = f"导入中… 已完成 {len(completed)}/{total_targets} 个策略（本批新增 {imported_new}）"
+            if sync_job_id is not None:
+                ck_row = (
+                    db.execute(
+                        text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                        {"id": sync_job_id},
+                    )
+                    .mappings()
+                    .first()
+                )
+                cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
+                _sync_save_checkpoint(
+                    db,
+                    sync_job_id,
+                    completed_import=done_list,
+                    completed_nav=cp.get("completed_nav") or [],
+                    stage="import",
+                    do_commit=do_commit,
+                )
+            if strategy_import_job_id is not None:
+                _strategy_import_job_touch(
+                    db,
+                    int(strategy_import_job_id),
+                    message=prog_msg,
+                    completed_ids=done_list,
+                    imported=len(completed),
+                    failed=failed,
+                    errors=errors,
+                    do_commit=do_commit,
+                )
+        except Exception as ex:
+            if do_commit:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            failed += 1
+            hint = ""
+            if _mysql_lock_contention(ex):
+                hint = "（可能与「数据更新」或其它导入并发，请错开执行或稍后重试）"
+            errors.append(f"{sid} ({c['file_name']}): {ex}{hint}")
+
+    expected_done = total_targets
+    resumable = len(completed) < expected_done
+    return {
+        "imported": len(completed),
+        "imported_new": imported_new,
+        "failed": failed,
+        "errors": errors[:50],
+        "completed_strategy_ids": sorted(completed),
+        "resumable": resumable,
+    }
 
 
 def run_update(
@@ -991,12 +1199,12 @@ _NAV_INSERT_SQL = text(
     ) VALUES (
       :sid, :td, :nav, :ret, :bret, :bnav, :rb, NULL
     )
-    ON DUPLICATE KEY UPDATE
-      nav_unit=VALUES(nav_unit),
-      daily_ret=VALUES(daily_ret),
-      benchmark_ret=VALUES(benchmark_ret),
-      benchmark_nav=VALUES(benchmark_nav),
-      rebalance_date=VALUES(rebalance_date)
+    ON CONFLICT(strategy_id, trade_date) DO UPDATE SET
+      nav_unit=excluded.nav_unit,
+      daily_ret=excluded.daily_ret,
+      benchmark_ret=excluded.benchmark_ret,
+      benchmark_nav=excluded.benchmark_nav,
+      rebalance_date=excluded.rebalance_date
     """
 )
 
@@ -1316,6 +1524,9 @@ def rebuild_nav_series(
     strategy_ids: list[str],
     mode: str = "incremental",
     do_commit: bool = True,
+    *,
+    skip_strategy_ids: set[str] | None = None,
+    sync_job_id: int | None = None,
 ) -> tuple[dict, Any]:
     """
     导入后同步重建净值：固定股数、收盘调仓，按交易日生成 strategy_nav_daily。返回 (结果字典, 当前 Wind 连接)。
@@ -1369,10 +1580,14 @@ def rebuild_nav_series(
         wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, latest_trade_c)
         wind_bundle = {"eod": eod_all, "idx": idx_all, "td": td_all}
 
-    done = 0
+    skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
+    done = len(skip)
     failed = 0
     errors: list[str] = []
+    completed_nav = sorted(skip)
     for sid in sids:
+        if sid in skip:
+            continue
         try:
             with db.begin_nested():
                 pl = plans.get(sid)
@@ -1392,6 +1607,25 @@ def rebuild_nav_series(
                     )
                 if counted:
                     done += 1
+                    completed_nav.append(sid)
+                    if sync_job_id is not None:
+                        ck_row = (
+                            db.execute(
+                                text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                                {"id": sync_job_id},
+                            )
+                            .mappings()
+                            .first()
+                        )
+                        cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
+                        _sync_save_checkpoint(
+                            db,
+                            sync_job_id,
+                            completed_import=cp.get("completed_import") or [],
+                            completed_nav=sorted(set(completed_nav)),
+                            stage="nav",
+                            do_commit=False,
+                        )
         except Exception as ex:
             failed += 1
             errors.append(f"{sid}: {ex}")
@@ -1406,7 +1640,13 @@ def rebuild_nav_series(
                     pass
     if do_commit:
         db.commit()
-    return {"rebuilt": done, "failed": failed, "errors": errors[:50]}, wind
+    return {
+        "rebuilt": done,
+        "failed": failed,
+        "errors": errors[:50],
+        "completed_nav_ids": sorted(set(completed_nav)),
+        "resumable": len(completed_nav) < len(sids),
+    }, wind
 
 
 def _admin_sync_mark_running(job_id: int) -> None:
@@ -1416,9 +1656,9 @@ def _admin_sync_mark_running(job_id: int) -> None:
     try:
         db.execute(
             text(
-                """
+                f"""
                 UPDATE admin_sync_jobs
-                SET status='RUNNING', started_at=NOW(), stage='start', message=:m
+                SET status='RUNNING', started_at={sql_now()}, stage='start', message=:m
                 WHERE id=:id
                 """
             ),
@@ -1465,13 +1705,13 @@ def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
     try:
         db.execute(
             text(
-                """
+                f"""
                 UPDATE admin_sync_jobs
                 SET status=:st,
-                    finished_at=NOW(),
+                    finished_at={sql_now()},
                     stage=:sg,
                     message=:sm,
-                    result_json=CAST(:rj AS JSON)
+                    result_json=:rj
                 WHERE id=:id
                 """
             ),
@@ -1494,6 +1734,7 @@ def execute_admin_sync_pipeline(
     import_mode: str,
     *,
     sync_job_id: int | None = None,
+    resume: bool = False,
 ) -> dict:
     """
     策略配置「导入并提取」一体化：导入 Excel → 重建净值 → 全量更新持仓快照。
@@ -1514,21 +1755,32 @@ def execute_admin_sync_pipeline(
     wind = None
     imp: dict | None = None
     nav_ret: dict | None = None
+    completed_import: set[str] = set()
+    completed_nav: set[str] = set()
+    if sync_job_id is not None and resume:
+        ck_row = (
+            db.execute(
+                text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                {"id": sync_job_id},
+            )
+            .mappings()
+            .first()
+        )
+        cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
+        completed_import = set(cp.get("completed_import") or [])
+        completed_nav = set(cp.get("completed_nav") or [])
+        if completed_import:
+            p("resume", f"续传：导入阶段已完成 {len(completed_import)} 个策略，净值已完成 {len(completed_nav)} 个")
     try:
         stale_mins = max(1, int(getattr(settings, "stale_running_update_job_minutes", 240)))
         db.execute(
             text(
-                """
+                f"""
                 UPDATE strategy_update_jobs
-                SET status='FAILED', finished_at=NOW(),
-                    message=CONCAT(
-                        COALESCE(message, ''),
-                        '（僵尸RUNNING：已超过 ',
-                        CAST(:mins AS CHAR),
-                        ' 分钟未结束，同步前自动标记失败；若确为长跑任务请调大 STALE_RUNNING_UPDATE_JOB_MINUTES）'
-                    )
+                SET status='FAILED', finished_at={sql_now()},
+                    message=COALESCE(message, '') || '（僵尸RUNNING：已超过 ' || :mins || ' 分钟未结束，同步前自动标记失败；若确为长跑任务请调大 STALE_RUNNING_UPDATE_JOB_MINUTES）'
                 WHERE status='RUNNING'
-                  AND started_at < DATE_SUB(NOW(), INTERVAL :mins MINUTE)
+                  AND started_at < {sql_minutes_ago(':mins')}
                 """
             ),
             {"mins": stale_mins},
@@ -1558,37 +1810,86 @@ def execute_admin_sync_pipeline(
                     f"若确认无进程在跑，可将该条 status 改为 FAILED，或等待超过 {stale_mins} 分钟后重试。"
                 ],
             }
-        p("import", f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}）…")
-        imp = import_strategy_files(
-            db,
-            selected_strategy_ids=ids,
-            import_mode=import_mode,
-            do_commit=True,
-        )
-        if int(imp.get("failed") or 0) > 0:
-            return {"ok": False, "stage": "import", **imp}
+        ids_set = set(ids)
+        if ids_set <= completed_import:
+            imp = {
+                "imported": len(completed_import),
+                "failed": 0,
+                "errors": [],
+                "completed_strategy_ids": sorted(completed_import),
+            }
+            p("import", f"阶段1/3：导入已跳过（{len(completed_import)} 个策略已于断点完成）")
+        else:
+            p(
+                "import",
+                f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}"
+                f"{f'，续传跳过 {len(completed_import)} 个' if completed_import else ''}）…",
+            )
+            imp = import_strategy_files(
+                db,
+                selected_strategy_ids=ids,
+                import_mode=import_mode,
+                do_commit=True,
+                skip_strategy_ids=completed_import,
+                sync_job_id=sync_job_id,
+            )
+            completed_import = set(imp.get("completed_strategy_ids") or [])
+        if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
+            return {
+                "ok": False,
+                "stage": "import",
+                "resumable": True,
+                **imp,
+            }
         t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
         if t1 > 0:
             p("import", f"导入完成，休眠 {t1}s 后进入净值…")
             time.sleep(t1)
-        p("nav", f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略）…")
-        wind = wind_sql.open_wind(db)
-        nav_ret, wind = rebuild_nav_series(
-            db,
-            wind,
-            ids,
-            mode=import_mode,
-            do_commit=True,
-        )
-        if int(nav_ret.get("failed") or 0) > 0:
+        if ids_set <= completed_nav:
+            nav_ret = {
+                "rebuilt": len(completed_nav),
+                "failed": 0,
+                "errors": [],
+                "completed_nav_ids": sorted(completed_nav),
+            }
+            p("nav", f"阶段2/3：净值已跳过（{len(completed_nav)} 个策略已于断点完成）")
+            wind = wind_sql.open_wind(db)
+        else:
+            p(
+                "nav",
+                f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略"
+                f"{f'，续传跳过 {len(completed_nav)} 个' if completed_nav else ''}）…",
+            )
+            wind = wind_sql.open_wind(db)
+            nav_ret, wind = rebuild_nav_series(
+                db,
+                wind,
+                ids,
+                mode=import_mode,
+                do_commit=True,
+                skip_strategy_ids=completed_nav,
+                sync_job_id=sync_job_id,
+            )
+            completed_nav = set(nav_ret.get("completed_nav_ids") or [])
+        if int(nav_ret.get("failed") or 0) > 0 and not ids_set <= completed_nav:
             return {
                 "ok": False,
                 "stage": "nav",
+                "resumable": True,
                 "imported": imp.get("imported", 0),
                 "nav_rebuilt": nav_ret.get("rebuilt", 0),
                 "failed": nav_ret.get("failed", 0),
                 "errors": nav_ret.get("errors", []),
             }
+        if sync_job_id is not None:
+            _sync_save_checkpoint(
+                db,
+                sync_job_id,
+                completed_import=sorted(completed_import),
+                completed_nav=sorted(completed_nav),
+                stage="update",
+                do_commit=True,
+            )
         t2 = float(settings.admin_sync_sleep_after_nav_seconds or 0.0)
         if t2 > 0:
             p("nav", f"净值完成，休眠 {t2}s…")
@@ -1686,12 +1987,14 @@ def run_admin_sync_background_task(
     username: str,
     selected_ids: list[str],
     import_mode: str,
+    *,
+    resume: bool = False,
 ) -> None:
     """供 FastAPI BackgroundTasks 调用：先标 RUNNING，再跑管道并落库终态。"""
     try:
         _admin_sync_mark_running(job_id)
         ret = execute_admin_sync_pipeline(
-            username, selected_ids, import_mode, sync_job_id=job_id
+            username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
         )
         _finalize_admin_sync_job(job_id, ret)
     except Exception as ex:
@@ -1701,9 +2004,99 @@ def run_admin_sync_background_task(
             {
                 "ok": False,
                 "stage": "exception",
+                "resumable": True,
                 "imported": 0,
                 "nav_rebuilt": 0,
                 "failed": len(selected_ids),
                 "errors": [str(ex)],
             },
         )
+
+
+def run_strategy_import_background_task(
+    job_id: int,
+    *,
+    resume: bool = False,
+) -> None:
+    from app.db import SessionLocalFactory
+
+    db = SessionLocalFactory()
+    try:
+        job = get_strategy_import_job_row(db, job_id)
+        if not job:
+            return
+        ids = _json_str_list(job.get("strategy_ids_json"))
+        import_mode = str(job.get("import_mode") or "full")
+        skip = set(_json_str_list(job.get("completed_strategy_ids_json"))) if resume else set()
+        db.execute(
+            text(
+                f"""
+                UPDATE strategy_import_jobs
+                SET status='RUNNING', started_at={sql_now()}, message=:m
+                WHERE id=:id
+                """
+            ),
+            {
+                "m": "续传执行中…" if resume else "后台导入执行中…",
+                "id": job_id,
+            },
+        )
+        db.commit()
+        ret = import_strategy_files(
+            db,
+            selected_strategy_ids=ids,
+            import_mode=import_mode,
+            do_commit=True,
+            skip_strategy_ids=skip,
+            strategy_import_job_id=job_id,
+        )
+        all_ids = set(ids)
+        done = set(ret.get("completed_strategy_ids") or [])
+        ok = all_ids <= done and int(ret.get("failed") or 0) == 0
+        st = "SUCCESS" if ok else "FAILED"
+        if not ok and ret.get("resumable"):
+            st = "FAILED"
+        msg = (
+            f"完成：成功 {len(done)}/{len(all_ids)} 个策略"
+            if ok
+            else f"部分完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」"
+        )
+        db.execute(
+            text(
+                f"""
+                UPDATE strategy_import_jobs
+                SET status=:st, finished_at={sql_now()}, message=:msg,
+                    imported_count=:ic, failed_count=:fc, errors_json=:ej,
+                    completed_strategy_ids_json=:cj
+                WHERE id=:id
+                """
+            ),
+            {
+                "st": st,
+                "msg": msg[:6000],
+                "ic": len(done),
+                "fc": int(ret.get("failed") or 0),
+                "ej": json.dumps(ret.get("errors") or [], ensure_ascii=False),
+                "cj": json.dumps(sorted(done), ensure_ascii=False),
+                "id": job_id,
+            },
+        )
+        db.commit()
+    except Exception as ex:
+        _log.exception("strategy_import job %s failed", job_id)
+        try:
+            db.execute(
+                text(
+                    f"""
+                    UPDATE strategy_import_jobs
+                    SET status='FAILED', finished_at={sql_now()}, message=:m
+                    WHERE id=:id
+                    """
+                ),
+                {"m": f"异常：{str(ex)[:5900]}", "id": job_id},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()

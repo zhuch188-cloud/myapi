@@ -11,17 +11,11 @@ class Settings(BaseSettings):
     # 访问令牌有效期；配合 SlidingJWTAccessMiddleware：每次带有效 JWT 且响应成功时下发新令牌，实现「有操作自动续期」
     access_token_expire_minutes: int = 7 * 24 * 60
 
-    db_host: str = "127.0.0.1"
-    db_port: int = 3306
-    db_user: str = "root"
-    db_password: str = ""
-    db_name: str = "strategy_showcase_dev"
-    # SQLAlchemy 连接池：长跑「同步」+ 后台更新会长时间占连接；默认池过小易导致其它请求卡在取连接、浏览器 Failed to fetch
-    db_pool_size: int = 20
-    db_max_overflow: int = 40
-    db_pool_timeout: int = 120
-    # 秒；定期丢弃池内连接，避免 MySQL wait_timeout 断开后首次使用报错（配合 pool_pre_ping）
-    db_pool_recycle: int = 1800
+    # Turso（libSQL）应用主库
+    turso_database_url: str = ""
+    turso_auth_token: str = ""
+    # 本地嵌入式副本路径（相对项目根）；留空则仅远程连接。副本会同步到 Turso 云端。
+    turso_local_replica: str = ""
 
     # 远程 Wind（SQL Server，WindDB）。必填且须能连通；不再使用 MySQL winddb。
     wind_sqlserver_server: str = ""
@@ -38,10 +32,18 @@ class Settings(BaseSettings):
     wind_inside_holder_rank_column: str = ""
 
     strategy_root_dir: str = r"D:\360云盘\指数部\策略研发与应用\展示策略"
+    # Render 等部署：上传文件落盘目录（与 Turso 同机/同区导入）；留空则仅用本机 STRATEGY_ROOT_DIR
+    server_upload_root: str = ""
+    server_upload_max_mb: int = 200
     # 净值固定股数法：名义初始资金（元），仅用于市值→nav_unit 缩放；序列收益与绝对值无关，默认 1 亿
     strategy_nav_initial_capital: float = 100_000_000.0
     # 补充表导入文件路径；为空则使用 strategy_root_dir/数据/公司资料.xlsx
     supplement_company_excel_path: str = ""
+    # 补充数据导入：每批 executemany 行数；纯远程 Turso 会自动压到 supplement_import_remote_batch_size
+    supplement_import_batch_size: int = 200
+    supplement_import_remote_batch_size: int = 50
+    # RUNNING 超过该分钟数且 progress_at 未更新，视为僵死，可续传
+    supplement_import_stale_running_minutes: int = 12
     # 定时数据更新：分 时 日 月 星期（APScheduler：星期一=0，周一至周五为 0-4）
     daily_job_cron: str = "0 17 * * 0-4"
     # 火山方舟（豆包等）：个股 AI 摘要等使用。ARK_MODEL 为控制台「推理接入点」ID（ep-xxx）或模型名
@@ -63,7 +65,7 @@ class Settings(BaseSettings):
     # 「联系我们」站内信收件箱（仅服务端使用，不在页面展示；可通过 .env 覆盖）
     contact_us_inbox_email: str = "zh1111@88.com"
 
-    # 管理端「同步导入+净值+更新」：各阶段单独提交；阶段之间休眠秒数（0=不等待），减轻 InnoDB 与 Wind 并发压力
+    # 管理端「同步导入+净值+更新」：各阶段单独提交；阶段之间休眠秒数（0=不等待），减轻库与 Wind 并发压力
     admin_sync_sleep_after_import_seconds: float = 0.6
     admin_sync_sleep_after_nav_seconds: float = 0.6
     # strategy_update_jobs 仍为 RUNNING 且 started_at 早于此分钟数：视为僵尸（如进程崩溃未写 FAILED），同步前自动标 FAILED，避免永久 409

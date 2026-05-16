@@ -15,8 +15,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services import normalize_code
+from app.sql_dialect import list_table_columns, quote_ident
 
 CODE_COMPANY_PROFILE_EXCEL = "company_profile_excel"
+_IMPORT_ROW_CHUNK = 200
 
 TABLE_COMPANY_PROFILES = "supplement_company_profiles"
 # 与 supplement_company_profiles 固定列冲突时自动改名（如 Excel 列名恰好为 id）
@@ -27,6 +29,14 @@ _RESERVED_COL_LOWER = frozenset(
 
 class ImportDefinitionNotFoundError(Exception):
     """data_import_definitions 中无对应 code。"""
+
+
+class DataImportBatchNotFoundError(Exception):
+    """data_import_batches 中无对应 id。"""
+
+
+class DataImportBatchNotResumableError(Exception):
+    """批次不可续传（已成功、无进度或文件不可用）。"""
 
 _ENTITY_COLUMN_CANDIDATES = [
     "证券代码",
@@ -39,7 +49,12 @@ _ENTITY_COLUMN_CANDIDATES = [
 ]
 
 
-def default_company_profile_xlsx_path() -> str:
+def default_company_profile_exlsx_path() -> str:
+    from app.server_files import resolve_supplement_upload_path
+
+    server_p = resolve_supplement_upload_path(CODE_COMPANY_PROFILE_EXCEL)
+    if server_p and server_p.is_file():
+        return str(server_p)
     raw = (getattr(settings, "supplement_company_excel_path", None) or "").strip()
     if raw:
         return raw
@@ -126,20 +141,11 @@ _WIND_LIKE = re.compile(r"^[0-9]{6}\.(SH|SZ|BJ)$", re.IGNORECASE)
 
 
 def _quote_ident(name: str) -> str:
-    return "`" + str(name).replace("`", "``") + "`"
+    return quote_ident(name)
 
 
 def _list_table_columns(db: Session, table: str) -> set[str]:
-    rows = db.execute(
-        text(
-            """
-            SELECT COLUMN_NAME FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn
-            """
-        ),
-        {"tn": table},
-    ).fetchall()
-    return {str(r[0]) for r in rows}
+    return list_table_columns(db, table)
 
 
 def _dedupe_excel_headers(raw_cols: list[Any]) -> list[str]:
@@ -225,7 +231,6 @@ def _ensure_profile_columns(db: Session, sql_cols: list[str]) -> None:
                 )
             )
             exist_lower.add(col.lower())
-    db.commit()
 
 
 def _build_upsert_sql(excel_headers: list[str], sql_by_excel: dict[str, str]) -> str:
@@ -238,14 +243,14 @@ def _build_upsert_sql(excel_headers: list[str], sql_by_excel: dict[str, str]) ->
     cols_q.append(_quote_ident("last_batch_id"))
     ph.append(":bid")
     upd_parts = [
-        f"{_quote_ident(sql_by_excel[eh])}=VALUES({_quote_ident(sql_by_excel[eh])})"
+        f"{_quote_ident(sql_by_excel[eh])}=excluded.{_quote_ident(sql_by_excel[eh])}"
         for eh in excel_headers
     ]
-    upd_parts.append(f"{_quote_ident('last_batch_id')}=VALUES({_quote_ident('last_batch_id')})")
+    upd_parts.append(f"{_quote_ident('last_batch_id')}=excluded.{_quote_ident('last_batch_id')}")
     tbl = _quote_ident(TABLE_COMPANY_PROFILES)
     return (
         f"INSERT INTO {tbl} ({', '.join(cols_q)}) VALUES ({', '.join(ph)}) "
-        f"ON DUPLICATE KEY UPDATE {', '.join(upd_parts)}"
+        f"ON CONFLICT(definition_code, stock_code) DO UPDATE SET {', '.join(upd_parts)}"
     )
 
 
@@ -301,6 +306,176 @@ def _read_tabular_file(path: Path, sheet: int | str = 0) -> pd.DataFrame:
     raise ValueError("unsupported import file type")
 
 
+def _uses_remote_turso_only() -> bool:
+    return not bool((getattr(settings, "turso_local_replica", None) or "").strip())
+
+
+def _import_row_chunk() -> int:
+    try:
+        base = max(20, int(getattr(settings, "supplement_import_batch_size", _IMPORT_ROW_CHUNK)))
+        if _uses_remote_turso_only():
+            remote_cap = max(20, int(getattr(settings, "supplement_import_remote_batch_size", 50)))
+            return min(base, remote_cap)
+        return base
+    except Exception:
+        return _IMPORT_ROW_CHUNK
+
+
+def _touch_import_batch_progress(
+    db: Session,
+    batch_id: int,
+    *,
+    rows_ok: int,
+    rows_fail: int,
+    resume_from_row: int,
+    rows_total: int,
+    message: str,
+) -> None:
+    db.execute(
+        text(
+            """
+            UPDATE data_import_batches
+            SET rows_ok=:ok, rows_fail=:fail, resume_from_row=:rr,
+                rows_total=:rt, message=:m, progress_at=datetime('now')
+            WHERE id=:id
+            """
+        ),
+        {
+            "ok": rows_ok,
+            "fail": rows_fail,
+            "rr": resume_from_row,
+            "rt": rows_total,
+            "m": message[:65000],
+            "id": batch_id,
+        },
+    )
+    db.commit()
+
+
+def _import_progress_message(
+    *,
+    phase: str,
+    scanned_to: int,
+    rows_total: int,
+    rows_ok: int,
+    rows_fail: int,
+    batch_from: int | None = None,
+    batch_to: int | None = None,
+) -> str:
+    """phase: scanning | writing | done"""
+    if phase == "writing" and batch_from is not None and batch_to is not None:
+        remote_hint = "（纯远程库单批约 0.5～2 分钟，数字暂不变属正常）" if _uses_remote_turso_only() else ""
+        return (
+            f"正在写入远程库 第 {batch_from}～{batch_to} 行"
+            f" · 已扫行 {scanned_to}/{rows_total}"
+            f" · 写入成功 {rows_ok} · 跳过 {rows_fail}{remote_hint}"
+        )
+    if phase == "scanning":
+        return (
+            f"导入中… 已扫行 {scanned_to}/{rows_total}"
+            f" · 写入成功 {rows_ok} · 跳过 {rows_fail}"
+        )
+    return (
+        f"导入中… 已扫行 {scanned_to}/{rows_total}"
+        f" · 写入成功 {rows_ok} · 跳过 {rows_fail}"
+    )
+
+
+def _flush_upsert_batch(db: Session, upsert_sql: str, pending: list[dict[str, Any]]) -> None:
+    if not pending:
+        return
+    db.execute(text(upsert_sql), pending)
+    pending.clear()
+
+
+def _parse_batch_checkpoint(raw: Any) -> dict[str, Any]:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(str(raw))
+    except json.JSONDecodeError:
+        return {}
+
+
+def get_data_import_batch_row(db: Session, batch_id: int) -> dict[str, Any] | None:
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT id, definition_code, source_file_path, status, rows_ok, rows_fail,
+                       rows_total, resume_from_row, checkpoint_json, message, actor_user_id,
+                       created_at, progress_at
+                FROM data_import_batches
+                WHERE id = :id
+                LIMIT 1
+                """
+            ),
+            {"id": batch_id},
+        )
+        .mappings()
+        .first()
+    )
+    return dict(row) if row else None
+
+
+def batch_is_resumable(batch: dict[str, Any]) -> bool:
+    st = str(batch.get("status") or "").upper()
+    if st == "SUCCESS":
+        return False
+    resume_from = int(batch.get("resume_from_row") or 0)
+    if resume_from <= 0:
+        return False
+    rows_total = batch.get("rows_total")
+    if rows_total is not None and resume_from >= int(rows_total):
+        return False
+    path = (batch.get("source_file_path") or "").strip()
+    return bool(path and Path(path).is_file())
+
+
+def resume_data_import_batch(db: Session, batch_id: int, actor_user_id: int | None) -> dict[str, Any]:
+    """从已有批次断点继续（同一 batch_id，跳过已处理行）。"""
+    batch = get_data_import_batch_row(db, batch_id)
+    if not batch:
+        raise DataImportBatchNotFoundError()
+    if not batch_is_resumable(batch):
+        raise DataImportBatchNotResumableError(
+            f"批次 #{batch_id} 不可续传（status={batch.get('status')}, resume_from_row={batch.get('resume_from_row')})"
+        )
+    ck = _parse_batch_checkpoint(batch.get("checkpoint_json"))
+    merged_unique = [str(x).strip() for x in (ck.get("unique_headers") or []) if str(x).strip()]
+    if not merged_unique and ck.get("unique_source_column"):
+        merged_unique = [
+            p.strip()
+            for p in re.split(r"[,，;；]", str(ck["unique_source_column"]).strip())
+            if p.strip()
+        ]
+    code = str(batch.get("definition_code") or "").strip()
+    path = str(batch.get("source_file_path") or "").strip()
+    if code == CODE_COMPANY_PROFILE_EXCEL:
+        return import_company_profile_excel(
+            db,
+            source_path=path,
+            definition_code=code,
+            actor_user_id=actor_user_id,
+            explicit_unique_headers=merged_unique,
+            existing_batch_id=batch_id,
+            resume=True,
+        )
+    runner = _IMPORT_RUNNERS.get(code)
+    if not runner:
+        raise ValueError("unsupported import code")
+    return runner(
+        db,
+        source_path=path,
+        definition_code=code,
+        actor_user_id=actor_user_id,
+        existing_batch_id=batch_id,
+        resume=True,
+    )
+
+
 def import_company_profile_excel(
     db: Session,
     *,
@@ -308,6 +483,8 @@ def import_company_profile_excel(
     definition_code: str,
     actor_user_id: int | None,
     explicit_unique_headers: list[str],
+    existing_batch_id: int | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     path = Path(source_path)
     if not path.is_file():
@@ -331,7 +508,7 @@ def import_company_profile_excel(
             },
         )
         db.commit()
-        br = db.execute(text("SELECT LAST_INSERT_ID() AS id")).mappings().first()
+        br = db.execute(text("SELECT last_insert_rowid() AS id")).mappings().first()
         return {
             "ok": True,
             "batch_id": int(br["id"]) if br and br.get("id") is not None else 0,
@@ -362,26 +539,80 @@ def import_company_profile_excel(
 
     upsert_sql = _build_upsert_sql(data_headers, sql_by_excel)
     rows_total = len(df)
+    checkpoint_payload = {
+        "unique_headers": list(explicit_unique_headers or []),
+        "unique_source_column": (
+            explicit_unique_headers[0] if len(explicit_unique_headers) == 1 else None
+        ),
+        "key_columns": key_cols,
+    }
+    checkpoint_str = json.dumps(checkpoint_payload, ensure_ascii=False)
+
     rows_ok = 0
     rows_fail = 0
+    resume_from_row = 0
     fail_samples: list[str] = []
 
-    db.execute(
-        text(
-            """
-            INSERT INTO data_import_batches
-            (definition_code, source_file_path, status, rows_ok, rows_fail, message, actor_user_id)
-            VALUES (:dc, :fp, 'RUNNING', 0, 0, '', :uid)
-            """
-        ),
-        {"dc": definition_code, "fp": str(path)[:1024], "uid": actor_user_id},
-    )
-    db.commit()
-    bid_row = db.execute(text("SELECT LAST_INSERT_ID() AS id")).mappings().first()
-    batch_id = int(bid_row["id"]) if bid_row and bid_row.get("id") is not None else 0
+    batch_id = int(existing_batch_id or 0)
+    if batch_id <= 0:
+        db.execute(
+            text(
+                """
+                INSERT INTO data_import_batches
+                (definition_code, source_file_path, status, rows_ok, rows_fail, rows_total,
+                 resume_from_row, checkpoint_json, message, actor_user_id)
+                VALUES (:dc, :fp, 'RUNNING', 0, 0, :rt, 0, :ck, '', :uid)
+                """
+            ),
+            {
+                "dc": definition_code,
+                "fp": str(path)[:1024],
+                "rt": rows_total,
+                "ck": checkpoint_str,
+                "uid": actor_user_id,
+            },
+        )
+        bid_row = db.execute(text("SELECT last_insert_rowid() AS id")).mappings().first()
+        batch_id = int(bid_row["id"]) if bid_row and bid_row.get("id") is not None else 0
+    else:
+        prev = get_data_import_batch_row(db, batch_id) or {}
+        if resume:
+            rows_ok = int(prev.get("rows_ok") or 0)
+            rows_fail = int(prev.get("rows_fail") or 0)
+            resume_from_row = int(prev.get("resume_from_row") or 0)
+            prev_ck = _parse_batch_checkpoint(prev.get("checkpoint_json"))
+            prev_keys = prev_ck.get("key_columns") or []
+            if prev_keys and prev_keys != key_cols:
+                raise ValueError("续传失败：唯一键列与上次导入不一致，请使用相同唯一键配置")
+        db.execute(
+            text(
+                """
+                UPDATE data_import_batches
+                SET status='RUNNING',
+                    rows_total=:rt,
+                    checkpoint_json=:ck,
+                    message=:m
+                WHERE id=:id
+                """
+            ),
+            {
+                "rt": rows_total,
+                "ck": checkpoint_str,
+                "m": f"续传中… 从第 {resume_from_row + 1}/{rows_total} 行继续"
+                if resume and resume_from_row > 0
+                else "",
+                "id": batch_id,
+            },
+        )
+
+    chunk = _import_row_chunk()
+    pending: list[dict[str, Any]] = []
+    last_processed_row = resume_from_row
 
     try:
-        for _, ser in df.iterrows():
+        for row_idx, (_, ser) in enumerate(df.iterrows()):
+            if row_idx < resume_from_row:
+                continue
             ek = _build_entity_key(ser, key_cols)
             if not ek:
                 rows_fail += 1
@@ -395,8 +626,73 @@ def import_company_profile_excel(
             }
             for i, eh in enumerate(data_headers):
                 params[f"c{i}"] = _cell_to_db_text(ser[eh])
-            db.execute(text(upsert_sql), params)
-            rows_ok += 1
+            pending.append(params)
+            if len(pending) >= chunk:
+                n = len(pending)
+                batch_from = row_idx - n + 2
+                batch_to = row_idx + 1
+                if batch_id:
+                    _touch_import_batch_progress(
+                        db,
+                        batch_id,
+                        rows_ok=rows_ok,
+                        rows_fail=rows_fail,
+                        resume_from_row=last_processed_row,
+                        rows_total=rows_total,
+                        message=_import_progress_message(
+                            phase="writing",
+                            scanned_to=row_idx + 1,
+                            rows_total=rows_total,
+                            rows_ok=rows_ok,
+                            rows_fail=rows_fail,
+                            batch_from=batch_from,
+                            batch_to=batch_to,
+                        ),
+                    )
+                _flush_upsert_batch(db, upsert_sql, pending)
+                rows_ok += n
+                if batch_id:
+                    next_row = row_idx + 1
+                    last_processed_row = next_row
+                    resume_from_row = next_row
+                    _touch_import_batch_progress(
+                        db,
+                        batch_id,
+                        rows_ok=rows_ok,
+                        rows_fail=rows_fail,
+                        resume_from_row=next_row,
+                        rows_total=rows_total,
+                        message=_import_progress_message(
+                            phase="scanning",
+                            scanned_to=next_row,
+                            rows_total=rows_total,
+                            rows_ok=rows_ok,
+                            rows_fail=rows_fail,
+                        ),
+                    )
+        if pending:
+            n = len(pending)
+            if batch_id:
+                tail_from = rows_total - n + 1
+                _touch_import_batch_progress(
+                    db,
+                    batch_id,
+                    rows_ok=rows_ok,
+                    rows_fail=rows_fail,
+                    resume_from_row=last_processed_row,
+                    rows_total=rows_total,
+                    message=_import_progress_message(
+                        phase="writing",
+                        scanned_to=last_processed_row,
+                        rows_total=rows_total,
+                        rows_ok=rows_ok,
+                        rows_fail=rows_fail,
+                        batch_from=tail_from,
+                        batch_to=rows_total,
+                    ),
+                )
+            _flush_upsert_batch(db, upsert_sql, pending)
+            rows_ok += n
 
         col_preview = {eh: sql_by_excel[eh] for eh in data_headers[:30]}
         extra = ""
@@ -414,11 +710,18 @@ def import_company_profile_excel(
             text(
                 """
                 UPDATE data_import_batches
-                SET status='SUCCESS', rows_ok=:ok, rows_fail=:fail, message=:m
+                SET status='SUCCESS', rows_ok=:ok, rows_fail=:fail, rows_total=:rt,
+                    resume_from_row=:rt, message=:m, progress_at=datetime('now')
                 WHERE id=:id
                 """
             ),
-            {"ok": rows_ok, "fail": rows_fail, "m": msg[:65000], "id": batch_id},
+            {
+                "ok": rows_ok,
+                "fail": rows_fail,
+                "rt": rows_total,
+                "m": msg[:65000],
+                "id": batch_id,
+            },
         )
         db.commit()
         return {
@@ -440,14 +743,22 @@ def import_company_profile_excel(
                 text(
                     """
                     UPDATE data_import_batches
-                    SET status='FAILED', rows_ok=:ok, rows_fail=:fail, message=:m
+                    SET status='FAILED', rows_ok=:ok, rows_fail=:fail,
+                        resume_from_row=:rr, rows_total=:rt, message=:m,
+                        progress_at=datetime('now')
                     WHERE id=:id
                     """
                 ),
                 {
                     "ok": rows_ok,
                     "fail": rows_fail,
-                    "m": str(e)[:65000],
+                    "rr": last_processed_row,
+                    "rt": rows_total,
+                    "m": (
+                        f"失败（可从第 {last_processed_row + 1} 行续传）：{str(e)[:64000]}"
+                        if last_processed_row < rows_total
+                        else str(e)[:65000]
+                    ),
                     "id": batch_id,
                 },
             )
@@ -470,6 +781,7 @@ def run_import_by_code(
     actor_user_id: int | None,
     unique_source_column: str | None = None,
     unique_source_columns: list[str] | None = None,
+    existing_batch_id: int | None = None,
 ) -> dict[str, Any]:
     row = db.execute(
         text(
@@ -487,12 +799,15 @@ def run_import_by_code(
     if not int(row.get("enabled") or 0):
         raise ValueError("import definition disabled")
 
-    path = (file_path or "").strip()
-    if not path:
-        path = (row.get("default_file_path") or "").strip()
-    if not path:
-        if code == CODE_COMPANY_PROFILE_EXCEL:
-            path = default_company_profile_xlsx_path()
+    from app.server_files import resolve_supplement_import_path
+
+    fallback = default_company_profile_xlsx_path() if code == CODE_COMPANY_PROFILE_EXCEL else ""
+    path = resolve_supplement_import_path(
+        definition_code=code,
+        explicit_path=file_path,
+        default_file_path=(row.get("default_file_path") or ""),
+        fallback_path=fallback,
+    )
     if not path:
         raise ValueError("import file path empty")
 
@@ -516,10 +831,17 @@ def run_import_by_code(
             definition_code=code,
             actor_user_id=actor_user_id,
             explicit_unique_headers=merged_unique,
+            existing_batch_id=existing_batch_id,
         )
 
     runner = _IMPORT_RUNNERS.get(code)
     if not runner:
         raise ValueError("unsupported import code")
 
-    return runner(db, source_path=path, definition_code=code, actor_user_id=actor_user_id)
+    return runner(
+        db,
+        source_path=path,
+        definition_code=code,
+        actor_user_id=actor_user_id,
+        existing_batch_id=existing_batch_id,
+    )
