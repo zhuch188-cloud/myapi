@@ -1,10 +1,10 @@
-# Render Blueprint（也可在 Dashboard 手动填写相同 Build / Start）
+# Render：Wind 需 Microsoft ODBC，请用 Docker 运行时（见 Dockerfile）
+# Dashboard 若仍选「Python」原生运行时，Linux 上没有 ODBC Driver 17，Wind 会 disabled。
 services:
   - type: web
-    runtime: python
     name: myapi
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.0"
