@@ -1291,7 +1291,7 @@ def _rebuild_nav_for_strategy(
     wind_bundle: dict[str, Any] | None = None,
 ) -> tuple[bool, Any]:
     """
-    单策略净值重建（建议 SAVEPOINT / begin_nested 内调用）。固定股数、调仓日按收盘复权价满仓再平衡。
+    单策略净值重建。固定股数、调仓日按收盘复权价满仓再平衡。
     调仓自然日可为非交易日：在序列中首个交易日即按「当前调仓期」持仓用该日收盘价建仓（不跳过该期调仓）。
 
     nav_unit = 收盘组合市值 / 名义本金（settings.strategy_nav_initial_capital，默认 1 亿元）；
@@ -1589,46 +1589,53 @@ def rebuild_nav_series(
         if sid in skip:
             continue
         try:
-            with db.begin_nested():
-                pl = plans.get(sid)
-                if pl:
-                    counted, wind = _rebuild_nav_for_strategy(
+            # Turso 远程 Hrana 不支持 SQLAlchemy SAVEPOINT（sa_savepoint_*），勿用 begin_nested。
+            pl = plans.get(sid)
+            if pl:
+                counted, wind = _rebuild_nav_for_strategy(
+                    db,
+                    wind,
+                    sid,
+                    mode_l,
+                    latest_trade_c_cached=latest_trade_c,
+                    mysql_plan=pl,
+                    wind_bundle=wind_bundle,
+                )
+            else:
+                counted, wind = _rebuild_nav_for_strategy(
+                    db, wind, sid, mode_l, latest_trade_c_cached=latest_trade_c
+                )
+            if counted:
+                done += 1
+                completed_nav.append(sid)
+                if sync_job_id is not None:
+                    ck_row = (
+                        db.execute(
+                            text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                            {"id": sync_job_id},
+                        )
+                        .mappings()
+                        .first()
+                    )
+                    cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
+                    _sync_save_checkpoint(
                         db,
-                        wind,
-                        sid,
-                        mode_l,
-                        latest_trade_c_cached=latest_trade_c,
-                        mysql_plan=pl,
-                        wind_bundle=wind_bundle,
+                        sync_job_id,
+                        completed_import=cp.get("completed_import") or [],
+                        completed_nav=sorted(set(completed_nav)),
+                        stage="nav",
+                        do_commit=False,
                     )
-                else:
-                    counted, wind = _rebuild_nav_for_strategy(
-                        db, wind, sid, mode_l, latest_trade_c_cached=latest_trade_c
-                    )
-                if counted:
-                    done += 1
-                    completed_nav.append(sid)
-                    if sync_job_id is not None:
-                        ck_row = (
-                            db.execute(
-                                text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
-                                {"id": sync_job_id},
-                            )
-                            .mappings()
-                            .first()
-                        )
-                        cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
-                        _sync_save_checkpoint(
-                            db,
-                            sync_job_id,
-                            completed_import=cp.get("completed_import") or [],
-                            completed_nav=sorted(set(completed_nav)),
-                            stage="nav",
-                            do_commit=False,
-                        )
+            if do_commit:
+                db.commit()
         except Exception as ex:
             failed += 1
             errors.append(f"{sid}: {ex}")
+            if do_commit:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
             if _wind_sql_transient_disconnect(ex):
                 try:
                     wind_sql.close_wind(wind, db)
