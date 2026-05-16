@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 净值</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      input, button, select { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      .scroll { overflow-x: auto; }
+      .ret-up { color: #d93026; font-weight: 600; }
+      .ret-down { color: #0d8943; font-weight: 600; }
+      .chart-wrap { border: 1px solid #e9eef5; border-radius: 8px; padding: 8px; background: #fff; width: 100%; box-sizing: border-box; }
+      #navChart { width: 100%; height: 280px; display: block; box-sizing: border-box; }
+      .pager { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+      .year-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin: 6px 0 8px; }
+      .year-btn { padding: 4px 10px; border:1px solid #ccd3de; border-radius: 999px; background:#fff; color:#1b2430; cursor:pointer; }
+      .year-btn.active { background:#2463eb; color:#fff; border-color:#2463eb; }
+      .metrics-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+        margin: 10px 0;
+      }
+      .metric-card { border: 1px solid #e9eef5; border-radius: 8px; padding: 8px 10px; background: #fff; min-width: 0; }
+      .metric-name { color: #667085; font-size: 12px; margin-bottom: 4px; }
+      .metric-value { font-size: 18px; font-weight: 700; color: #1b2430; }
+      .metric-value.pos { color: #d93026; }
+      .metric-value.neg { color: #0d8943; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表盘</a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更新</a>
+        <a href="/admin/nav-check">净值</a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+        <span id="profile" class="muted"></span>
+      </div>
+      <div class="card">
+        <h4>净值</h4>
+        <div class="row">
+          <label>策略</label><select id="strategySel"></select>
+          <label>开始日</label><input id="startDate" type="date" />
+          <label>结束日</label><input id="endDate" type="date" />
+          <button onclick="navPage=1;loadNav()">按范围查询</button>
+          <button class="secondary" onclick="resetRange()">全部日期</button>
+          <label>每页</label>
+          <select id="pageSizeSel" onchange="navPage=1;loadNav()">
+            <option value="20" selected>20</option>
+            <option value="30">30</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <span id="navInfo" class="muted"></span>
+        </div>
+        <div class="chart-wrap" style="margin-bottom:10px;">
+          <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:8px;">
+            <span class="muted">左轴：净值；右轴：收益率</span>
+            <label class="muted" style="font-size:13px;"><input type="checkbox" id="showExcessChk" checked onchange="redrawNavChartOnly()" /> 显示超额折线</label>
+          </div>
+          <canvas id="navChart" width="800" height="280"></canvas>
+        </div>
+        <div id="yearButtons" class="year-row"></div>
+        <div>
+          <div class="muted" style="margin-bottom:6px;">重要指标</div>
+          <div id="metricsGrid" class="metrics-grid"></div>
+        </div>
+        <div class="scroll"><table id="navTable"></table></div>
+        <div class="pager">
+          <button class="secondary" id="navFirst" onclick="navFirstPage()">首页</button>
+          <button class="secondary" id="navPrev" onclick="navPrev()">上一页</button>
+          <button class="secondary" id="navNext" onclick="navNext()">下一页</button>
+          <button class="secondary" id="navLast" onclick="navLastPage()">末页</button>
+          <span id="navPager" class="muted"></span>
+        </div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      let navPage = 1;
+      let navTotalPages = 1;
+      /** 最近一次用于绑图的完整序列（与分页无关），避免 chart_series 为空数组时误判 */
+      let lastChartSeries = [];
+      /** 与 chart 同次的 meta（含 excess_anchor_*），作图收益率与后端超额累计对齐 */
+      let lastChartMeta = {};
+      let navYearsBySid = {};
+      let latestRebalanceBySid = {};
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); location.href = "/admin-login"; }
+      async function api(path, options = {}) {
+        let res;
+        try {
+          res = await fetch(path, { ...options, headers: authHeaders(options.headers || {}) });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+        return res.json();
+      }
+      function pct(v) { return v == null ? "-" : (v * 100).toFixed(2) + "%"; }
+      function valPct(v) { return v == null ? "--" : `${(Number(v) * 100).toFixed(2)}%`; }
+      function valNum(v) { return v == null ? "--" : Number(v).toFixed(2); }
+      function metricValue(v, type) {
+        if (type === "pct") return valPct(v);
+        if (type === "num") return valNum(v);
+        return (v == null ? "--" : String(v));
+      }
+      function metricClass(v, type, key) {
+        if (key === "annual_volatility" || key === "win_rate") return "";
+        if (type !== "pct") return "";
+        if (v == null || !Number.isFinite(Number(v))) return "";
+        const n = Number(v);
+        if (n > 0) return "pos";
+        if (n < 0) return "neg";
+        return "";
+      }
+      function renderMetrics(metrics) {
+        const defs = [
+          ["累计收益率", "cum_return", "pct"],
+          ["累计超额收益率", "excess_cum_return", "pct"],
+          ["年化收益率", "annual_return", "pct"],
+          ["最近一周回报", "week_return", "pct"],
+          ["本月回报", "month_return", "pct"],
+          ["本年回报", "year_return", "pct"],
+          ["年化波动率", "annual_volatility", "pct"],
+          ["最大回撤", "max_drawdown", "pct"],
+          ["日胜率", "win_rate", "pct"],
+          ["夏普比率", "sharpe", "num"],
+          ["Calmar比率", "calmar", "num"],
+          ["信息比率(IR)", "information_ratio", "num"],
+        ];
+        const html = defs.map(([name, key, tp]) => {
+          const raw = metrics ? metrics[key] : null;
+          const v = metricValue(metrics ? metrics[key] : null, tp);
+          const cls = metricClass(raw, tp, key);
+          return `<div class="metric-card"><div class="metric-name">${name}</div><div class="metric-value ${cls}">${v}</div></div>`;
+        }).join("");
+        document.getElementById("metricsGrid").innerHTML = html;
+      }
+      async function loadAllYears(sid) {
+        if (!sid) return;
+        if (Array.isArray(navYearsBySid[sid]) && navYearsBySid[sid].length) return;
+        try {
+          const ret = await api(`/api/strategies/${sid}/nav-years`);
+          navYearsBySid[sid] = (ret.items || [])
+            .map((x) => String(x))
+            .filter((x) => /^\d{4}$/.test(x))
+            .sort();
+        } catch (_) {
+          navYearsBySid[sid] = [];
+        }
+      }
+      async function loadLatestRebalanceDate(sid) {
+        if (!sid) return;
+        if (latestRebalanceBySid[sid] !== undefined) return;
+        try {
+          const ret = await api(`/api/strategies/${sid}/rebalance-dates`);
+          const arr = ret.items || [];
+          latestRebalanceBySid[sid] = arr.length ? String(arr[0]).slice(0, 10) : "";
+        } catch (_) {
+          latestRebalanceBySid[sid] = "";
+        }
+      }
+      function fmtLocalYMD(d) {
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, "0");
+        const day = String(d.getDate()).padStart(2, "0");
+        return `${y}-${m}-${day}`;
+      }
+      function getLastYearRange() {
+        const end = new Date();
+        const start = new Date(end.getFullYear() - 1, end.getMonth(), end.getDate());
+        return { start: fmtLocalYMD(start), end: fmtLocalYMD(end) };
+      }
+      function applyDefaultNavLastYearRange() {
+        const r = getLastYearRange();
+        document.getElementById("startDate").value = r.start;
+        document.getElementById("endDate").value = r.end;
+      }
+      function renderYearButtons(sid) {
+        const el = document.getElementById("yearButtons");
+        const years = navYearsBySid[sid] || [];
+        const latestRb = latestRebalanceBySid[sid] || "";
+        const sd = document.getElementById("startDate").value || "";
+        const ed = document.getElementById("endDate").value || "";
+        const allActive = (!sd && !ed) ? "active" : "";
+        const yr = getLastYearRange();
+        const yearActive = (sd === yr.start && ed === yr.end) ? "active" : "";
+        const curActive = (latestRb && sd === latestRb && !ed) ? "active" : "";
+        const parts = [
+          `<span class="muted">年度快捷：</span>`,
+          `<button class="year-btn ${allActive}" onclick="pickAllYears()">全部</button>`,
+          `<button class="year-btn ${yearActive}" onclick="pickLastYear()">最近一年</button>`,
+        ];
+        if (latestRb) parts.push(`<button class="year-btn ${curActive}" onclick="pickCurrentPeriod()">本期</button>`);
+        years.forEach((y) => {
+          const active = (sd === `${y}-01-01` && ed === `${y}-12-31`) ? "active" : "";
+          parts.push(`<button class="year-btn ${active}" onclick="pickYear('${y}')">${y}</button>`);
+        });
+        el.innerHTML = parts.join("");
+      }
+      function pickAllYears() {
+        document.getElementById("startDate").value = "";
+        document.getElementById("endDate").value = "";
+        navPage = 1;
+        loadNav();
+      }
+      function pickLastYear() {
+        const r = getLastYearRange();
+        document.getElementById("startDate").value = r.start;
+        document.getElementById("endDate").value = r.end;
+        navPage = 1;
+        loadNav();
+      }
+      function pickCurrentPeriod() {
+        const sid = document.getElementById("strategySel").value;
+        const rb = latestRebalanceBySid[sid] || "";
+        if (!rb) return;
+        document.getElementById("startDate").value = rb;
+        document.getElementById("endDate").value = "";
+        navPage = 1;
+        loadNav();
+      }
+      function pickYear(y) {
+        document.getElementById("startDate").value = `${y}-01-01`;
+        document.getElementById("endDate").value = `${y}-12-31`;
+        navPage = 1;
+        loadNav();
+      }
+      function pctSigned(v) {
+        const t = pct(v); if (v == null) return t;
+        const n = Number(v); if (n > 0) return `<span class="ret-up">${t}</span>`;
+        if (n < 0) return `<span class="ret-down">${t}</span>`; return t;
+      }
+      /**
+       * 收益率对齐：若 meta 含 excess_anchor_nav / excess_anchor_bench（与后端超额累计一致），
+       * 否则退化为序列中首个双正点作锚。
+       */
+      function alignedReturnSeries(items, anchorMeta) {
+        const n = items.length;
+        const strat = new Array(n).fill(null);
+        const bench = new Array(n).fill(null);
+        const excess = new Array(n).fill(null);
+        const m = anchorMeta || {};
+        const n0s = m.excess_anchor_nav != null ? Number(m.excess_anchor_nav) : NaN;
+        const b0s = m.excess_anchor_bench != null ? Number(m.excess_anchor_bench) : NaN;
+        if (Number.isFinite(n0s) && n0s > 0 && Number.isFinite(b0s) && b0s > 0) {
+          let anchor = -1;
+          for (let i = 0; i < n; i++) {
+            const nu = Number(items[i].nav_unit);
+            const bn = Number(items[i].benchmark_nav);
+            if (Number.isFinite(nu) && nu > 0) strat[i] = nu / n0s - 1;
+            if (Number.isFinite(bn) && bn > 0) bench[i] = bn / b0s - 1;
+            if (strat[i] != null && bench[i] != null) {
+              excess[i] = (1 + strat[i]) / (1 + bench[i]) - 1;
+              if (anchor < 0) anchor = i;
+            }
+          }
+          return { strat, bench, excess, anchor: anchor >= 0 ? anchor : 0, navBase: n0s };
+        }
+        let anchor = -1;
+        for (let i = 0; i < n; i++) {
+          const nu = Number(items[i].nav_unit);
+          const bn = Number(items[i].benchmark_nav);
+          if (Number.isFinite(nu) && nu > 0 && Number.isFinite(bn) && bn > 0) {
+            anchor = i;
+            break;
+          }
+        }
+        if (anchor < 0) return { strat, bench, excess, anchor, navBase: null };
+        const n0 = Number(items[anchor].nav_unit);
+        const b0 = Number(items[anchor].benchmark_nav);
+        for (let i = anchor; i < n; i++) {
+          const bn = Number(items[i].benchmark_nav);
+          const nu = Number(items[i].nav_unit);
+          if (Number.isFinite(nu) && nu > 0) {
+            strat[i] = nu / n0 - 1;
+          }
+          if (Number.isFinite(bn) && bn > 0) {
+            bench[i] = bn / b0 - 1;
+          }
+          if (strat[i] != null && bench[i] != null) {
+            excess[i] = (1 + strat[i]) / (1 + bench[i]) - 1;
+          }
+        }
+        return { strat, bench, excess, anchor, navBase: n0 };
+      }
+      function redrawNavChartOnly() {
+        drawNavChart(lastChartSeries);
+      }
+      function drawNavChart(items) {
+        const c = document.getElementById("navChart");
+        const wrap = c.closest(".chart-wrap");
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        let w = wrap ? Math.floor(wrap.clientWidth) : 800;
+        if (!w || w < 320) w = 800;
+        const h = 280;
+        c.style.width = w + "px";
+        c.style.height = h + "px";
+        c.width = Math.floor(w * dpr);
+        c.height = Math.floor(h * dpr);
+        const ctx = c.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, w, h);
+        const n = items.length;
+        if (!n) {
+          ctx.fillStyle = "#667085";
+          ctx.font = "13px Arial";
+          ctx.fillText("暂无净值数据", 12, 24);
+          return;
+        }
+        const vals = items.map(x => Number(x.nav_unit)).filter(x => Number.isFinite(x));
+        if (!vals.length) {
+          ctx.fillStyle = "#667085";
+          ctx.font = "13px Arial";
+          ctx.fillText("暂无净值数据（若表格有数据，请刷新或检查接口 chart_series）", 12, 24);
+          return;
+        }
+        const showExcess = document.getElementById("showExcessChk") && document.getElementById("showExcessChk").checked;
+        const ret = alignedReturnSeries(items, lastChartMeta);
+        const stratRet = ret.strat;
+        const benchRet = ret.bench;
+        const excessRet = ret.excess;
+        const hasStrat = stratRet.some((v) => v != null && Number.isFinite(v));
+        const hasBench = benchRet.some((v) => v != null && Number.isFinite(v));
+        const hasExcess = showExcess && excessRet.some((v) => v != null && Number.isFinite(v));
+        const padL = 48, padR = (hasStrat || hasBench || hasExcess) ? 62 : 14, padT = 8, padB = 42;
+        /** 顶部单独留给图例，K 线与收益率折线不进入该区域，避免与标签重叠 */
+        const legendBand = 28;
+        const plotTop = padT + legendBand;
+        const plotW = w - padL - padR;
+        const plotH = h - plotTop - padB;
+        const anchorIdx = ret.anchor >= 0 ? ret.anchor : 0;
+        const metaNav = lastChartMeta && lastChartMeta.excess_anchor_nav != null ? Number(lastChartMeta.excess_anchor_nav) : NaN;
+        const anchorNav = Number.isFinite(metaNav) && metaNav > 0 ? metaNav : Number(items[anchorIdx]?.nav_unit);
+        const yOfNav = (v) => {
+          if (!Number.isFinite(anchorNav) || anchorNav <= 0 || !Number.isFinite(v)) return plotTop + plotH / 2;
+          const r = v / anchorNav - 1;
+          return yOfRet(r);
+        };
+        const xOf = (i, n0) => padL + (n0 <= 1 ? 0 : (i * plotW / (n0 - 1)));
+        let yOfRight = null;
+        let yOfRet = null;
+        let rtTop = 0;
+        let rtBottom = 0;
+        if (hasStrat || hasBench || hasExcess) {
+          const rs = [];
+          for (const v of stratRet) if (v != null && Number.isFinite(v)) rs.push(v);
+          for (const v of benchRet) if (v != null && Number.isFinite(v)) rs.push(v);
+          if (hasExcess) for (const v of excessRet) if (v != null && Number.isFinite(v)) rs.push(v);
+          rtTop = rs.length ? Math.max(0, ...rs) : 0;
+          rtBottom = rs.length ? Math.min(0, ...rs) : 0;
+          if (rtTop <= rtBottom) { rtTop = rtBottom + 1e-8; }
+          yOfRet = (r) => {
+            if (!Number.isFinite(r)) return plotTop + plotH / 2;
+            return plotTop + (rtTop - r) * plotH / (rtTop - rtBottom);
+          };
+          yOfRight = yOfRet;
+        } else {
+          yOfRet = (_r) => plotTop + plotH / 2;
+        }
+        const yBase = yOfRet(0);
+        let vMin = Math.min(...vals), vMax = Math.max(...vals);
+        if (Number.isFinite(anchorNav) && anchorNav > 0) {
+          vMin = anchorNav * (1 + rtBottom);
+          vMax = anchorNav * (1 + rtTop);
+        } else if (vMax <= vMin) {
+          vMax = vMin + 1e-6;
+        }
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, padT, w, legendBand + 1);
+        ctx.strokeStyle = "#e9eef5";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, plotTop);
+        ctx.lineTo(w, plotTop);
+        ctx.stroke();
+        ctx.font = "11px Arial";
+        let lx = padL + 4, ly = padT + 8;
+        ctx.fillStyle = "#d93026";
+        ctx.fillRect(lx, ly, 10, 6);
+        ctx.fillStyle = "#1b2430";
+        ctx.fillText("策略", lx + 14, ly + 6);
+        lx += 52;
+        const drawLineLegend = (name, color, dash = []) => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.setLineDash(dash);
+          ctx.beginPath();
+          ctx.moveTo(lx, ly + 3);
+          ctx.lineTo(lx + 14, ly + 3);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = "#1b2430";
+          ctx.fillText(name, lx + 18, ly + 6);
+          lx += 70;
+        };
+        if (hasStrat) drawLineLegend("策略%", "#f5a873");
+        if (hasBench) drawLineLegend("基准%", "#2463eb");
+        if (hasExcess) drawLineLegend("超额%", "#7c3aed", [5, 3]);
+        ctx.strokeStyle = "#e9eef5";
+        ctx.lineWidth = 1;
+        for (let k = 0; k <= 4; k++) {
+          const y = plotTop + k * plotH / 4;
+          ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+        }
+        ctx.fillStyle = "#667085";
+        ctx.font = "12px Arial";
+        ctx.textAlign = "left";
+        ctx.fillText(vMax.toFixed(2), 6, plotTop + 11);
+        ctx.fillText(vMin.toFixed(2), 6, plotTop + plotH);
+        // 参考基线：右轴 0% 与起点净值落在同一水平线
+        ctx.strokeStyle = "#cfd8e3";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, yBase); ctx.lineTo(w - padR, yBase); ctx.stroke();
+        // 横轴日期（稀疏标注）
+        const nLab = Math.min(8, Math.max(2, Math.floor(plotW / 90)));
+        ctx.fillStyle = "#667085";
+        ctx.textAlign = "center";
+        ctx.font = "11px Arial";
+        for (let k = 0; k < nLab; k++) {
+          const i = Math.round((n - 1) * (k / Math.max(nLab - 1, 1)));
+          const x = xOf(i, n);
+          const td = items[i] && items[i].trade_date;
+          const s = td == null ? "" : String(td).replace("T", " ").slice(0, 10);
+          ctx.fillText(s, x, h - 10);
+        }
+        if (yOfRight) {
+          ctx.textAlign = "right";
+          ctx.fillStyle = "#667085";
+          ctx.fillText((rtTop * 100).toFixed(0) + "%", w - 6, plotTop + 11);
+          ctx.fillText("0%", w - 6, yBase + 4);
+          ctx.fillText((rtBottom * 100).toFixed(0) + "%", w - 6, plotTop + plotH);
+        }
+        ctx.textAlign = "left";
+        // 策略 K 线
+        const bwBase = Math.max(2, Math.min(8, plotW / Math.max(n, 1) * 0.55));
+        const drawCandle = (xCenter, bodyW, high, low, open, close, upColor, downColor) => {
+          const yH = yOfNav(high), yL = yOfNav(low), yO = yOfNav(open), yC = yOfNav(close);
+          const up = close >= open;
+          ctx.strokeStyle = up ? upColor : downColor;
+          ctx.fillStyle = up ? upColor : downColor;
+          ctx.beginPath(); ctx.moveTo(xCenter, yH); ctx.lineTo(xCenter, yL); ctx.stroke();
+          const top = Math.min(yO, yC), bh = Math.max(1, Math.abs(yC - yO));
+          ctx.fillRect(xCenter - bodyW / 2, top, bodyW, bh);
+        };
+        for (let i = 0; i < n; i++) {
+          const close = Number(items[i].nav_unit);
+          if (!Number.isFinite(close)) continue;
+          const prev = i > 0 ? Number(items[i - 1].nav_unit) : close;
+          const open = Number.isFinite(prev) ? prev : close;
+          const high = Math.max(open, close), low = Math.min(open, close);
+          const x = xOf(i, n);
+          drawCandle(x, bwBase, high, low, open, close, "#d93026", "#0d8943");
+        }
+        const strokeLine = (arr, color, dash = []) => {
+          if (!yOfRight) return;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.setLineDash(dash);
+          ctx.beginPath();
+          let started = false;
+          for (let i = 0; i < n; i++) {
+            const v = arr[i];
+            if (v == null || !Number.isFinite(v)) { started = false; continue; }
+            const x = xOf(i, n), y = yOfRight(v);
+            if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+        };
+        if (hasStrat) strokeLine(stratRet, "#f5a873");
+        if (hasBench) strokeLine(benchRet, "#2463eb");
+        if (hasExcess) strokeLine(excessRet, "#7c3aed", [5, 3]);
+      }
+      function navPrev() { if (navPage > 1) { navPage -= 1; loadNav(); } }
+      function navNext() { navPage += 1; loadNav(); }
+      function navFirstPage() { if (navPage !== 1) { navPage = 1; loadNav(); } }
+      function navLastPage() { if (navPage !== navTotalPages) { navPage = navTotalPages; loadNav(); } }
+      function resetRange() {
+        document.getElementById("startDate").value = "";
+        document.getElementById("endDate").value = "";
+        navPage = 1;
+        loadNav();
+      }
+      async function loadStrategies() {
+        const data = await api("/api/strategies");
+        const sel = document.getElementById("strategySel");
+        sel.innerHTML = (data.items || []).map(i => `<option value="${i.strategy_id}">${i.strategy_name} (${i.strategy_id})</option>`).join("");
+        navYearsBySid = {};
+        latestRebalanceBySid = {};
+        navPage = 1;
+        if ((data.items || []).length) {
+          applyDefaultNavLastYearRange();
+          loadNav();
+        }
+      }
+      async function loadNav() {
+        const sid = document.getElementById("strategySel").value;
+        if (!sid) return;
+        await loadAllYears(sid);
+        await loadLatestRebalanceDate(sid);
+        const ps = Number(document.getElementById("pageSizeSel").value || 20);
+        const q = new URLSearchParams({
+          page: String(navPage),
+          page_size: String(ps),
+          chart: "1",
+        });
+        const sd = document.getElementById("startDate").value;
+        const ed = document.getElementById("endDate").value;
+        if (sd) q.set("start_date", sd);
+        if (ed) q.set("end_date", ed);
+        const data = await api(`/api/strategies/${sid}/nav?${q.toString()}`);
+        const mQ = new URLSearchParams();
+        if (sd) mQ.set("start_date", sd);
+        if (ed) mQ.set("end_date", ed);
+        const metricsResp = await api(`/api/strategies/${sid}/nav-metrics?${mQ.toString()}`);
+        renderMetrics(metricsResp.metrics || {});
+        const items = data.items || [];
+        let series = Array.isArray(data.chart_series) && data.chart_series.length ? data.chart_series : items;
+        renderYearButtons(sid);
+        lastChartSeries = series;
+        lastChartMeta = data.meta || {};
+        const total = data.total != null ? data.total : items.length;
+        const meta = data.meta || {};
+        const bc = meta.benchmark_code || "-";
+        const bn = meta.benchmark_name || "";
+        const benchLbl = bn ? `${bn}（${bc}）` : `${bc}`;
+        const totalPages = Math.max(1, Math.ceil(total / ps));
+        navTotalPages = totalPages;
+        if (navPage > totalPages) { navPage = totalPages; return loadNav(); }
+        document.getElementById("navInfo").textContent =
+          `${sid}：基准：${benchLbl}`;
+        document.getElementById("navPager").textContent =
+          `第 ${navPage} / ${totalPages} 页（本页 ${items.length} 条）`;
+        document.getElementById("navFirst").disabled = navPage <= 1;
+        document.getElementById("navPrev").disabled = navPage <= 1;
+        document.getElementById("navNext").disabled = navPage >= totalPages;
+        document.getElementById("navLast").disabled = navPage >= totalPages;
+        drawNavChart(series);
+        requestAnimationFrame(() => { drawNavChart(lastChartSeries); });
+        document.getElementById("navTable").innerHTML = `
+          <thead><tr>
+            <th>日期</th><th>单位净值</th><th>当日收益</th>
+            <th>基准当日</th><th>超额(当日)</th><th>超额(累计)</th>
+            <th>调仓日</th>
+          </tr></thead>
+          <tbody>${items.map(i => `<tr>
+            <td>${i.trade_date||"-"}</td>
+            <td>${i.nav_unit==null?"-":Number(i.nav_unit).toFixed(2)}</td>
+            <td>${pctSigned(i.daily_ret)}</td>
+            <td>${pctSigned(i.benchmark_ret)}</td>
+            <td>${pctSigned(i.excess_daily)}</td>
+            <td>${pctSigned(i.excess_cumulative)}</td>
+            <td>${i.rebalance_date||"-"}</td>
+          </tr>`).join("")}</tbody>`;
+      }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      let resizeRedrawT;
+      window.addEventListener("resize", () => {
+        clearTimeout(resizeRedrawT);
+        resizeRedrawT = setTimeout(redrawNavChartOnly, 120);
+      });
+      loadStrategies();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

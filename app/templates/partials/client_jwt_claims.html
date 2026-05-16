@@ -1,0 +1,16 @@
+      function _jwtPayloadClient(token) {
+        try {
+          var parts = String(token || "").split(".");
+          if (parts.length < 2) return null;
+          var b = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+          var pad = b.length % 4;
+          if (pad) b += "====".slice(0, 4 - pad);
+          return JSON.parse(atob(b));
+        } catch (_) {
+          return null;
+        }
+      }
+      function _clientJwtIsPasswordAuth(token) {
+        var p = _jwtPayloadClient(token);
+        return !!(p && p.client_auth === "password");
+      }

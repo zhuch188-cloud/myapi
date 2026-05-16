@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 登录</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 460px; margin: 80px auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+      input, button { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      .pwd-wrap { display: flex; width: 100%; gap: 8px; align-items: center; }
+      .pwd-wrap input { flex: 1 1 auto; width: auto; }
+      button.eye-btn {
+        min-width: 52px;
+        padding: 8px 10px;
+        background: #fff;
+        border: 1px solid #ccd3de;
+        color: #667085;
+        font-size: 13px;
+        line-height: 1;
+      }
+      button.eye-btn:hover { background: #f8fafc; }
+      .muted { color: #667085; }
+      #bootScreen {
+        min-height: 200px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+      #bootScreen .boot-line { font-size: 14px; color: #475569; }
+      #loginShell { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="bootScreen" class="container">
+      <h3 style="margin:0;">后台管理</h3>
+      <p class="boot-line">正在验证登录…</p>
+    </div>
+    <div id="loginShell" class="container">
+      <div class="card">
+        <h3>后台管理登录</h3>
+        <div class="row"><input id="username" placeholder="用户名 / 邮箱 / 手机 / 昵称" value="admin" /></div>
+        <div class="row">
+          <div class="pwd-wrap">
+            <input id="password" type="password" placeholder="密码" value="admin123" />
+            <button id="togglePwdBtn" class="eye-btn" type="button" onclick="togglePasswordVisibility()" aria-label="显示密码" title="显示密码">显示</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:2px;">
+          <label class="muted" style="display:flex;align-items:center;gap:6px;">
+            <input id="rememberChk" type="checkbox" checked style="width:auto;" />
+            记录用户名和密码
+          </label>
+        </div>
+        <div class="row">
+          <button onclick="login('/admin')">登录并进入后台</button>
+          <button type="button" onclick="location.href='/'">前往策略前台登录</button>
+          <span id="msg" class="muted"></span>
+        </div>
+        <p class="muted" style="margin:0;font-size:12px;"><a href="/">策略前台登录页</a></p>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      var ADMIN_LAST_LOGIN_IDENTIFIER_KEY = "admin_last_login_identifier";
+      var ADMIN_REMEMBERED_CREDENTIALS_KEY = "admin_remembered_credentials";
+      function getDeviceToken() {
+        return localStorage.getItem("device_token") || "";
+      }
+      function setDeviceToken(v) {
+        if (v) localStorage.setItem("device_token", v);
+      }
+      function setLastLoginIdentifier(v) {
+        var s = String(v || "").trim();
+        if (!s) return;
+        try {
+          localStorage.setItem(ADMIN_LAST_LOGIN_IDENTIFIER_KEY, s);
+        } catch (_) {}
+      }
+      function getLastLoginIdentifier() {
+        return localStorage.getItem(ADMIN_LAST_LOGIN_IDENTIFIER_KEY) || "";
+      }
+      function saveRememberedCredentials(identifier, password) {
+        try {
+          localStorage.setItem(
+            ADMIN_REMEMBERED_CREDENTIALS_KEY,
+            JSON.stringify({ identifier: String(identifier || "").trim(), password: String(password || "") })
+          );
+        } catch (_) {}
+      }
+      function clearRememberedCredentials() {
+        try {
+          localStorage.removeItem(ADMIN_REMEMBERED_CREDENTIALS_KEY);
+        } catch (_) {}
+      }
+      function restoreRememberedCredentials() {
+        try {
+          var raw = localStorage.getItem(ADMIN_REMEMBERED_CREDENTIALS_KEY);
+          if (!raw) return false;
+          var o = JSON.parse(raw);
+          var ident = String((o && o.identifier) || "").trim();
+          var pwd = String((o && o.password) || "");
+          if (!ident || !pwd) return false;
+          document.getElementById("username").value = ident;
+          document.getElementById("password").value = pwd;
+          document.getElementById("rememberChk").checked = true;
+          setLastLoginIdentifier(ident);
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+      async function tryIdentifyByDevice() {
+        const tk = getDeviceToken();
+        if (!tk) return;
+        const ret = await fetch("/api/auth/device/identify?device_token=" + encodeURIComponent(tk));
+        if (!ret.ok) return;
+        const data = await ret.json();
+        if (data && data.ok && data.username && !getLastLoginIdentifier().trim() && !document.getElementById("username").value.trim()) {
+          document.getElementById("username").value = data.username;
+        }
+      }
+      function applyAdminAuthSuccess(data, nextPath) {
+        localStorage.setItem("token", data.access_token);
+        localStorage.setItem("profile", JSON.stringify(data.profile || {}));
+        const inputId = document.getElementById("username").value;
+        const inputPwd = document.getElementById("password").value;
+        setLastLoginIdentifier(inputId);
+        if (document.getElementById("rememberChk").checked) {
+          saveRememberedCredentials(inputId, inputPwd);
+        } else {
+          clearRememberedCredentials();
+        }
+        if (data.device_token) setDeviceToken(data.device_token);
+        if (data.must_change_password) {
+          location.href = "/client-change-password";
+          return;
+        }
+        location.href = nextPath || "/admin";
+      }
+      function showAdminLoginForm() {
+        var b = document.getElementById("bootScreen");
+        var s = document.getElementById("loginShell");
+        if (b) b.style.display = "none";
+        if (s) s.style.display = "block";
+      }
+      async function login(nextPath) {
+        const form = new FormData();
+        form.append("username", document.getElementById("username").value);
+        form.append("password", document.getElementById("password").value);
+        form.append("remember", document.getElementById("rememberChk").checked ? "true" : "false");
+        form.append("device_token", getDeviceToken());
+        const el = document.getElementById("msg");
+        try {
+          const ret = await fetch("/api/auth/login", { method: "POST", body: form });
+          if (!ret.ok) {
+            let errMsg = "登录失败";
+            try {
+              const e = await ret.json();
+              errMsg = (e && (e.detail || e.message)) ? String(e.detail || e.message) : errMsg;
+            } catch (_) {
+              try {
+                errMsg = await ret.text() || errMsg;
+              } catch (_) {}
+            }
+            throw new Error(errMsg);
+          }
+          const data = await ret.json();
+          applyAdminAuthSuccess(data, nextPath);
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
+      function togglePasswordVisibility() {
+        const pwd = document.getElementById("password");
+        const btn = document.getElementById("togglePwdBtn");
+        const show = pwd.type === "password";
+        pwd.type = show ? "text" : "password";
+        btn.textContent = show ? "隐藏" : "显示";
+        btn.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
+        btn.setAttribute("title", show ? "隐藏密码" : "显示密码");
+      }
+      (async function initLoginPage() {
+        const hasRemembered = restoreRememberedCredentials();
+        const preferred = getLastLoginIdentifier().trim();
+        if (preferred) document.getElementById("username").value = preferred;
+        await tryIdentifyByDevice();
+        if (preferred) document.getElementById("username").value = preferred;
+        if (hasRemembered) restoreRememberedCredentials();
+        /* 从登录页进入不自动跳转后台：须点击「登录并进入后台」（即使有有效 token / 已记住密码） */
+        showAdminLoginForm();
+      })();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

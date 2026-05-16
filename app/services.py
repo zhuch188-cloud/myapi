@@ -1,0 +1,1709 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+from collections import defaultdict
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
+from app.config import settings
+from app import wind_bulk, wind_sql
+
+_log = logging.getLogger(__name__)
+_job_running = False
+# 单批越小，Wind SQL Server 上「多表 OUTER APPLY」越不易被对端掐断(10054)；过大会整批失败
+_WIND_QUOTE_CHUNK = 30
+_SID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _strategy_excel_path(file_dir: str | None, file_name: str) -> str:
+    """策略 Excel 绝对路径（Windows 下统一为反斜杠，避免 D:/dir\\file 混排）。"""
+    base = Path(str(settings.strategy_root_dir).strip()).expanduser()
+    fd = (file_dir or "").strip().replace("\\", "/").strip("/")
+    p = (base / fd / file_name) if fd else (base / file_name)
+    return os.path.normpath(str(p))
+
+
+def _safe_return(a: float | None, b: float | None) -> float | None:
+    if a is None or b is None:
+        return None
+    if a <= 0 or b <= 0:
+        return None
+    return a / b - 1.0
+
+
+def _compact_date(v: object) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y%m%d")
+    if isinstance(v, date):
+        return v.strftime("%Y%m%d")
+    s = str(v).strip().replace("-", "")
+    return s[:8] if len(s) >= 8 else s.zfill(8)
+
+
+def _wind_code_key(code) -> str:
+    """与 Wind 行情 dict 查找统一（大小写、首尾空格）。"""
+    if code is None:
+        return ""
+    return str(code).strip().upper()
+
+
+def _row_sql_date(v: object) -> date | None:
+    """MySQL DATE/DATETIME 等转为 date，便于比较调仓日与快照日。"""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return datetime.fromisoformat(str(v).strip()[:10]).date()
+    except ValueError:
+        return None
+
+
+def _adj_close_td_ff(
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    sc: str,
+    td: str,
+    last_close_fill: dict[str, float],
+) -> float | None:
+    """当日复权收盘；无则沿用最近一次有效收盘（前向填充）。"""
+    row = day_map.get(sc, {}).get(td)
+    if row:
+        cl, _ = row
+        if cl is not None and not (isinstance(cl, float) and cl != cl) and cl > 0:
+            last_close_fill[sc] = float(cl)
+            return float(cl)
+    pv = last_close_fill.get(sc)
+    return pv if pv is not None and pv > 0 else None
+
+
+def _strategy_nav_notional_capital() -> float:
+    """固定股数法名义本金（元），nav_unit = 收盘市值 / 该值；收益序列与取值无关。"""
+    v = float(settings.strategy_nav_initial_capital)
+    return v if v > 0 else 100_000_000.0
+
+
+def _job_progress(db: Session, job_id: int, message: str, do_commit: bool = True) -> None:
+    """更新任务进度（写入 message，便于前端轮询 / 人工查库）。"""
+    msg = (message or "")[:2000]
+    db.execute(
+        text(
+            "UPDATE strategy_update_jobs SET message=:m WHERE id=:id AND status='RUNNING'"
+        ),
+        {"m": msg, "id": job_id},
+    )
+    if do_commit:
+        db.commit()
+
+
+def _excel_meta_strategy_labels(df: pd.DataFrame) -> dict[str, str]:
+    """从持仓 Excel 读取策略级「分类」「调仓频率」（列存在即写入，可多行取首个非空）。"""
+    out: dict[str, str] = {}
+    if "分类" in df.columns or "策略分类" in df.columns:
+        val = ""
+        for col in ("分类", "策略分类"):
+            if col not in df.columns:
+                continue
+            for x in df[col].tolist():
+                if x is None or (isinstance(x, float) and pd.isna(x)):
+                    continue
+                t = str(x).strip()
+                if t:
+                    val = t[:128]
+                    break
+        out["strategy_category"] = val
+    if "调仓频率" in df.columns:
+        val = ""
+        for x in df["调仓频率"].tolist():
+            if x is None or (isinstance(x, float) and pd.isna(x)):
+                continue
+            t = str(x).strip()
+            if t:
+                val = t[:128]
+                break
+        out["rebalance_frequency"] = val
+    return out
+
+
+def _mysql_lock_contention(exc: BaseException) -> bool:
+    """InnoDB 1205 lock wait timeout / 1213 deadlock，可短重试。"""
+    if isinstance(exc, OperationalError):
+        orig = getattr(exc, "orig", None)
+        if orig is not None and getattr(orig, "args", ()):
+            try:
+                code = int(orig.args[0])
+            except (TypeError, ValueError):
+                code = None
+            if code in (1205, 1213):
+                return True
+    s = str(exc).lower()
+    return "1205" in s or "1213" in s or "lock wait timeout" in s or "deadlock" in s
+
+
+def _format_update_job_failure_message(exc: BaseException) -> str:
+    """写入 strategy_update_jobs.message，附常见原因便于运维排查。"""
+    base = str(exc)[:60000]
+    low = base.lower()
+    extra = ""
+    if _mysql_lock_contention(exc):
+        extra = (
+            " 【排查】与「导入/同步」或其它会话同时写 strategy_positions、"
+            "strategy_holding_daily 等表时易触发 InnoDB 锁等待；请错开执行。"
+        )
+    elif "gone away" in low or "lost connection to mysql" in low:
+        extra = " 【排查】MySQL 连接中断，检查 max_allowed_packet / wait_timeout / 网络后重试。"
+    elif "no trade date" in low:
+        extra = " 【排查】Wind 库无交易日数据或无法连接 Wind SQL Server。"
+    elif "wind sql server" in low or "wind" in low and "未初始化" in base:
+        extra = " 【排查】Wind 远程库未配置或 ODBC 失败，见应用启动日志与 .env 中 WIND_SQLSERVER_*。"
+    elif "10054" in base or "08s01" in low or "通讯链接失败" in base:
+        extra = (
+            " 【排查】Wind SQL Server 连接被中断(10054/08S01)，常见于单次查询股票过多、"
+            "执行超时或网络不稳；程序已分批拉取，若仍失败请检查 VPN、防火墙与 SQL Server 超时设置。"
+        )
+    return (base + extra)[:65000]
+
+
+def _mark_update_job_failed(db: Session, job_id: int, message: str, do_commit: bool) -> None:
+    """将任务标为 FAILED；主 Session 失效时用新连接补写，避免界面长期卡在 RUNNING。"""
+    params = {"ft": datetime.now(), "m": message[:65000], "id": job_id}
+    upd = text(
+        "UPDATE strategy_update_jobs SET status='FAILED', finished_at=:ft, message=:m WHERE id=:id"
+    )
+    try:
+        db.execute(upd, params)
+        if do_commit:
+            db.commit()
+    except Exception:
+        if do_commit:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        try:
+            from app.db import SessionLocalFactory
+
+            db2 = SessionLocalFactory()
+            try:
+                db2.execute(upd, params)
+                db2.commit()
+            finally:
+                db2.close()
+        except Exception:
+            pass
+
+
+def _wind_sql_transient_disconnect(exc: BaseException) -> bool:
+    """pyodbc / SQL Server 执行中断、连接被对端关闭等，可换连接重试。"""
+    s = str(exc).lower()
+    if "10054" in s or "08s01" in s:
+        return True
+    if "通讯链接失败" in str(exc) or "远程主机强迫关闭" in str(exc):
+        return True
+    return "connection" in s and ("forcibly closed" in s or "broken pipe" in s)
+
+
+def _fetch_wind_quote_map_batched(
+    db: Session,
+    wind: Any,
+    stock_codes: list[str],
+    td_compact: object,
+) -> tuple[Any, dict[str, Any]]:
+    """
+    sql_quote_batch 在数百只股票 + 多表 OUTER APPLY 时，单条 SQL 易触发 SQL Server 超时或断连(10054)。
+    按批 IN 查询并合并；遇瞬断则关闭连接后从池取新连接重试。
+    """
+    quote_map: dict[str, Any] = {}
+    td = str(td_compact).strip()
+    w = wind
+    chunk = _WIND_QUOTE_CHUNK
+    for i in range(0, len(stock_codes), chunk):
+        part = stock_codes[i : i + chunk]
+        quoted = ",".join("'" + c.replace("'", "''") + "'" for c in part)
+        if not quoted:
+            continue
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                rows = w.execute(
+                    text(wind_sql.sql_quote_batch(quoted)),
+                    {"td_compact": td},
+                ).mappings().all()
+                for row in rows:
+                    quote_map[_wind_code_key(row["stock_code"])] = row
+                break
+            except Exception as ex:
+                if attempt >= max_attempts - 1 or not _wind_sql_transient_disconnect(ex):
+                    raise
+                _log.warning(
+                    "Wind sql_quote_batch 分批失败 sid_chunk=%s..%s attempt=%s: %s",
+                    i,
+                    min(i + chunk, len(stock_codes)),
+                    attempt + 1,
+                    ex,
+                )
+                time.sleep(0.5 * (2**attempt))
+                try:
+                    w.close()
+                except Exception:
+                    pass
+                w = wind_sql.open_wind(db)
+    return w, quote_map
+
+
+_HOLDING_INSERT_CHUNK = 200
+_HOLDING_INSERT_SQL = text(
+    """
+    INSERT INTO strategy_holding_daily(
+      strategy_id, trade_date, rebalance_date, stock_code, stock_name,
+      period_weight, latest_weight, latest_price, last_1d_pct, period_return,
+      ret_5d, ret_20d, ret_60d, ret_ytd, market_cap, industry_name, pe, pb
+    ) VALUES (
+      :strategy_id, :trade_date, :rebalance_date, :stock_code, :stock_name,
+      :period_weight, :latest_weight, :latest_price, :last_1d_pct, :period_return,
+      :ret_5d, :ret_20d, :ret_60d, :ret_ytd, :market_cap, :industry_name, :pe, :pb
+    )
+    """
+)
+
+
+def _flush_strategy_holding_daily_batch(db: Session, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    for i in range(0, len(rows), _HOLDING_INSERT_CHUNK):
+        chunk = rows[i : i + _HOLDING_INSERT_CHUNK]
+        db.execute(_HOLDING_INSERT_SQL, chunk)
+
+
+def _run_update_try_build_work_item(
+    db: Session,
+    cfg: Any,
+    trade_date: date,
+    full_refresh: bool,
+    job_id: int,
+    do_commit: bool,
+) -> dict[str, Any] | None:
+    """
+    若本策略本次 run_update 应跳过或无可处理持仓，返回 None（并已写进度）；
+    否则返回后续计算所需的元数据（不再重复查 positions / rebalance 列表）。
+    """
+    sid = cfg["strategy_id"]
+    bench_code_raw = cfg.get("benchmark_code")
+    bench_code = str(bench_code_raw or "").strip().upper() if bench_code_raw else ""
+    last_row = db.execute(
+        text(
+            """
+            SELECT MAX(trade_date) AS d
+            FROM strategy_holding_daily
+            WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": sid},
+    ).mappings().first()
+    last_td = last_row["d"] if last_row else None
+    if (not full_refresh) and last_td is not None and last_td >= trade_date:
+        rb_pos_row = db.execute(
+            text("SELECT MAX(rebalance_date) AS m FROM strategy_positions WHERE strategy_id=:sid"),
+            {"sid": sid},
+        ).mappings().first()
+        rb_hold_row = db.execute(
+            text(
+                """
+                SELECT MAX(rebalance_date) AS m
+                FROM strategy_holding_daily
+                WHERE strategy_id=:sid AND trade_date=:td
+                """
+            ),
+            {"sid": sid, "td": trade_date},
+        ).mappings().first()
+        mx_pos = rb_pos_row.get("m") if rb_pos_row else None
+        mx_hold = rb_hold_row.get("m") if rb_hold_row else None
+        dp = _row_sql_date(mx_pos)
+        dh = _row_sql_date(mx_hold)
+        if dp is not None and dh is not None and dp <= dh:
+            _job_progress(
+                db,
+                job_id,
+                f"{sid}：增量跳过（行情日={trade_date} 快照已含调仓至 {dh}）",
+                do_commit=do_commit,
+            )
+            return None
+    rebalance_rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT rebalance_date
+            FROM strategy_positions
+            WHERE strategy_id=:sid
+            ORDER BY rebalance_date DESC
+            """
+        ),
+        {"sid": sid},
+    ).mappings().all()
+    if not rebalance_rows:
+        return None
+    latest_rb = rebalance_rows[0]["rebalance_date"]
+    latest_rb_compact = (
+        latest_rb.strftime("%Y%m%d")
+        if hasattr(latest_rb, "strftime")
+        else str(latest_rb).replace("-", "")[:8]
+    )
+    rb_positions: list = []
+    code_keys: set[str] = set()
+    min_rb_date: date | None = None
+    for rb in rebalance_rows:
+        rebalance = rb["rebalance_date"]
+        if min_rb_date is None or rebalance < min_rb_date:
+            min_rb_date = rebalance
+        positions = db.execute(
+            text(
+                """
+                SELECT stock_code, holding_weight, industry_neutral_weight
+                FROM strategy_positions
+                WHERE strategy_id=:sid AND rebalance_date=:rd
+                """
+            ),
+            {"sid": sid, "rd": rebalance},
+        ).mappings().all()
+        rb_positions.append((rebalance, positions))
+        for p in positions:
+            if p.get("stock_code"):
+                code_keys.add(_wind_code_key(p["stock_code"]))
+    stock_codes = sorted(code_keys)
+    if not stock_codes or min_rb_date is None:
+        return None
+    start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
+    return {
+        "cfg": cfg,
+        "sid": sid,
+        "bench_code": bench_code,
+        "trade_date": trade_date,
+        "latest_rb": latest_rb,
+        "latest_rb_compact": latest_rb_compact,
+        "n_rb": len(rebalance_rows),
+        "rb_positions": rb_positions,
+        "stock_codes": stock_codes,
+        "min_rb_date": min_rb_date,
+        "start_c": start_c,
+    }
+
+
+def _run_update_prefetch_wind_merged(
+    db: Session,
+    wind: Any,
+    work_items: list[dict[str, Any]],
+    latest_trade_compact: str,
+) -> tuple[Any, dict[str, Any] | None]:
+    """对本轮待处理策略合并拉取 Wind EOD / 指数 / 行情，减少 SQL Server 往返。"""
+    union_codes: set[str] = set()
+    union_bench: set[str] = set()
+    global_st: str | None = None
+    for w in work_items:
+        for c in w["stock_codes"]:
+            union_codes.add(c)
+        bc = str(w.get("bench_code") or "").strip().upper()
+        if bc:
+            union_bench.add(bc)
+        st = w["start_c"]
+        if global_st is None or st < global_st:
+            global_st = st
+    if not union_codes or not global_st:
+        return wind, None
+    lt = str(latest_trade_compact).strip()
+    wind, eod_all = wind_bulk.load_eod_by_code(wind, sorted(union_codes), global_st, lt, db)
+    idx_all: dict[str, list] = {}
+    if union_bench:
+        wind, idx_all = wind_bulk.load_index_eod_by_code(
+            wind, sorted(union_bench), global_st, lt, db
+        )
+    wind, quote_all = _fetch_wind_quote_map_batched(db, wind, sorted(union_codes), lt)
+    wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, lt)
+    return wind, {"eod": eod_all, "idx": idx_all, "quote": quote_all, "td": td_all}
+
+
+def _import_write_positions_one_strategy(
+    db: Session,
+    sid: str,
+    rows_to_write: list[tuple[date, str, float | None, float | None]],
+    label_meta: dict[str, str],
+    import_mode: str,
+) -> None:
+    """单策略：删/增 strategy_positions，可选更新 strategy_configs 元数据（不含 commit）。"""
+    if import_mode == "full":
+        db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
+        write_rows = rows_to_write
+    else:
+        max_row = db.execute(
+            text(
+                """
+                SELECT MAX(rebalance_date) AS d
+                FROM strategy_positions
+                WHERE strategy_id=:sid
+                """
+            ),
+            {"sid": sid},
+        ).mappings().first()
+        max_rb = max_row["d"] if max_row else None
+        write_rows = [x for x in rows_to_write if (max_rb is None or x[0] > max_rb)]
+    for rebalance, code, holding, industry_w in write_rows:
+        db.execute(
+            text(
+                """
+                INSERT INTO strategy_positions
+                (strategy_id, rebalance_date, stock_code, holding_weight, industry_neutral_weight)
+                VALUES (:sid, :rdate, :scode, :hw, :iw)
+                ON DUPLICATE KEY UPDATE
+                  holding_weight=VALUES(holding_weight),
+                  industry_neutral_weight=VALUES(industry_neutral_weight)
+                """
+            ),
+            {"sid": sid, "rdate": rebalance, "scode": code, "hw": holding, "iw": industry_w},
+        )
+    if label_meta:
+        keys = list(label_meta.keys())
+        sets = ", ".join(f"{k}=:{k}" for k in keys)
+        params = {k: label_meta[k] for k in keys}
+        params["sid"] = sid
+        db.execute(
+            text(f"UPDATE strategy_configs SET {sets} WHERE strategy_id=:sid"),
+            params,
+        )
+
+
+def normalize_code(code) -> str:
+    """证券代码：支持 Wind 风格字符串，以及 Excel 读出的 int/float（如 600000.0）。"""
+    if code is None or (isinstance(code, float) and pd.isna(code)):
+        raise ValueError("empty stock code")
+    if isinstance(code, bool):
+        raise ValueError("invalid stock code")
+    if isinstance(code, int):
+        text_code = str(code)
+    elif isinstance(code, float):
+        text_code = str(int(code)) if code.is_integer() else str(code).strip().upper()
+    else:
+        text_code = str(code).strip().upper()
+        if len(text_code) > 2 and text_code[-2:] == ".0" and text_code[:-2].isdigit():
+            text_code = text_code[:-2]
+    if "." in text_code:
+        return text_code
+    if len(text_code) == 6 and text_code.startswith("6"):
+        return f"{text_code}.SH"
+    if len(text_code) == 6:
+        return f"{text_code}.SZ"
+    return text_code
+
+
+def import_strategy_files(
+    db: Session,
+    selected_strategy_ids: list[str] | None = None,
+    import_mode: str = "full",
+    do_commit: bool = True,
+) -> dict:
+    selected_set = {str(x).strip() for x in (selected_strategy_ids or []) if str(x).strip()}
+    if selected_set:
+        quoted = ",".join("'" + s.replace("'", "''") + "'" for s in sorted(selected_set))
+        sql = (
+            "SELECT strategy_id, file_dir, file_name FROM strategy_configs "
+            f"WHERE status='enabled' AND strategy_id IN ({quoted})"
+        )
+    else:
+        sql = "SELECT strategy_id, file_dir, file_name FROM strategy_configs WHERE status='enabled'"
+    configs = db.execute(text(sql)).mappings().all()
+    imported, failed = 0, 0
+    errors: list[str] = []
+    if selected_set:
+        found_set = {str(c.get("strategy_id") or "").strip() for c in configs}
+        missing = sorted(selected_set - found_set)
+        for sid in missing:
+            failed += 1
+            errors.append(f"{sid}: 配置不存在或未启用，未执行导入")
+
+    staged_rows: list[tuple[str, list[tuple[date, str, float | None, float | None]], dict[str, str]]] = []
+    for c in configs:
+        file_path = _strategy_excel_path(c.get("file_dir"), c["file_name"])
+        sid = str(c.get("strategy_id") or "").strip()
+        if not sid:
+            failed += 1
+            errors.append(f"(空ID) ({c.get('file_name') or ''}): strategy_id 为空，未执行导入")
+            continue
+        if not _SID_PATTERN.match(sid):
+            failed += 1
+            errors.append(
+                f"{sid} ({c.get('file_name') or ''}): strategy_id 非法，仅允许字母/数字/下划线/中划线，且需以字母或数字开头"
+            )
+            continue
+        if not os.path.isfile(file_path):
+            failed += 1
+            errors.append(f"{sid} ({c['file_name']}): 文件不存在: {file_path}")
+            continue
+        try:
+            df = pd.read_excel(file_path, sheet_name=0)
+            label_meta = _excel_meta_strategy_labels(df)
+            for col in ("调整日期", "证券代码"):
+                if col not in df.columns:
+                    raise ValueError(f"缺少列: {col}")
+            # 日期列容错：个别空值按列 ffill/bfill（无合并单元格时等价于原列）
+            dt = pd.to_datetime(df["调整日期"], errors="coerce")
+            dt = dt.ffill().bfill()
+            df = df.assign(_rebalance_dt=dt)
+            df = df.loc[df["_rebalance_dt"].notna() & df["证券代码"].notna()].copy()
+            if df.empty:
+                raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
+
+            rows_to_write: list[tuple[date, str, float | None, float | None]] = []
+            for _, row in df.iterrows():
+                ts = row["_rebalance_dt"]
+                rebalance = ts.date() if hasattr(ts, "date") else pd.Timestamp(ts).date()
+                code = normalize_code(row["证券代码"])
+                holding = (
+                    float(row["持仓权重"]) if "持仓权重" in df.columns and pd.notna(row["持仓权重"]) else None
+                )
+                industry_w = (
+                    float(row["行业中性权重"])
+                    if "行业中性权重" in df.columns and pd.notna(row["行业中性权重"])
+                    else None
+                )
+                rows_to_write.append((rebalance, code, holding, industry_w))
+            staged_rows.append((sid, rows_to_write, label_meta))
+            imported += 1
+        except Exception as ex:
+            failed += 1
+            errors.append(f"{sid} ({c['file_name']}): {ex}")
+
+    if failed > 0:
+        if do_commit:
+            db.rollback()
+        return {"imported": imported, "failed": failed, "errors": errors[:50]}
+
+    try:
+        if do_commit:
+            # 每策略单独提交：缩短持锁时间，避免与 run_update 等长事务互相 1205
+            for sid, rows_to_write, label_meta in staged_rows:
+                for attempt in range(4):
+                    try:
+                        _import_write_positions_one_strategy(
+                            db, sid, rows_to_write, label_meta, import_mode
+                        )
+                        db.commit()
+                        break
+                    except OperationalError as oe:
+                        if not _mysql_lock_contention(oe) or attempt >= 3:
+                            db.rollback()
+                            raise
+                        db.rollback()
+                        time.sleep(0.25 * (2**attempt))
+        else:
+            for sid, rows_to_write, label_meta in staged_rows:
+                _import_write_positions_one_strategy(
+                    db, sid, rows_to_write, label_meta, import_mode
+                )
+            db.commit()
+    except Exception as ex:
+        if do_commit:
+            db.rollback()
+        hint = ""
+        if _mysql_lock_contention(ex):
+            hint = "（可能与「数据更新」或其它导入并发，请错开执行或稍后重试）"
+        return {
+            "imported": imported,
+            "failed": imported,
+            "errors": [f"写库失败{hint}: {ex}"],
+        }
+
+    return {"imported": imported, "failed": failed, "errors": errors[:50]}
+
+
+def run_update(
+    db: Session,
+    job_type: str,
+    triggered_by: str,
+    full_refresh: bool = False,
+    selected_strategy_ids: list[str] | None = None,
+    do_commit: bool = True,
+    existing_job_id: int | None = None,
+) -> None:
+    global _job_running
+    if _job_running:
+        raise RuntimeError(
+            "另一项数据更新正在本进程内执行（例如后台「立即更新」尚未结束，或与定时任务重叠）。"
+            "请待其完成后再操作；全量同步最后一步会占用同一互斥锁。"
+        )
+    _job_running = True
+
+    started = datetime.now()
+    if existing_job_id is not None:
+        job_id = int(existing_job_id)
+    else:
+        job_id = db.execute(
+            text(
+                """
+                INSERT INTO strategy_update_jobs(job_type,status,triggered_by,started_at)
+                VALUES (:jt,'RUNNING',:by,:st)
+                """
+            ),
+            {"jt": job_type, "by": triggered_by, "st": started},
+        ).lastrowid
+        if do_commit:
+            db.commit()
+
+    wind = None
+    try:
+        wind = wind_sql.open_wind(db)
+        mtd = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
+        latest_trade = mtd["d"] if mtd else None
+        if not latest_trade:
+            raise RuntimeError("No trade date in winddb")
+        trade_date = datetime.strptime(str(latest_trade), "%Y%m%d").date()
+
+        selected_set = {str(x).strip() for x in (selected_strategy_ids or []) if str(x).strip()}
+        if selected_set:
+            quoted = ",".join("'" + s.replace("'", "''") + "'" for s in sorted(selected_set))
+            configs_sql = f"""
+                SELECT c.strategy_id, c.benchmark_code, c.benchmark_name
+                FROM strategy_configs c
+                WHERE c.status = 'enabled'
+                  AND c.strategy_id IN ({quoted})
+                ORDER BY (
+                    SELECT COUNT(DISTINCT p.rebalance_date)
+                    FROM strategy_positions p
+                    WHERE p.strategy_id = c.strategy_id
+                ) ASC,
+                c.strategy_id ASC
+                """
+        else:
+            configs_sql = """
+                SELECT c.strategy_id, c.benchmark_code, c.benchmark_name
+                FROM strategy_configs c
+                WHERE c.status = 'enabled'
+                ORDER BY (
+                    SELECT COUNT(DISTINCT p.rebalance_date)
+                    FROM strategy_positions p
+                    WHERE p.strategy_id = c.strategy_id
+                ) ASC,
+                c.strategy_id ASC
+                """
+        configs = db.execute(text(configs_sql)).mappings().all()
+
+        src = "远程SQLServer(WindDB)"
+        mode_text = "全量重算当日快照" if full_refresh else "增量（默认）"
+        scope_text = f"指定策略={len(selected_set)}" if selected_set else "全部启用策略"
+        _job_progress(
+            db,
+            job_id,
+            f"Wind源={src} 最新交易日={trade_date} 模式={mode_text} 范围={scope_text}，待处理策略数={len(configs)}",
+            do_commit=do_commit,
+        )
+
+        work_items: list[dict[str, Any] | None] = []
+        for cfg in configs:
+            work_items.append(
+                _run_update_try_build_work_item(
+                    db, cfg, trade_date, full_refresh, job_id, do_commit
+                )
+            )
+        active = [w for w in work_items if w is not None]
+        wind_merged: dict[str, Any] | None = None
+        if active:
+            n_union = len({c for w in active for c in w["stock_codes"]})
+            _job_progress(
+                db,
+                job_id,
+                f"合并拉取 Wind：{len(active)} 个策略、{n_union} 只不重复股票（EOD+行情+指数一次批量）…",
+                do_commit=do_commit,
+            )
+            wind, wind_merged = _run_update_prefetch_wind_merged(
+                db, wind, active, str(latest_trade)
+            )
+
+        for wi in work_items:
+            if wi is None:
+                continue
+            sid = wi["sid"]
+            bench_code = wi["bench_code"]
+            latest_rb = wi["latest_rb"]
+            latest_rb_compact = wi["latest_rb_compact"]
+            n_rb = wi["n_rb"]
+            rb_positions = wi["rb_positions"]
+            stock_codes = wi["stock_codes"]
+            start_c = wi["start_c"]
+
+            if wind_merged is not None:
+                full_eod = wind_merged["eod"]
+                eod_by_code = {c: full_eod[c] for c in stock_codes if c in full_eod}
+                index_eod_by_code: dict[str, list] = {}
+                if bench_code and bench_code in wind_merged["idx"]:
+                    index_eod_by_code[bench_code] = wind_merged["idx"][bench_code]
+                full_qu = wind_merged["quote"]
+                quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
+            else:
+                _job_progress(
+                    db,
+                    job_id,
+                    f"{sid}：批量拉取 A 股 EOD {len(stock_codes)} 只"
+                    f"{(' + 指数 1 只' if bench_code else '')} × 区间 {start_c}~{latest_trade} …",
+                    do_commit=do_commit,
+                )
+                wind, eod_by_code = wind_bulk.load_eod_by_code(
+                    wind, stock_codes, start_c, str(latest_trade), db
+                )
+                index_eod_by_code = {}
+                if bench_code:
+                    wind, index_eod_by_code = wind_bulk.load_index_eod_by_code(
+                        wind, [bench_code], start_c, str(latest_trade), db
+                    )
+                wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
+
+            _job_progress(db, job_id, f"{sid}：共 {n_rb} 个调仓期，准备写入…", do_commit=do_commit)
+            for attempt in range(4):
+                try:
+                    db.execute(
+                        text(
+                            """
+                            DELETE FROM strategy_holding_daily
+                            WHERE strategy_id = :sid AND trade_date = :td
+                            """
+                        ),
+                        {"sid": sid, "td": trade_date},
+                    )
+                    break
+                except OperationalError as oe:
+                    if not _mysql_lock_contention(oe) or attempt >= 3 or not do_commit:
+                        raise
+                    if do_commit:
+                        db.rollback()
+                    time.sleep(0.25 * (2**attempt))
+            for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                if not positions:
+                    _job_progress(
+                        db,
+                        job_id,
+                        f"{sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} 无仓位，跳过",
+                        do_commit=do_commit,
+                    )
+                    continue
+
+                prepared_rows = []
+                total_weight = 0.0
+
+                for p in positions:
+                    scode = p["stock_code"]
+                    # 净值与持仓日快照统一仅使用持仓权重（与全量净值重建一致）；行业中性列仍入库供展示/导出。
+                    period_weight = float(p["holding_weight"] or 0.0)
+                    total_weight += max(period_weight, 0.0)
+                    wk = _wind_code_key(scode)
+                    quote = quote_map.get(wk)
+                    series = eod_by_code.get(wk, [])
+                    if not quote:
+                        prepared_rows.append(
+                            {
+                                "strategy_id": sid,
+                                "trade_date": trade_date,
+                                "rebalance_date": rebalance,
+                                "stock_code": scode,
+                                "stock_name": None,
+                                "period_weight": period_weight,
+                                "latest_price": None,
+                                "last_1d_pct": None,
+                                "period_return": None,
+                                "ret_5d": None,
+                                "ret_20d": None,
+                                "ret_60d": None,
+                                "ret_ytd": None,
+                                "market_cap": None,
+                                "industry_name": None,
+                                "pe": None,
+                                "pb": None,
+                            }
+                        )
+                        continue
+                    latest_price = float(quote["latest_price"] or 0.0)
+                    prev_close = float(quote["prev_close"] or 0.0)
+                    lt_compact = str(latest_trade).strip().replace("-", "")[:8]
+                    day_ret = wind_bulk.day_return_adj_for_asof(series, lt_compact)
+                    if day_ret is None:
+                        day_ret = _safe_return(latest_price, prev_close)
+
+                    desc_closes = wind_bulk.closes_desc_from_asc(series, 280)
+                    latest_adj = desc_closes[0] if desc_closes else None
+                    close_5 = wind_bulk.close_n_trading_days_ago(desc_closes, 5)
+                    close_20 = wind_bulk.close_n_trading_days_ago(desc_closes, 20)
+                    close_60 = wind_bulk.close_n_trading_days_ago(desc_closes, 60)
+                    # YTD：以上年最后一个交易日的收盘价为基准（严格早于本年 1 月 1 日的最后一条日 K）
+                    ytd_close = wind_bulk.last_close_before_calendar_date(
+                        series, f"{trade_date.year}0101"
+                    )
+                    rb_compact_this = (
+                        rebalance.strftime("%Y%m%d")
+                        if hasattr(rebalance, "strftime")
+                        else str(rebalance).replace("-", "")[:8]
+                    )
+                    period_start_close = wind_bulk.first_close_on_or_after(series, rb_compact_this)
+
+                    px = latest_adj if (latest_adj is not None and latest_adj > 0) else latest_price
+                    period_ret = _safe_return(px, period_start_close)
+                    prepared_rows.append(
+                        {
+                            "strategy_id": sid,
+                            "trade_date": trade_date,
+                            "rebalance_date": rebalance,
+                            "stock_code": scode,
+                            "stock_name": quote["stock_name"],
+                            "period_weight": period_weight,
+                            "latest_price": latest_price if latest_price > 0 else None,
+                            "last_1d_pct": day_ret,
+                            "period_return": period_ret,
+                            "ret_5d": _safe_return(px, close_5),
+                            "ret_20d": _safe_return(px, close_20),
+                            "ret_60d": _safe_return(px, close_60),
+                            "ret_ytd": _safe_return(px, ytd_close),
+                            "market_cap": quote["market_cap"],
+                            "industry_name": quote["industry_name"],
+                            "pe": quote["pe"],
+                            "pb": quote["pb"],
+                        }
+                    )
+
+                # 调仓生效日：按新持仓表目标权重（period_weight 归一）替换，与是否停牌无关；其余交易日仍用 drift。
+                snap_target_weights = False
+                rb_d = _row_sql_date(rebalance)
+                if i_rb == 1 and rb_d is not None and total_weight > 0:
+                    mx = db.execute(
+                        text(
+                            """
+                            SELECT MAX(trade_date) AS m
+                            FROM strategy_nav_daily
+                            WHERE strategy_id=:sid AND trade_date < :td
+                            """
+                        ),
+                        {"sid": sid, "td": trade_date},
+                    ).mappings().first()
+                    last_nt = _row_sql_date(mx["m"]) if mx and mx.get("m") is not None else None
+                    if trade_date == rb_d:
+                        snap_target_weights = True
+                    elif trade_date > rb_d and (last_nt is None or last_nt < rb_d):
+                        snap_target_weights = True
+
+                if snap_target_weights:
+                    for row in prepared_rows:
+                        pw = max(row["period_weight"], 0.0)
+                        row["latest_weight"] = pw / total_weight
+                else:
+                    drift_total = sum(
+                        max(row["period_weight"], 0.0)
+                        * (1.0 + (row["period_return"] if row["period_return"] is not None else 0.0))
+                        for row in prepared_rows
+                    )
+                    base = drift_total if drift_total > 0 else (total_weight if total_weight > 0 else 1.0)
+                    for row in prepared_rows:
+                        drift = max(row["period_weight"], 0.0) * (
+                            1.0 + (row["period_return"] if row["period_return"] is not None else 0.0)
+                        )
+                        row["latest_weight"] = drift / base
+                _flush_strategy_holding_daily_batch(db, [dict(r) for r in prepared_rows])
+                # 每期单独提交：后期 Wind/网络异常时，已写入的调仓期不会随大事务回滚丢失
+                if do_commit:
+                    db.commit()
+                _job_progress(
+                    db,
+                    job_id,
+                    f"{sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} 已写入 {len(prepared_rows)} 条",
+                    do_commit=do_commit,
+                )
+
+            try:
+                plans1 = _batch_nav_mysql_plans(db, [sid], "full")
+                pl1 = plans1.get(sid)
+                if pl1:
+                    wb = None
+                    if wind_merged is not None and wind_merged.get("td"):
+                        wb = {
+                            "eod": wind_merged["eod"],
+                            "idx": wind_merged["idx"],
+                            "td": wind_merged["td"],
+                        }
+                    _job_progress(
+                        db,
+                        job_id,
+                        f"{sid}：固定股数全量重算净值（名义本金 {settings.strategy_nav_initial_capital:g} 元）…",
+                        do_commit=do_commit,
+                    )
+                    _, wind = _rebuild_nav_for_strategy(
+                        db,
+                        wind,
+                        sid,
+                        "full",
+                        latest_trade_c_cached=str(latest_trade),
+                        mysql_plan=pl1,
+                        wind_bundle=wb,
+                    )
+            except Exception as ex_nav:
+                _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
+                _job_progress(
+                    db,
+                    job_id,
+                    f"{sid}：净值重算失败（已跳过）：{ex_nav}"[:2000],
+                    do_commit=do_commit,
+                )
+            if do_commit:
+                db.commit()
+
+        db.execute(
+            text(
+                "UPDATE strategy_update_jobs SET status='SUCCESS', finished_at=:ft, message=:m WHERE id=:id"
+            ),
+            {"ft": datetime.now(), "m": "全部完成", "id": job_id},
+        )
+        if do_commit:
+            db.commit()
+    except Exception as ex:
+        if do_commit:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        _mark_update_job_failed(db, job_id, _format_update_job_failure_message(ex), do_commit)
+        raise
+    finally:
+        if wind is not None:
+            wind_sql.close_wind(wind, db)
+        _job_running = False
+
+
+# 净值日序列写入：逐条 INSERT 时 MySQL 往返次数 ≈ 交易日数；批量 executemany 可显著降低耗时
+_NAV_INSERT_CHUNK = 400
+
+_NAV_INSERT_SQL = text(
+    """
+    INSERT INTO strategy_nav_daily(
+      strategy_id, trade_date, nav_unit, daily_ret,
+      benchmark_ret, benchmark_nav, rebalance_date, source_job_id
+    ) VALUES (
+      :sid, :td, :nav, :ret, :bret, :bnav, :rb, NULL
+    )
+    ON DUPLICATE KEY UPDATE
+      nav_unit=VALUES(nav_unit),
+      daily_ret=VALUES(daily_ret),
+      benchmark_ret=VALUES(benchmark_ret),
+      benchmark_nav=VALUES(benchmark_nav),
+      rebalance_date=VALUES(rebalance_date)
+    """
+)
+
+
+def _flush_strategy_nav_daily_batch(db: Session, acc: list[dict[str, Any]]) -> None:
+    if not acc:
+        return
+    for i in range(0, len(acc), _NAV_INSERT_CHUNK):
+        chunk = acc[i : i + _NAV_INSERT_CHUNK]
+        db.execute(_NAV_INSERT_SQL, chunk)
+
+
+def _batch_nav_mysql_plans(db: Session, strategy_ids: list[str], _mode_l: str) -> dict[str, dict[str, Any]]:
+    """一次查询多策略的持仓与配置，供 rebuild_nav_series 合并 Wind 拉取。"""
+    sids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
+    if not sids:
+        return {}
+    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in sids)
+    pos_rows = db.execute(
+        text(
+            f"""
+            SELECT strategy_id, rebalance_date, stock_code, holding_weight
+            FROM strategy_positions
+            WHERE strategy_id IN ({quoted})
+            ORDER BY strategy_id, rebalance_date, stock_code
+            """
+        )
+    ).mappings().all()
+    by_sid: dict[str, list[Any]] = defaultdict(list)
+    for r in pos_rows:
+        by_sid[str(r["strategy_id"]).strip()].append(r)
+
+    cfg_rows = db.execute(
+        text(
+            f"""
+            SELECT strategy_id, benchmark_code
+            FROM strategy_configs
+            WHERE strategy_id IN ({quoted})
+            """
+        )
+    ).mappings().all()
+    bench_by: dict[str, str] = {}
+    for r in cfg_rows:
+        sid = str(r["strategy_id"]).strip()
+        bench_by[sid] = str(r.get("benchmark_code") or "").strip().upper()
+
+    plans: dict[str, dict[str, Any]] = {}
+    for sid in sids:
+        rows = by_sid.get(sid) or []
+        if not rows:
+            continue
+        rb_map: dict[date, list[tuple[str, float]]] = {}
+        code_set: set[str] = set()
+        for r in rows:
+            rd = r["rebalance_date"]
+            sc = str(r["stock_code"]).strip().upper()
+            w = float(r.get("holding_weight") or 0.0)
+            rb_map.setdefault(rd, []).append((sc, w))
+            if sc:
+                code_set.add(sc)
+        if not code_set:
+            continue
+        rb_sorted = sorted(rb_map.keys())
+        min_rb = rb_sorted[0]
+        start_c = _compact_date(min_rb)
+        plans[sid] = {
+            "rb_map": rb_map,
+            "code_set": code_set,
+            "bench_code": bench_by.get(sid, ""),
+            "start_c": start_c,
+            "min_rb": min_rb,
+        }
+    return plans
+
+
+def _rebuild_nav_for_strategy(
+    db: Session,
+    wind: Any,
+    sid: str,
+    _mode_l: str,
+    *,
+    latest_trade_c_cached: str | None = None,
+    mysql_plan: dict[str, Any] | None = None,
+    wind_bundle: dict[str, Any] | None = None,
+) -> tuple[bool, Any]:
+    """
+    单策略净值重建（建议 SAVEPOINT / begin_nested 内调用）。固定股数、调仓日按收盘复权价满仓再平衡。
+    调仓自然日可为非交易日：在序列中首个交易日即按「当前调仓期」持仓用该日收盘价建仓（不跳过该期调仓）。
+
+    nav_unit = 收盘组合市值 / 名义本金（settings.strategy_nav_initial_capital，默认 1 亿元）；
+    daily_ret = 当日市值 / 上一交易日市值 - 1。入参 _mode_l 仅保留与调用方签名兼容；每次均全量重写该策略净值表。
+
+    mysql_plan / wind_bundle 由 rebuild_nav_series 批量预取时传入，避免重复查库与重复拉 Wind。
+    """
+    cfg_row: Any | None = None
+    if mysql_plan is not None:
+        rb_map = mysql_plan["rb_map"]
+        code_set = mysql_plan["code_set"]
+        bench_code = mysql_plan["bench_code"]
+        min_rb = mysql_plan["min_rb"]
+        if not code_set:
+            return False, wind
+    else:
+        rb_rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT rebalance_date
+                FROM strategy_positions
+                WHERE strategy_id=:sid
+                ORDER BY rebalance_date ASC
+                """
+            ),
+            {"sid": sid},
+        ).mappings().all()
+        if not rb_rows:
+            return False, wind
+        min_rb = rb_rows[0]["rebalance_date"]
+        pos_rows = db.execute(
+            text(
+                """
+                SELECT rebalance_date, stock_code, holding_weight
+                FROM strategy_positions
+                WHERE strategy_id=:sid
+                """
+            ),
+            {"sid": sid},
+        ).mappings().all()
+        rb_map = {}
+        code_set: set[str] = set()
+        for r in pos_rows:
+            rd = r["rebalance_date"]
+            sc = str(r["stock_code"]).strip().upper()
+            w = float(r.get("holding_weight") or 0.0)
+            rb_map.setdefault(rd, []).append((sc, w))
+            if sc:
+                code_set.add(sc)
+        if not code_set:
+            return False, wind
+        cfg_row = db.execute(
+            text(
+                """
+                SELECT benchmark_code, benchmark_name
+                FROM strategy_configs
+                WHERE strategy_id=:sid
+                LIMIT 1
+                """
+            ),
+            {"sid": sid},
+        ).mappings().first()
+        bench_code_raw = (cfg_row or {}).get("benchmark_code")
+        bench_code = str(bench_code_raw or "").strip().upper() if bench_code_raw else ""
+
+    start_c = _compact_date(min_rb)
+    ic0 = _strategy_nav_notional_capital()
+
+    if latest_trade_c_cached:
+        latest_trade_c = str(latest_trade_c_cached).strip()
+    else:
+        mtd_nav = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
+        latest_trade = mtd_nav["d"] if mtd_nav else None
+        if not latest_trade:
+            raise RuntimeError("No trade date in winddb")
+        latest_trade_c = str(latest_trade)
+
+    codes_for_eod = sorted(code_set)
+    if wind_bundle is not None:
+        full_eod = wind_bundle["eod"]
+        eod_by_code = {c: full_eod[c] for c in codes_for_eod if c in full_eod}
+        index_eod_by_code: dict[str, list] = {}
+        if bench_code:
+            idx_full = wind_bundle["idx"]
+            if bench_code in idx_full:
+                index_eod_by_code[bench_code] = idx_full[bench_code]
+        td_all = wind_bundle["td"]
+        trade_days = [d for d in td_all if d >= start_c]
+    else:
+        wind, eod_by_code = wind_bulk.load_eod_by_code(
+            wind, codes_for_eod, start_c, latest_trade_c, db
+        )
+        index_eod_by_code = {}
+        if bench_code:
+            wind, index_eod_by_code = wind_bulk.load_index_eod_by_code(
+                wind, [bench_code], start_c, latest_trade_c, db
+            )
+        wind, trade_days = wind_bulk.fetch_trade_date_compacts(wind, db, start_c, latest_trade_c)
+
+    if not trade_days:
+        return False, wind
+
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]] = {}
+    for c, series in eod_by_code.items():
+        dct: dict[str, tuple[float | None, float | None]] = {}
+        for d, cl, pc, _raw in series:
+            clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
+            pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
+            dct[_compact_date(d)] = (clv, pcv)
+        day_map[c] = dct
+    bench_day_map: dict[str, tuple[float | None, float | None]] = {}
+    if bench_code:
+        for d, cl, pc, _raw in index_eod_by_code.get(bench_code, []):
+            clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
+            pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
+            bench_day_map[_compact_date(d)] = (clv, pcv)
+
+    bench_nav_acc: float | None = None
+    nav_accum: list[dict[str, Any]] = []
+    for attempt in range(4):
+        try:
+            db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid})
+            break
+        except OperationalError as oe:
+            if not _mysql_lock_contention(oe) or attempt >= 3:
+                raise
+            time.sleep(0.25 * (2**attempt))
+    if bench_code:
+        bench_nav_acc = 1.0
+
+    rb_sorted = sorted(rb_map.keys())
+    rb_idx = 0
+    current_rb = rb_sorted[0]
+    prev_td_date: date | None = None
+    shares: dict[str, float] = {}
+    last_close_fill: dict[str, float] = {}
+    prev_mv: float | None = None
+    for i_td, td in enumerate(trade_days):
+        rb_idx_at_start = rb_idx
+        td_date = datetime.strptime(td, "%Y%m%d").date()
+        while rb_idx + 1 < len(rb_sorted) and rb_sorted[rb_idx + 1] <= td_date:
+            rb_idx += 1
+            current_rb = rb_sorted[rb_idx]
+        # 调仓自然日可为非交易日：首个交易日 prev_td_date 尚为 None 时，原逻辑不会 snap，导致 shares 空、净值为 0。
+        # 若当前调仓日已不晚于本交易日，应在当日收盘按权重用现价完成调仓并形成净值。
+        snap_rebalance = (
+            (rb_idx != rb_idx_at_start)
+            or (td_date == current_rb)
+            or (
+                prev_td_date is not None
+                and prev_td_date < current_rb <= td_date
+            )
+            or (prev_td_date is None and current_rb <= td_date)
+        )
+        holdings = rb_map.get(current_rb, [])
+        total_weight = sum(max(float(w or 0.0), 0.0) for _, w in holdings)
+        if snap_rebalance:
+            if not shares:
+                mv_pre = ic0
+            else:
+                mv_pre = 0.0
+                for sc2, sh in list(shares.items()):
+                    if sh <= 0:
+                        continue
+                    px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
+                    if px is not None:
+                        mv_pre += sh * px
+            new_shares: dict[str, float] = {}
+            if total_weight > 0 and mv_pre > 0:
+                valid: list[tuple[str, float, float]] = []
+                for sc, w0 in holdings:
+                    w0p = max(float(w0 or 0.0), 0.0)
+                    if w0p <= 0:
+                        continue
+                    px = _adj_close_td_ff(day_map, sc, td, last_close_fill)
+                    if px is None or px <= 0:
+                        continue
+                    valid.append((sc, w0p, px))
+                tw2 = sum(w for _, w, _ in valid)
+                if tw2 > 0:
+                    for sc, w0p, px in valid:
+                        dollar = mv_pre * (w0p / tw2)
+                        new_shares[sc] = dollar / px
+            shares = new_shares
+        mv_eod = 0.0
+        for sc2, sh in shares.items():
+            if sh <= 0:
+                continue
+            px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
+            if px is not None:
+                mv_eod += sh * px
+        nav = mv_eod / ic0 if ic0 > 0 else 1.0
+        if prev_mv is not None and prev_mv > 0:
+            day_ret = mv_eod / prev_mv - 1.0
+        else:
+            day_ret = (mv_eod / ic0 - 1.0) if ic0 > 0 else 0.0
+        prev_mv = mv_eod
+        prev_td_date = td_date
+        bench_ret_ins = None
+        bench_nav_ins = None
+        if bench_code and bench_nav_acc is not None:
+            bp = bench_day_map.get(td) if bench_day_map else None
+            br = _safe_return(bp[0], bp[1]) if bp else None
+            if br is not None:
+                bench_ret_ins = float(br)
+                bench_nav_acc *= 1.0 + bench_ret_ins
+                bench_nav_ins = bench_nav_acc
+            elif i_td == 0:
+                # 全量起点常遇指数首日无 EOD：与策略单位净值起点 1 对齐，基准净值 1、日收益 0，便于超额与指标口径统一
+                bench_ret_ins = 0.0
+                bench_nav_ins = float(bench_nav_acc)
+        nav_accum.append(
+            {
+                "sid": sid,
+                "td": td_date,
+                "nav": nav,
+                "ret": day_ret,
+                "bret": bench_ret_ins,
+                "bnav": bench_nav_ins,
+                "rb": current_rb,
+            }
+        )
+    _flush_strategy_nav_daily_batch(db, nav_accum)
+    return True, wind
+
+
+def rebuild_nav_series(
+    db: Session,
+    wind,
+    strategy_ids: list[str],
+    mode: str = "incremental",
+    do_commit: bool = True,
+) -> tuple[dict, Any]:
+    """
+    导入后同步重建净值：固定股数、收盘调仓，按交易日生成 strategy_nav_daily。返回 (结果字典, 当前 Wind 连接)。
+
+    优化：① 全区间只查一次 Wind 最新交易日；② MySQL 持仓/配置按策略批量预取；③ 合并所有策略涉及的股票与指数，
+    一次性拉 EOD / 交易日历（减少 SQL Server 往返）；④ 净值日序列对 MySQL 使用 executemany 批量写入。
+    mode 为 incremental/full 时均对涉及策略全量重写净值（名义本金见 settings.strategy_nav_initial_capital）。
+    """
+    mode_l = str(mode or "incremental").strip().lower()
+    if mode_l not in ("incremental", "full"):
+        raise ValueError(f"invalid nav rebuild mode: {mode}")
+    sids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
+    if not sids:
+        if do_commit:
+            db.commit()
+        return {"rebuilt": 0, "failed": 0, "errors": []}, wind
+
+    mtd_nav = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
+    latest_trade = mtd_nav["d"] if mtd_nav else None
+    if not latest_trade:
+        if do_commit:
+            db.commit()
+        return {"rebuilt": 0, "failed": len(sids), "errors": ["No trade date in winddb"]}, wind
+    latest_trade_c = str(latest_trade)
+
+    plans = _batch_nav_mysql_plans(db, sids, mode_l)
+    union_codes: set[str] = set()
+    union_bench: set[str] = set()
+    global_st: str | None = None
+    for _sid, pl in plans.items():
+        for c in pl["code_set"]:
+            union_codes.add(c)
+        bc = str(pl.get("bench_code") or "").strip().upper()
+        if bc:
+            union_bench.add(bc)
+        st = pl["start_c"]
+        if global_st is None or st < global_st:
+            global_st = st
+
+    wind_bundle: dict[str, Any] | None = None
+    if global_st and union_codes:
+        wind, eod_all = wind_bulk.load_eod_by_code(
+            wind, sorted(union_codes), global_st, latest_trade_c, db
+        )
+        if union_bench:
+            wind, idx_all = wind_bulk.load_index_eod_by_code(
+                wind, sorted(union_bench), global_st, latest_trade_c, db
+            )
+        else:
+            idx_all = {}
+        wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, latest_trade_c)
+        wind_bundle = {"eod": eod_all, "idx": idx_all, "td": td_all}
+
+    done = 0
+    failed = 0
+    errors: list[str] = []
+    for sid in sids:
+        try:
+            with db.begin_nested():
+                pl = plans.get(sid)
+                if pl:
+                    counted, wind = _rebuild_nav_for_strategy(
+                        db,
+                        wind,
+                        sid,
+                        mode_l,
+                        latest_trade_c_cached=latest_trade_c,
+                        mysql_plan=pl,
+                        wind_bundle=wind_bundle,
+                    )
+                else:
+                    counted, wind = _rebuild_nav_for_strategy(
+                        db, wind, sid, mode_l, latest_trade_c_cached=latest_trade_c
+                    )
+                if counted:
+                    done += 1
+        except Exception as ex:
+            failed += 1
+            errors.append(f"{sid}: {ex}")
+            if _wind_sql_transient_disconnect(ex):
+                try:
+                    wind_sql.close_wind(wind, db)
+                except Exception:
+                    pass
+                try:
+                    wind = wind_sql.open_wind(db)
+                except Exception:
+                    pass
+    if do_commit:
+        db.commit()
+    return {"rebuilt": done, "failed": failed, "errors": errors[:50]}, wind
+
+
+def _admin_sync_mark_running(job_id: int) -> None:
+    from app.db import SessionLocalFactory
+
+    db = SessionLocalFactory()
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE admin_sync_jobs
+                SET status='RUNNING', started_at=NOW(), stage='start', message=:m
+                WHERE id=:id
+                """
+            ),
+            {"m": "后台任务已启动，正在执行…", "id": job_id},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _admin_sync_job_touch(job_id: int, stage: str, message: str) -> None:
+    from app.db import SessionLocalFactory
+
+    db = SessionLocalFactory()
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE admin_sync_jobs
+                SET stage=:st, message=:msg
+                WHERE id=:id AND status='RUNNING'
+                """
+            ),
+            {"st": (stage or "")[:64], "msg": (message or "")[:6000], "id": job_id},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
+    from app.db import SessionLocalFactory
+
+    ok = bool(result.get("ok"))
+    status = "SUCCESS" if ok else "FAILED"
+    errs = result.get("errors") or []
+    summary = (
+        ("成功：" + json.dumps({k: result.get(k) for k in ("imported", "nav_rebuilt", "stage") if k in result}, ensure_ascii=False))
+        if ok
+        else ("失败：" + ("；".join(str(x) for x in errs)[:1800]))
+    )
+    body = json.dumps(result, ensure_ascii=False)
+    db = SessionLocalFactory()
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE admin_sync_jobs
+                SET status=:st,
+                    finished_at=NOW(),
+                    stage=:sg,
+                    message=:sm,
+                    result_json=CAST(:rj AS JSON)
+                WHERE id=:id
+                """
+            ),
+            {
+                "st": status,
+                "sg": str(result.get("stage") or "")[:64],
+                "sm": summary[:4000],
+                "rj": body,
+                "id": job_id,
+            },
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def execute_admin_sync_pipeline(
+    username: str,
+    selected_ids: list[str],
+    import_mode: str,
+    *,
+    sync_job_id: int | None = None,
+) -> dict:
+    """
+    策略配置「导入并提取」一体化：导入 Excel → 重建净值 → 全量更新持仓快照。
+    与原先 admin_sync 同步逻辑一致；可选 sync_job_id 写入 admin_sync_jobs 进度。
+    """
+    ids = [str(x).strip() for x in selected_ids if str(x or "").strip()]
+    if not ids:
+        return {"ok": False, "stage": "validate", "failed": 0, "errors": ["strategy_ids 为空"]}
+
+    def p(stage: str, msg: str) -> None:
+        if sync_job_id is not None:
+            _admin_sync_job_touch(sync_job_id, stage, msg)
+
+    from app.db import SessionLocalFactory
+
+    p("precheck", "检查僵尸 RUNNING、数据更新任务互斥…")
+    db = SessionLocalFactory()
+    wind = None
+    imp: dict | None = None
+    nav_ret: dict | None = None
+    try:
+        stale_mins = max(1, int(getattr(settings, "stale_running_update_job_minutes", 240)))
+        db.execute(
+            text(
+                """
+                UPDATE strategy_update_jobs
+                SET status='FAILED', finished_at=NOW(),
+                    message=CONCAT(
+                        COALESCE(message, ''),
+                        '（僵尸RUNNING：已超过 ',
+                        CAST(:mins AS CHAR),
+                        ' 分钟未结束，同步前自动标记失败；若确为长跑任务请调大 STALE_RUNNING_UPDATE_JOB_MINUTES）'
+                    )
+                WHERE status='RUNNING'
+                  AND started_at < DATE_SUB(NOW(), INTERVAL :mins MINUTE)
+                """
+            ),
+            {"mins": stale_mins},
+        )
+        db.commit()
+        running = db.execute(
+            text(
+                """
+                SELECT id, started_at
+                FROM strategy_update_jobs
+                WHERE status='RUNNING'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+        ).first()
+        if running:
+            rid, rst = running[0], running[1]
+            return {
+                "ok": False,
+                "stage": "blocked",
+                "imported": 0,
+                "nav_rebuilt": 0,
+                "failed": len(ids),
+                "errors": [
+                    f"已有进行中的数据更新任务 id={rid}（开始于 {rst}），请待其完成后再执行同步。"
+                    f"若确认无进程在跑，可将该条 status 改为 FAILED，或等待超过 {stale_mins} 分钟后重试。"
+                ],
+            }
+        p("import", f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}）…")
+        imp = import_strategy_files(
+            db,
+            selected_strategy_ids=ids,
+            import_mode=import_mode,
+            do_commit=True,
+        )
+        if int(imp.get("failed") or 0) > 0:
+            return {"ok": False, "stage": "import", **imp}
+        t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
+        if t1 > 0:
+            p("import", f"导入完成，休眠 {t1}s 后进入净值…")
+            time.sleep(t1)
+        p("nav", f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略）…")
+        wind = wind_sql.open_wind(db)
+        nav_ret, wind = rebuild_nav_series(
+            db,
+            wind,
+            ids,
+            mode=import_mode,
+            do_commit=True,
+        )
+        if int(nav_ret.get("failed") or 0) > 0:
+            return {
+                "ok": False,
+                "stage": "nav",
+                "imported": imp.get("imported", 0),
+                "nav_rebuilt": nav_ret.get("rebuilt", 0),
+                "failed": nav_ret.get("failed", 0),
+                "errors": nav_ret.get("errors", []),
+            }
+        t2 = float(settings.admin_sync_sleep_after_nav_seconds or 0.0)
+        if t2 > 0:
+            p("nav", f"净值完成，休眠 {t2}s…")
+            time.sleep(t2)
+        if wind is not None:
+            wind_sql.close_wind(wind, db)
+            wind = None
+    except Exception as ex:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "stage": "import_or_nav",
+            "imported": (imp or {}).get("imported", 0),
+            "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
+            "failed": len(ids),
+            "errors": [str(ex)],
+        }
+    finally:
+        if wind is not None:
+            try:
+                wind_sql.close_wind(wind, db)
+            except Exception:
+                pass
+        db.close()
+
+    cap = int(getattr(settings, "admin_sync_wait_idle_update_seconds", 180) or 0)
+    step = 3
+    p("wait_idle", "阶段3/3 前：等待进程内数据更新互斥锁释放…")
+    if cap > 0:
+        t0 = time.monotonic()
+        last_touch = 0.0
+        while _job_running and (time.monotonic() - t0) < cap:
+            elapsed = int(time.monotonic() - t0)
+            if elapsed - last_touch >= 9:
+                last_touch = float(elapsed)
+                p("wait_idle", f"等待其它数据更新结束… 已等待 {elapsed}s / 上限 {cap}s")
+            time.sleep(step)
+    if _job_running:
+        wait_hint = f"已等待 {cap} 秒" if cap > 0 else "未配置等待（ADMIN_SYNC_WAIT_IDLE_UPDATE_SECONDS=0）"
+        return {
+            "ok": False,
+            "stage": "update",
+            "imported": (imp or {}).get("imported", 0),
+            "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
+            "failed": len(ids),
+            "errors": [
+                f"其它数据更新仍占用进程（{wait_hint}）。请待「立即更新」或定时任务结束后再点同步；导入与净值已提交。"
+            ],
+        }
+
+    p("holding_update", "阶段3/3：写入最新交易日持仓快照（可能较久）…")
+    db2: Session | None = None
+    try:
+        db2 = SessionLocalFactory()
+        run_update(
+            db2,
+            "MANUAL",
+            username,
+            full_refresh=True,
+            selected_strategy_ids=ids,
+            do_commit=True,
+        )
+        return {
+            "ok": True,
+            "stage": "all_success",
+            "imported": (imp or {}).get("imported", 0),
+            "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
+            "failed": 0,
+            "errors": [],
+        }
+    except Exception as ex:
+        if db2 is not None:
+            try:
+                db2.rollback()
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "stage": "update",
+            "imported": (imp or {}).get("imported", 0),
+            "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
+            "failed": len(ids),
+            "errors": [str(ex)],
+        }
+    finally:
+        if db2 is not None:
+            db2.close()
+
+
+def run_admin_sync_background_task(
+    job_id: int,
+    username: str,
+    selected_ids: list[str],
+    import_mode: str,
+) -> None:
+    """供 FastAPI BackgroundTasks 调用：先标 RUNNING，再跑管道并落库终态。"""
+    try:
+        _admin_sync_mark_running(job_id)
+        ret = execute_admin_sync_pipeline(
+            username, selected_ids, import_mode, sync_job_id=job_id
+        )
+        _finalize_admin_sync_job(job_id, ret)
+    except Exception as ex:
+        _log.exception("admin_sync job %s failed", job_id)
+        _finalize_admin_sync_job(
+            job_id,
+            {
+                "ok": False,
+                "stage": "exception",
+                "imported": 0,
+                "nav_rebuilt": 0,
+                "failed": len(selected_ids),
+                "errors": [str(ex)],
+            },
+        )

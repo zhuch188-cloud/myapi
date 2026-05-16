@@ -1,0 +1,10 @@
+      /** 退出后进入客户登录页，并跳过静默登录；保留「记住密码」凭据以便页面上仍预填密码 */
+      function clientLogoutToLogin() {
+        try {
+          localStorage.removeItem("token");
+          localStorage.removeItem("profile");
+          localStorage.removeItem("device_token");
+          localStorage.removeItem("client_pending_auto_login");
+        } catch (_) {}
+        location.href = "/client-login?logout=1";
+      }

@@ -1,0 +1,34 @@
+{# 供各页 <script> 内 include：将 fetch 网络层错误转成可读中文说明（幂等，避免 api 已包装后再包一层） #}
+function formatFetchError(err) {
+  const raw = err && err.message != null ? String(err.message) : String(err || "");
+  if (raw.indexOf("无法连上本服务（浏览器未收到有效响应）") !== -1) {
+    return raw;
+  }
+  const low = raw.trim().toLowerCase();
+  if (
+    low === "failed to fetch" ||
+    low === "typeerror: failed to fetch" ||
+    low.includes("networkerror when attempting to fetch") ||
+    low.includes("load failed")
+  ) {
+    return (
+      "无法连上本服务（浏览器未收到有效响应）。请依次检查：① 后端进程是否已启动、是否刚崩溃；② 地址栏协议/主机/端口是否与接口一致（勿混用 http 与 https）；③ 是否经公司代理或 VPN 拦截了本地请求；④ 打开 F12 → Network，点开红色失败项查看状态码或 (failed)。浏览器原文：" +
+      (raw.trim() || "（空）")
+    );
+  }
+  return raw;
+}
+(function () {
+  if (window.__fpSlidingTokenFetch) return;
+  window.__fpSlidingTokenFetch = true;
+  var orig = window.fetch;
+  window.fetch = function () {
+    return orig.apply(this, arguments).then(function (res) {
+      try {
+        var v = res.headers.get("X-Access-Token-Renewal");
+        if (v && String(v).trim()) localStorage.setItem("token", String(v).trim());
+      } catch (e) {}
+      return res;
+    });
+  };
+})();

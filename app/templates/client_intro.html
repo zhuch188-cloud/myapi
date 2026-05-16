@@ -1,0 +1,129 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 策略介绍</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 900px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .card.nav-card { padding: 12px; }
+      .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+      .nav a { margin-right: 12px; text-decoration: none; }
+      .nav a.nav-primary { color: #2463eb; font-weight: 600; font-size: 16px; }
+      .nav a.nav-secondary { color: #5b6b85; font-weight: 500; font-size: 14px; }
+      .nav a.nav-secondary:hover { color: #2463eb; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      button { padding: 8px 14px; border: none; border-radius: 8px; background: #2463eb; color: #fff; cursor: pointer; }
+      button.secondary { background: #667085; }
+      button.outline { background: #fff; color: #2463eb; border: 1px solid #2463eb; }
+      .muted { color: #667085; }
+      .intro { white-space: pre-wrap; line-height: 1.6; font-size: 14px; }
+      h2 { margin: 0 0 8px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card nav-card row nav">
+        <a class="nav-primary" href="/client">策略列表</a>
+        <a class="nav-secondary" href="/client/strategy/{{ strategy_id }}/intro">策略介绍</a>
+        <a class="nav-secondary" id="linkNav" href="#">净值</a>
+        <a class="nav-secondary" id="linkHold" href="#">持仓</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content: space-between;">
+          <h2 id="titleName">{{ strategy_name }}</h2>
+          <button id="followBtn" type="button" onclick="toggleFollow()">关注</button>
+        </div>
+        <p id="bench" class="muted" style="margin: 0 0 12px;"></p>
+        <div id="intro" class="intro muted">加载中...</div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/client_session_gate.html' %}
+{% include 'partials/client_logout_fn.html' %}
+      const STRATEGY_ID = {{ strategy_id | tojson }};
+      let token = localStorage.getItem("token") || "";
+      document.getElementById("linkNav").href = "/client/strategy/" + encodeURIComponent(STRATEGY_ID) + "/nav";
+      document.getElementById("linkHold").href = "/client/strategy/" + encodeURIComponent(STRATEGY_ID) + "/holdings";
+      function authHeaders(extra) {
+        const h = Object.assign({}, extra || {});
+        if (token) h.Authorization = "Bearer " + token;
+        try {
+          const dt = localStorage.getItem("device_token");
+          if (dt) h["X-Device-Token"] = dt;
+        } catch (_) {}
+        return h;
+      }
+      function logout() { clientLogoutToLogin(); }
+      async function api(path, options) {
+        let res;
+        try {
+          res = await fetch(path, Object.assign({ headers: authHeaders() }, options || {}));
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || "HTTP " + res.status);
+        return res.json();
+      }
+      function formatBenchmarkLabel(code, name) {
+        const bc = (code != null && String(code).trim() !== "") ? String(code).trim() : "";
+        const bn = (name != null && String(name).trim() !== "") ? String(name).trim() : "";
+        if (bn && bc && bn !== bc) return bn + "（" + bc + "）";
+        if (bn) return bn;
+        if (bc) return bc;
+        return "—";
+      }
+      async function loadDetail() {
+        if (!(await ensureClientViewerSession())) return;
+        try {
+          token = localStorage.getItem("token") || "";
+        } catch (_) {}
+        const d = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID));
+        document.getElementById("titleName").textContent = d.strategy_name || STRATEGY_ID;
+        document.getElementById("bench").textContent = "基准：" + formatBenchmarkLabel(d.benchmark_code, d.benchmark_name);
+        document.getElementById("intro").textContent = d.strategy_intro || "（无介绍）";
+        document.getElementById("intro").classList.remove("muted");
+        const btn = document.getElementById("followBtn");
+        if (d.is_followed) {
+          btn.textContent = "取消关注";
+          btn.className = "outline";
+        } else {
+          btn.textContent = "关注";
+          btn.className = "";
+        }
+        btn.dataset.followed = d.is_followed ? "1" : "0";
+      }
+      async function toggleFollow() {
+        const btn = document.getElementById("followBtn");
+        const followed = btn.dataset.followed === "1";
+        try {
+          if (followed) {
+            await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/follow", { method: "DELETE" });
+          } else {
+            await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/follow", { method: "POST" });
+          }
+          await loadDetail();
+        } catch (e) {
+          alert(e.message);
+        }
+      }
+      loadDetail().catch((e) => { document.getElementById("intro").textContent = "加载失败：" + e.message; });
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

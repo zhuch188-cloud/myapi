@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 持仓更新</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1300px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      input, button, select { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      tr.rb-group-end td { border-bottom: 2px solid #98a2b3 !important; }
+      .scroll { overflow-x: auto; }
+      .ret-up { color: #d93026; font-weight: 600; }
+      .ret-down { color: #0d8943; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表盘</a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更新</a>
+        <a href="/admin/nav-check">净值</a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+        <span id="profile" class="muted"></span>
+      </div>
+      <div class="card row">
+        <span class="muted">导入/更新已迁移到「策略配置」页面，按勾选策略执行。</span>
+      </div>
+      <div class="card">
+        <h4>策略列表</h4>
+        <div id="strategyList"></div>
+      </div>
+      <div class="card">
+        <h4>持仓明细（最新交易日）</h4>
+        <p id="holdingsMeta" class="muted"></p>
+        <div class="row">
+          <label>每页</label>
+          <select id="pageSize" onchange="reloadHoldings()"><option>20</option><option selected>50</option><option>100</option></select>
+          <button class="secondary" onclick="prevPage()">上一页</button>
+          <button class="secondary" onclick="nextPage()">下一页</button>
+          <span id="pageInfo" class="muted"></span>
+        </div>
+        <div class="scroll"><table id="holdingsTable"></table></div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      let currentStrategyId = "";
+      let page = 1;
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); location.href = "/admin-login"; }
+      async function api(path, options = {}) {
+        let res;
+        try {
+          res = await fetch(path, { ...options, headers: authHeaders(options.headers || {}) });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+        return res.json();
+      }
+      function pct(v) { return v == null ? "-" : (v * 100).toFixed(2) + "%"; }
+      function retClass(v) { if (v == null) return ""; const n = Number(v); return n > 0 ? "ret-up" : (n < 0 ? "ret-down" : ""); }
+      function pctSigned(v) { const t = pct(v); const c = retClass(v); return c ? `<span class="${c}">${t}</span>` : t; }
+      function priceFmt(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      function num2(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      function mvYi(wan) { return wan == null ? "-" : (Number(wan) / 10000).toFixed(1); }
+      async function loadStrategies() {
+        const data = await api("/api/strategies");
+        const box = document.getElementById("strategyList");
+        box.innerHTML = "";
+        data.items.forEach((s) => {
+          const btn = document.createElement("button");
+          btn.textContent = `${s.strategy_name} (${s.benchmark_code})`;
+          btn.onclick = () => { currentStrategyId = s.strategy_id; page = 1; reloadHoldings(); };
+          box.appendChild(btn);
+        });
+        if (data.items.length > 0) { currentStrategyId = data.items[0].strategy_id; reloadHoldings(); }
+      }
+      async function reloadHoldings() {
+        if (!currentStrategyId) return;
+        const pageSize = Number(document.getElementById("pageSize").value);
+        const q = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+        const data = await api(`/api/strategies/${currentStrategyId}/holdings?${q.toString()}`);
+        const pages = data.total === 0 ? 0 : Math.ceil(data.total / pageSize);
+        document.getElementById("pageInfo").textContent = `第 ${data.page} 页 / 共 ${pages} 页（${data.total} 条）`;
+        const m = data.meta;
+        document.getElementById("holdingsMeta").textContent = m ? `行情日 ${m.latest_trade_date || "-"}；调仓期截面 ${m.rebalance_periods}` : "";
+        const rowsHtml = (data.items || []).map((i, idx, arr) => {
+          const curRb = i.rebalance_date || "";
+          const nextRb = (idx + 1 < arr.length) ? (arr[idx + 1].rebalance_date || "") : "";
+          const endCls = curRb !== nextRb ? "rb-group-end" : "";
+          return `<tr class="${endCls}"><td>${i.trade_date||"-"}</td><td>${i.rebalance_date||"-"}</td><td>${i.stock_code||"-"}</td><td>${i.stock_name||"-"}</td><td>${pct(i.period_weight)}</td><td>${pct(i.latest_weight)}</td><td>${priceFmt(i.latest_price)}</td><td>${pctSigned(i.period_return)}</td><td>${pctSigned(i.last_1d_pct)}</td><td>${pctSigned(i.ret_5d)}</td><td>${pctSigned(i.ret_20d)}</td><td>${pctSigned(i.ret_60d)}</td><td>${pctSigned(i.ret_ytd)}</td><td>${mvYi(i.market_cap)}</td><td>${i.industry_name||"-"}</td><td>${num2(i.pe)}</td><td>${num2(i.pb)}</td></tr>`;
+        }).join("");
+        document.getElementById("holdingsTable").innerHTML = `
+          <thead><tr><th>行情日</th><th>调仓日</th><th>代码</th><th>名称</th><th>本期权重</th><th>最新权重</th><th>最新价格</th><th>本期收益</th><th>1日</th><th>5交易日</th><th>20交易日</th><th>60交易日</th><th>今年以来</th><th>市值(亿)</th><th>行业</th><th>PE</th><th>PB</th></tr></thead>
+          <tbody>${rowsHtml}</tbody>`;
+      }
+      function prevPage() { if (page > 1) { page -= 1; reloadHoldings(); } }
+      function nextPage() { page += 1; reloadHoldings(); }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      loadStrategies();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

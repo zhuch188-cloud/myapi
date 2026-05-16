@@ -1,0 +1,377 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 策略配置</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1300px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+      input, textarea, button, select { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      textarea { min-height: 70px; width: 620px; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      .scroll { overflow-x: auto; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表盘</a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更新</a>
+        <a href="/admin/nav-check">净值</a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+        <span id="profile" class="muted"></span>
+      </div>
+      <div class="card">
+        <h4>新增/更新策略配置</h4>
+        <div class="row">
+          <input id="strategy_id" placeholder="strategy_id" />
+          <input id="strategy_name" placeholder="strategy_name" />
+          <input id="source" placeholder="来源 source（例：自研/外部）" />
+          <input id="file_dir" placeholder="file_dir 可空" />
+          <input id="file_name" placeholder="file_name.xlsx" />
+        </div>
+        <div class="row" style="align-items:flex-start;flex-wrap:wrap;">
+          <div class="muted" style="font-size:13px;line-height:1.5;max-width:720px;">
+            <strong>权重模式</strong>：固定为 <code>holding</code>（<strong>持仓权重</strong>）。净值与持仓日快照均按持仓权重计算；Excel 仍可含「行业中性权重」列仅作记录，不参与净值。
+            <input type="hidden" id="weight_display_mode" value="holding" />
+          </div>
+          <input id="benchmark_code" placeholder="benchmark_code" />
+          <input id="benchmark_name" placeholder="benchmark_name" />
+          <label><input id="is_visible" type="checkbox" checked /> 可见</label>
+        </div>
+        <div class="row">
+          <textarea id="strategy_intro" placeholder="策略介绍"></textarea>
+        </div>
+        <div class="row">
+          <input id="strategy_category" placeholder="策略分类（自由文本，可空；展示页空则归为「其他」）" style="min-width:280px;" />
+          <input id="rebalance_frequency" placeholder="调仓频率（例：月度 / 双周）" style="min-width:220px;" />
+        </div>
+        <div class="row">
+          <textarea id="remark" placeholder="备注 remark（可空）"></textarea>
+        </div>
+        <div class="row">
+          <button onclick="saveStrategy()">保存配置</button>
+          <button class="secondary" onclick="exportStrategyConfigs()">导出配置模板</button>
+          <button class="secondary" onclick="triggerImportStrategyConfigs()">导入配置文件</button>
+          <input id="cfgImportFile" type="file" accept=".csv" style="display:none" onchange="importStrategyConfigsFile(this)" />
+          <button class="secondary" onclick="loadAdminStrategies()">刷新列表</button>
+          <span id="msg" class="muted"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h4>按勾选执行</h4>
+        <div class="row">
+          <button onclick="toggleAll(true)">全选</button>
+          <button class="secondary" onclick="toggleAll(false)">清空</button>
+          <button class="secondary" onclick="editSelectedStrategy()">编辑勾选项</button>
+          <button onclick="syncSelected('incremental')">增量导入并提取（勾选）</button>
+          <button class="secondary" onclick="syncSelected('full')">全量导入并提取（勾选）</button>
+          <button class="secondary" onclick="updateLatestSelected()">仅更新最新交易日（勾选）</button>
+          <button class="secondary" onclick="deleteSelected()">删除策略（勾选）</button>
+          <span id="selectedInfo" class="muted">已勾选 0 个</span>
+          <span id="jobMsg" class="muted"></span>
+        </div>
+        <p class="muted" style="margin:0;font-size:12px;line-height:1.45;">
+          「导入并提取」在后台执行并支持进度轮询，避免长时间占用一条 HTTP 连接导致浏览器报 Failed to fetch（服务端可能仍在写库）。若需排障可 JSON 传 <code>synchronous:true</code> 走同步（易超时）。
+        </p>
+      </div>
+      <div class="card">
+        <h4>策略配置列表</h4>
+        <div class="scroll"><table id="adminCfgTable"></table></div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      let selectedSidSet = new Set();
+      let strategyMap = new Map();
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); location.href = "/admin-login"; }
+      async function api(path, options = {}) {
+        let res;
+        try {
+          res = await fetch(path, { ...options, headers: authHeaders(options.headers || { "Content-Type": "application/json" }) });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+        return res.json();
+      }
+      async function loadAdminStrategies() {
+        const data = await api("/api/admin/strategies", { headers: authHeaders() });
+        const items = data.items || [];
+        selectedSidSet = new Set();
+        strategyMap = new Map(items.map((x) => [String(x.strategy_id || ""), x]));
+        document.getElementById("adminCfgTable").innerHTML = `
+          <thead><tr><th>勾选</th><th>可见</th><th>策略ID</th><th>显示名</th><th>分类</th><th>调仓频率</th><th>文件目录</th><th>文件名</th><th>权重模式</th><th>基准代码</th><th>基准名称</th><th>状态</th><th>来源</th><th>备注</th><th>更新时间</th></tr></thead>
+          <tbody>${items.map(i => `<tr><td><input type="checkbox" class="sid-check" value="${i.strategy_id||""}" data-sid="${i.strategy_id||""}" onchange="onSidCheck(this)" onclick="onSidCheck(this)" /></td><td>${i.is_visible ? "是" : "否"}</td><td>${i.strategy_id||"-"}</td><td>${i.strategy_name||"-"}</td><td>${i.strategy_category||""}</td><td>${i.rebalance_frequency||""}</td><td>${i.file_dir||""}</td><td>${i.file_name||"-"}</td><td>holding（固定）</td><td>${i.benchmark_code||"-"}</td><td>${i.benchmark_name||"-"}</td><td>${i.status||"-"}</td><td>${i.source||"-"}</td><td>${i.remark||""}</td><td>${i.updated_at||"-"}</td></tr>`).join("")}</tbody>`;
+        refreshSelectedInfo();
+      }
+      function onSidCheck(el) {
+        const sid = (el && (el.value || el.dataset.sid || "") || "").trim();
+        if (!sid) return;
+        if (el.checked) selectedSidSet.add(sid);
+        else selectedSidSet.delete(sid);
+        refreshSelectedInfo();
+      }
+      function selectedStrategyIds() {
+        const domIds = Array.from(document.querySelectorAll("input.sid-check"))
+          .filter((x) => !!x.checked)
+          .map((x) => (x.value || x.dataset.sid || "").trim())
+          .filter((x) => x);
+        if (domIds.length) return Array.from(new Set(domIds));
+        return Array.from(selectedSidSet.values());
+      }
+      function refreshSelectedInfo() {
+        const n = selectedStrategyIds().length;
+        document.getElementById("selectedInfo").textContent = `已勾选 ${n} 个`;
+      }
+      function toggleAll(checked) {
+        document.querySelectorAll(".sid-check").forEach((x) => {
+          x.checked = checked;
+          const sid = (x.value || x.dataset.sid || "").trim();
+          if (!sid) return;
+          if (checked) selectedSidSet.add(sid);
+          else selectedSidSet.delete(sid);
+        });
+        refreshSelectedInfo();
+      }
+      function editSelectedStrategy() {
+        const ids = selectedStrategyIds();
+        const msg = document.getElementById("msg");
+        if (ids.length !== 1) {
+          msg.textContent = "请勾选且仅勾选 1 条策略后再编辑";
+          return;
+        }
+        const sid = ids[0];
+        const it = strategyMap.get(sid);
+        if (!it) {
+          msg.textContent = "未找到该策略数据，请先刷新列表";
+          return;
+        }
+        document.getElementById("strategy_id").value = it.strategy_id || "";
+        document.getElementById("strategy_name").value = it.strategy_name || "";
+        document.getElementById("source").value = it.source || "";
+        document.getElementById("remark").value = it.remark || "";
+        document.getElementById("file_dir").value = it.file_dir || "";
+        document.getElementById("file_name").value = it.file_name || "";
+        document.getElementById("weight_display_mode").value = "holding";
+        document.getElementById("benchmark_code").value = it.benchmark_code || "";
+        document.getElementById("benchmark_name").value = it.benchmark_name || "";
+        document.getElementById("strategy_intro").value = it.strategy_intro || "";
+        document.getElementById("strategy_category").value = it.strategy_category || "";
+        document.getElementById("rebalance_frequency").value = it.rebalance_frequency || "";
+        document.getElementById("is_visible").checked = !!it.is_visible;
+        msg.textContent = `已载入 ${sid}，可修改后保存`;
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+      function triggerImportStrategyConfigs() {
+        const ipt = document.getElementById("cfgImportFile");
+        ipt.value = "";
+        ipt.click();
+      }
+      async function importStrategyConfigsFile(el) {
+        const msg = document.getElementById("msg");
+        const f = el.files && el.files[0];
+        if (!f) return;
+        const fd = new FormData();
+        fd.append("file", f);
+        try {
+          msg.textContent = "导入中…";
+          const res = await fetch("/api/admin/strategies/import", {
+            method: "POST",
+            headers: authHeaders({}),
+            body: fd,
+          });
+          if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+          const ret = await res.json();
+          msg.textContent = `导入成功：${ret.upserted || 0} 条`;
+          loadAdminStrategies();
+        } catch (e) { msg.textContent = `导入失败：${formatFetchError(e)}`; }
+      }
+      async function exportStrategyConfigs() {
+        const msg = document.getElementById("msg");
+        try {
+          msg.textContent = "导出中…";
+          const res = await fetch("/api/admin/strategies/export", {
+            method: "GET",
+            headers: authHeaders({}),
+          });
+          if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "strategy_configs_template.csv";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          msg.textContent = "导出完成";
+        } catch (e) {
+          msg.textContent = `导出失败：${formatFetchError(e)}`;
+        }
+      }
+      function parseSyncResultJson(rj) {
+        if (rj == null) return null;
+        if (typeof rj === "object") return rj;
+        try {
+          return JSON.parse(String(rj));
+        } catch (_) {
+          return null;
+        }
+      }
+      async function syncSelected(importMode) {
+        const ids = selectedStrategyIds();
+        const msg = document.getElementById("jobMsg");
+        if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
+        try {
+          msg.textContent = `${importMode === "full" ? "全量" : "增量"}导入并提取已提交（${ids.length} 个策略）…`;
+          const ret = await api("/api/admin/sync", {
+            method: "POST",
+            body: JSON.stringify({ strategy_ids: ids, import_mode: importMode })
+          });
+          if (ret.queued && ret.sync_job_id != null) {
+            const deadline = Date.now() + 120 * 60 * 1000;
+            while (Date.now() < deadline) {
+              const st = await api("/api/admin/sync-jobs/" + encodeURIComponent(String(ret.sync_job_id)), {
+                headers: authHeaders()
+              });
+              const stg = st.stage ? ` · ${st.stage}` : "";
+              const tail = st.message ? ` — ${st.message}` : "";
+              msg.textContent = `#${st.id} ${st.status}${stg}${tail}`;
+              if (st.status !== "QUEUED" && st.status !== "RUNNING") {
+                const rj = parseSyncResultJson(st.result_json) || {};
+                if (!rj.ok) {
+                  msg.textContent = `执行失败（${rj.stage || st.stage || ""}）：${(rj.errors || []).join("；") || "未知原因"}`;
+                } else {
+                  msg.textContent = `执行成功：导入 ${rj.imported != null ? rj.imported : "—"} 个策略并完成最新交易日提取`;
+                  loadAdminStrategies();
+                }
+                return;
+              }
+              await sleep(2000);
+            }
+            msg.textContent += "（轮询超时：后端可能仍在执行，请刷新列表或查看 strategy_update_jobs / admin_sync_jobs 表核对）";
+            return;
+          }
+          if (!ret.ok) {
+            msg.textContent = `执行失败（${ret.stage}）：${(ret.errors || []).join("；") || "未知原因"}`;
+            return;
+          }
+          msg.textContent = `执行成功：导入 ${ret.imported} 个策略并完成最新交易日提取`;
+          loadAdminStrategies();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+      async function updateLatestSelected() {
+        const ids = selectedStrategyIds();
+        const msg = document.getElementById("jobMsg");
+        if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
+        try {
+          msg.textContent = "正在更新最新交易日数据…";
+          const ret = await api(`/api/admin/update?full_refresh=true`, {
+            method: "POST",
+            body: JSON.stringify({ strategy_ids: ids })
+          });
+          const targetId = ret.job_id;
+          if (targetId == null) {
+            msg.textContent = "接口未返回 job_id，请升级后端";
+            return;
+          }
+          const deadline = Date.now() + 45 * 60 * 1000;
+          while (Date.now() < deadline) {
+            const jobs = await api("/api/admin/update-jobs", { headers: authHeaders() });
+            const j = (jobs.items || []).find((x) => x.id === targetId);
+            if (!j) {
+              msg.textContent = `未找到任务 #${targetId}，稍后重试轮询…`;
+              await sleep(2000);
+              continue;
+            }
+            msg.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
+            if (j.status !== "RUNNING") return;
+            await sleep(2000);
+          }
+          msg.textContent += "（轮询超时）";
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      async function deleteSelected() {
+        const msg = document.getElementById("jobMsg");
+        const ids = selectedStrategyIds();
+        if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
+        const ok = confirm(`确认删除已勾选 ${ids.length} 个策略及其持仓/净值/用户关注等数据？此操作不可撤销。`);
+        if (!ok) return;
+        try {
+          msg.textContent = `删除执行中（${ids.length} 个策略）...`;
+          const ret = await api("/api/admin/strategies/delete", {
+            method: "POST",
+            body: JSON.stringify({ strategy_ids: ids })
+          });
+          msg.textContent = `删除完成：${ret.deleted_count || 0} 个`;
+          loadAdminStrategies();
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      async function saveStrategy() {
+        const sid = document.getElementById("strategy_id").value.trim();
+        const msg = document.getElementById("msg");
+        if (!sid) {
+          msg.textContent = "strategy_id 不能为空";
+          document.getElementById("strategy_id").focus();
+          return;
+        }
+        const payload = {
+          strategy_id: sid,
+          strategy_name: document.getElementById("strategy_name").value.trim(),
+          source: document.getElementById("source").value.trim(),
+          remark: document.getElementById("remark").value.trim(),
+          file_dir: document.getElementById("file_dir").value.trim(),
+          file_name: document.getElementById("file_name").value.trim(),
+          weight_display_mode: document.getElementById("weight_display_mode").value,
+          benchmark_code: document.getElementById("benchmark_code").value.trim(),
+          benchmark_name: document.getElementById("benchmark_name").value.trim(),
+          strategy_intro: document.getElementById("strategy_intro").value.trim(),
+          strategy_category: document.getElementById("strategy_category").value.trim(),
+          rebalance_frequency: document.getElementById("rebalance_frequency").value.trim(),
+          is_visible: document.getElementById("is_visible").checked
+        };
+        try {
+          await api("/api/admin/strategies", { method: "POST", body: JSON.stringify(payload) });
+          msg.textContent = "保存成功";
+          loadAdminStrategies();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      loadAdminStrategies();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 联系我们</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 720px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border: 1px solid #e9eef5; border-radius: 12px; padding: 18px; margin-bottom: 12px; box-shadow: 0 4px 14px rgba(20,33,61,.08); }
+      .card.nav-card {
+        padding: 12px;
+        margin-bottom: 12px;
+        border: none;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(20,33,61,.08);
+      }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+      .nav a { margin-right: 12px; text-decoration: none; }
+      .nav a.nav-primary { color: #2463eb; font-weight: 600; font-size: 16px; }
+      .nav .nav-here {
+        margin-right: 12px;
+        color: #2463eb;
+        font-weight: 600;
+        font-size: 16px;
+        cursor: default;
+      }
+      .row.nav { width: 100%; box-sizing: border-box; margin: 0; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      label.lbl { display: block; width: 100%; font-size: 13px; color: #667085; margin-bottom: 4px; }
+      input, textarea, button { padding: 9px 11px; border: 1px solid #ccd3de; border-radius: 8px; font-size: 14px; }
+      input, textarea { width: 100%; box-sizing: border-box; background: #fff; color: #1b2430; }
+      textarea { min-height: 160px; resize: vertical; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; font-weight: 700; min-width: 88px; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; font-size: 13px; }
+      h3 { margin: 0 0 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card nav-card row nav">
+        <a class="nav-primary" href="/client">策略列表</a>
+        <a class="nav-primary" href="/client-profile">个人资料</a>
+        <span class="nav-here">联系我们</span>
+        <button type="button" id="navLogoutBtn" class="logout-soft" onclick="logout()">退出</button>
+        <a id="guestNavLogin" class="nav-primary" href="/client-login" style="display:none;margin-left:auto;">登录</a>
+      </div>
+      <div class="card">
+        <h3>联系我们</h3>
+        <p id="guestContactHint" class="muted" style="display:none;margin:0 0 14px;padding:10px;background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;line-height:1.5;">
+          本入口供<strong>暂时无法登录</strong>的用户使用（如密码异常、账号锁定等）。请填写标题与内容，并尽量填写<strong>联系方式</strong>（手机或邮箱），便于管理员回复。<strong>无需登录</strong>即可发送。若已能正常登录，建议使用登录后的「联系我们」以便关联账号。
+        </p>
+        <p id="contactIntro" class="muted" style="margin:0 0 14px;">请填写标题与内容后发送；联系方式选填。</p>
+        <div class="row">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="ctTitle">标题</label>
+            <input id="ctTitle" type="text" maxlength="200" placeholder="简要说明主题" autocomplete="off" />
+          </div>
+        </div>
+        <div class="row">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="ctContact">联系方式（选填）</label>
+            <input id="ctContact" type="text" maxlength="255" placeholder="手机、邮箱、微信等" autocomplete="on" />
+          </div>
+        </div>
+        <div class="row">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="ctBody">内容</label>
+            <textarea id="ctBody" maxlength="20000" placeholder="请描述您的问题或建议"></textarea>
+          </div>
+        </div>
+        <div class="row">
+          <button type="button" onclick="submitContact()">发送</button>
+          <span id="msg" class="muted"></span>
+        </div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/client_session_gate.html' %}
+{% include 'partials/client_logout_fn.html' %}
+      function logout() { clientLogoutToLogin(); }
+      function authHeaders(extra = {}) {
+        const t = localStorage.getItem("token") || "";
+        const h = { ...extra };
+        if (t) h.Authorization = "Bearer " + t;
+        try {
+          const dt = localStorage.getItem("device_token");
+          if (dt) h["X-Device-Token"] = dt;
+        } catch (_) {}
+        return h;
+      }
+      function contactGetToken() {
+        try {
+          return localStorage.getItem("token") || "";
+        } catch (_) {
+          return "";
+        }
+      }
+      function contactApplyGuestChrome(isGuest) {
+        const hint = document.getElementById("guestContactHint");
+        const intro = document.getElementById("contactIntro");
+        const gLogin = document.getElementById("guestNavLogin");
+        const out = document.getElementById("navLogoutBtn");
+        if (hint) hint.style.display = isGuest ? "block" : "none";
+        if (intro) intro.style.display = isGuest ? "none" : "block";
+        if (gLogin) gLogin.style.display = isGuest ? "inline" : "none";
+        if (out) out.style.display = isGuest ? "none" : "inline";
+      }
+      async function submitContact() {
+        const el = document.getElementById("msg");
+        el.style.color = "";
+        const title = (document.getElementById("ctTitle").value || "").trim();
+        const contact = (document.getElementById("ctContact").value || "").trim();
+        const content = (document.getElementById("ctBody").value || "").trim();
+        if (!title) {
+          el.textContent = "请填写标题";
+          return;
+        }
+        if (!content) {
+          el.textContent = "请填写内容";
+          return;
+        }
+        const t = contactGetToken();
+        const useAuth = !!t;
+        el.textContent = "发送中…";
+        try {
+          let res;
+          try {
+            res = await fetch(useAuth ? "/api/client/contact" : "/api/public/contact", {
+              method: "POST",
+              headers: useAuth
+                ? authHeaders({ "Content-Type": "application/json" })
+                : { "Content-Type": "application/json" },
+              body: JSON.stringify({ title, contact, content }),
+            });
+          } catch (e) {
+            throw new Error(formatFetchError(e));
+          }
+          let data = {};
+          try {
+            data = await res.json();
+          } catch (_) {}
+          if (!res.ok) {
+            const d = data && (data.detail || data.message);
+            throw new Error(d ? String(d) : "HTTP " + res.status);
+          }
+          el.style.color = "#0d8943";
+          el.textContent = "发送成功，感谢您的反馈。";
+          document.getElementById("ctTitle").value = "";
+          document.getElementById("ctContact").value = "";
+          document.getElementById("ctBody").value = "";
+        } catch (e) {
+          el.style.color = "#d92d20";
+          el.textContent = formatFetchError(e);
+        }
+      }
+      (async function init() {
+        let need = true;
+        try {
+          const r = await fetch("/api/public/client-access-mode");
+          if (r.ok) {
+            const j = await r.json();
+            need = !!(j && j.require_login);
+          }
+        } catch (_) {}
+        if (!need) {
+          if (!(await ensureClientViewerSession())) return;
+          contactApplyGuestChrome(false);
+          return;
+        }
+        const t = contactGetToken();
+        if (!t || !_clientJwtIsPasswordAuth(t)) {
+          contactApplyGuestChrome(!t);
+          return;
+        }
+        contactApplyGuestChrome(false);
+      })();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

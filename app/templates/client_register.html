@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 注册</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 520px; margin: 48px auto; padding: 16px; }
+      .card { background: #fff; border: 1px solid #e9eef5; border-radius: 12px; padding: 18px; box-shadow: 0 4px 14px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+      input, button { padding: 9px 11px; border: 1px solid #ccd3de; border-radius: 8px; font-size: 14px; }
+      input { width: 100%; box-sizing: border-box; background: #fff; color: #1b2430; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; font-weight: 700; min-width: 88px; }
+      .muted { color: #667085; font-size: 13px; }
+      h2 { margin: 0 0 10px; font-size: 1.25rem; }
+      .nav-back { display: inline-block; margin-bottom: 12px; color: #2463eb; text-decoration: none; font-weight: 600; font-size: 14px; }
+      .nav-back:hover { text-decoration: underline; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <a class="nav-back" href="/">← 返回登录</a>
+      <div class="card">
+        <h2>新用户注册</h2>
+        <p class="muted" style="margin:0 0 12px;">
+          系统将分配登录用户名（以 8 开头的 9 位数字）。请设置密码并填写<strong>邮箱</strong>，用于忘记密码时找回。
+        </p>
+        <div class="row"><input id="email" type="email" maxlength="255" placeholder="邮箱（必填）" autocomplete="email" /></div>
+        <div class="row"><input id="password" type="password" maxlength="128" placeholder="密码（至少6位）" autocomplete="new-password" /></div>
+        <div class="row"><input id="password2" type="password" maxlength="128" placeholder="确认密码" autocomplete="new-password" /></div>
+        <div class="row"><input id="nick" type="text" maxlength="64" placeholder="昵称（可选）" autocomplete="nickname" /></div>
+        <div class="row"><input id="phone" type="text" maxlength="32" placeholder="手机（可选）" autocomplete="tel" /></div>
+        <div class="row">
+          <button type="button" onclick="doRegister()">注册并登录</button>
+          <span id="msg" class="muted"></span>
+        </div>
+        <p id="doneLine" class="muted" style="display:none;margin-top:10px;"></p>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      /** 避免携带登录页自动开户生成的 device_token，防止设备记录被挂到新注册用户上 */
+      try {
+        localStorage.removeItem("device_token");
+      } catch (_) {}
+      var CLIENT_PENDING_AUTO_LOGIN_KEY = "client_pending_auto_login";
+      function getDeviceToken() {
+        return localStorage.getItem("device_token") || "";
+      }
+      function setDeviceToken(v) {
+        if (v) localStorage.setItem("device_token", v);
+      }
+      async function readErrorMessage(ret, fallbackText) {
+        try {
+          const data = await ret.json();
+          if (data && typeof data.detail === "string" && data.detail.trim()) return data.detail.trim();
+          if (data && typeof data.message === "string" && data.message.trim()) return data.message.trim();
+        } catch (_) {}
+        try {
+          const t = await ret.text();
+          if (!t) return fallbackText;
+          try {
+            const j = JSON.parse(t);
+            if (j && typeof j.detail === "string" && j.detail.trim()) return j.detail.trim();
+            if (j && typeof j.message === "string" && j.message.trim()) return j.message.trim();
+          } catch (_) {}
+          return t;
+        } catch (_) {
+          return fallbackText;
+        }
+      }
+      async function doRegister() {
+        var el = document.getElementById("msg");
+        el.textContent = "";
+        el.style.color = "";
+        document.getElementById("doneLine").style.display = "none";
+        var p1 = document.getElementById("password").value || "";
+        var p2 = document.getElementById("password2").value || "";
+        if (p1.length < 6) {
+          el.textContent = "密码至少6位";
+          return;
+        }
+        if (p1 !== p2) {
+          el.textContent = "两次密码不一致";
+          return;
+        }
+        var body = {
+          password: p1,
+          email: document.getElementById("email").value || "",
+          nickname: document.getElementById("nick").value || "",
+          phone: document.getElementById("phone").value || "",
+          device_token: getDeviceToken(),
+        };
+        try {
+          var ret;
+          try {
+            ret = await fetch("/api/auth/register", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+          } catch (e) {
+            throw new Error(formatFetchError(e));
+          }
+          if (!ret.ok) throw new Error(await readErrorMessage(ret, "注册失败"));
+          var data = await ret.json();
+          localStorage.setItem("token", data.access_token);
+          localStorage.setItem("profile", JSON.stringify(data.profile || {}));
+          try {
+            localStorage.removeItem(CLIENT_PENDING_AUTO_LOGIN_KEY);
+          } catch (_) {}
+          if (data.device_token) setDeviceToken(data.device_token);
+          var uname = (data.profile && data.profile.username) ? data.profile.username : "";
+          var done = document.getElementById("doneLine");
+          done.style.display = "block";
+          done.textContent = "注册成功，用户名：" + uname + " ，即将进入首页…";
+          setTimeout(function () {
+            location.href = "/client";
+          }, 1200);
+        } catch (e) {
+          el.style.color = "#d92d20";
+          el.textContent = formatFetchError(e);
+        }
+      }
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 登录</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 520px; margin: 70px auto; padding: 16px; }
+      .card { background: #fff; border: 1px solid #e9eef5; border-radius: 12px; padding: 18px; box-shadow: 0 4px 14px rgba(20,33,61,.08); }
+      .slogan {
+        margin: 0 0 6px;
+        font-size: 24px;
+        line-height: 1.35;
+        letter-spacing: .6px;
+        font-weight: 800;
+        font-family: "Microsoft YaHei", "PingFang SC", "Arial Black", sans-serif;
+        color: #1f3b74;
+        text-align: center;
+      }
+      .slogan-sub {
+        margin: 0 0 6px;
+        font-size: 13px;
+        line-height: 1.4;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+        color: #667085;
+        text-align: center;
+        font-family: Consolas, "Courier New", ui-monospace, monospace;
+      }
+      .slogan-tagline {
+        margin: 0 0 14px;
+        font-size: 12px;
+        line-height: 1.45;
+        font-weight: 500;
+        letter-spacing: 0.12em;
+        color: #94a3b8;
+        text-align: center;
+        font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+      input, button { padding: 9px 11px; border: 1px solid #ccd3de; border-radius: 8px; font-size: 14px; }
+      input { width: 100%; box-sizing: border-box; background: #fff; color: #1b2430; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; font-weight: 700; min-width: 88px; }
+      .pwd-wrap { display: flex; width: 100%; gap: 8px; align-items: center; }
+      .pwd-wrap input { flex: 1 1 auto; width: auto; }
+      button.eye-btn {
+        min-width: 52px;
+        padding: 9px 10px;
+        background: #fff;
+        border: 1px solid #ccd3de;
+        color: #667085;
+        font-size: 13px;
+        line-height: 1;
+      }
+      button.eye-btn:hover { background: #f8fafc; }
+      .muted { color: #667085; font-size: 13px; }
+      .foot-links { text-align: center; margin-top: 14px; font-size: 14px; }
+      .foot-links a { color: #2463eb; text-decoration: none; font-weight: 600; }
+      .foot-links a:hover { text-decoration: underline; }
+      #bootScreen {
+        min-height: 220px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+      }
+      #bootScreen .boot-line { font-size: 15px; color: #475569; }
+      #loginShell { display: none; }
+      @media (max-width: 480px) {
+        .container { margin: 34px auto; }
+        .card { padding: 14px; }
+        .slogan { font-size: 20px; line-height: 1.3; }
+        .slogan-sub { font-size: 12px; }
+        .slogan-tagline { font-size: 11px; letter-spacing: 0.08em; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bootScreen" class="container">
+      <h1 class="slogan" style="margin:0;">量化策略.top</h1>
+      <p class="boot-line">正在验证登录…</p>
+    </div>
+    <div id="loginShell" class="container">
+      <div class="card">
+        <h1 class="slogan">量化策略.top</h1>
+        <p class="slogan-sub">quantstrat.top</p>
+        <p class="slogan-tagline">量化策略回测  实时持仓明细</p>
+        <div class="row"><input id="username" placeholder="用户名 / 邮箱 / 手机 / 昵称" /></div>
+        <div class="row">
+          <div class="pwd-wrap">
+            <input id="password" type="password" placeholder="密码" />
+            <button id="togglePwdBtn" class="eye-btn" type="button" onclick="togglePasswordVisibility()" aria-label="显示密码" title="显示密码">显示</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:2px;">
+          <label class="muted" style="display:flex;align-items:center;gap:6px;">
+            <input id="rememberChk" type="checkbox" checked style="width:auto;" />
+            记录用户名和密码
+          </label>
+        </div>
+        <div class="row">
+          <button type="button" onclick="login()">登录</button>
+          <span id="msg" class="muted"></span>
+        </div>
+        <p class="foot-links muted">
+          <span id="registerLinkBlock" style="display:inline;">
+            <a href="/client-register">新用户注册</a>
+            <span style="color:#cbd5e1;"> · </span>
+          </span>
+          <a href="/client-forgot-password">忘记密码</a>
+          <span style="color:#cbd5e1;"> · </span>
+          <a href="/client/contact">联系我们</a>
+        </p>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/client_jwt_claims.html' %}
+      /** 首次自动开户返回的密码仅在本次 bootstrap 响应里出现；刷新后 existing=true 不再下发，暂存到此键便于同浏览器再次登录（登录成功或修改密码后清除）。 */
+      var CLIENT_PENDING_AUTO_LOGIN_KEY = "client_pending_auto_login";
+      /** 记录最近一次成功登录时使用的标识（用户名/邮箱/手机/昵称），下次登录页优先回填。 */
+      var CLIENT_LAST_LOGIN_IDENTIFIER_KEY = "client_last_login_identifier";
+      /** 勾选“记录用户名和密码”时保存本地登录凭据（仅当前浏览器）。 */
+      var CLIENT_REMEMBERED_CREDENTIALS_KEY = "client_remembered_credentials";
+      /** 与后台「须先显示登录页」一致：为 true 时不信任静默 JWT、不自动回填密码。 */
+      var clientGateRequirePassword = true;
+      /** 强制登录下：本地「记住」里上次保存时仍为系统下发密码，则登录请求须传 remember=true 以免再次触发须改密。 */
+      var loginGateRememberedWasSystem = false;
+      /**
+       * 请求里「remember」影响服务端须改密与设备信任。
+       * 强制登录 + 记住里为系统密码：固定传 true；否则与勾选一致（已改密用户可保持未勾选）。
+       */
+      function rememberForLoginApi() {
+        if (!clientGateRequirePassword) {
+          return document.getElementById("rememberChk").checked;
+        }
+        if (loginGateRememberedWasSystem) return true;
+        return document.getElementById("rememberChk").checked;
+      }
+      function getDeviceToken() {
+        return localStorage.getItem("device_token") || "";
+      }
+      function setDeviceToken(v) {
+        if (v) localStorage.setItem("device_token", v);
+      }
+      function getLastLoginIdentifier() {
+        return localStorage.getItem(CLIENT_LAST_LOGIN_IDENTIFIER_KEY) || "";
+      }
+      function setLastLoginIdentifier(v) {
+        var s = String(v || "").trim();
+        if (!s) return;
+        try {
+          localStorage.setItem(CLIENT_LAST_LOGIN_IDENTIFIER_KEY, s);
+        } catch (_) {}
+      }
+      function saveRememberedCredentials(identifier, password, profile) {
+        var pf = profile || {};
+        var isSys = !!pf.password_is_system_generated;
+        try {
+          localStorage.setItem(
+            CLIENT_REMEMBERED_CREDENTIALS_KEY,
+            JSON.stringify({
+              identifier: String(identifier || "").trim(),
+              password: String(password || ""),
+              is_system_password: isSys,
+            })
+          );
+        } catch (_) {}
+      }
+      function clearRememberedCredentials() {
+        try {
+          localStorage.removeItem(CLIENT_REMEMBERED_CREDENTIALS_KEY);
+        } catch (_) {}
+      }
+      function restoreRememberedCredentials() {
+        try {
+          var raw = localStorage.getItem(CLIENT_REMEMBERED_CREDENTIALS_KEY);
+          if (!raw) return false;
+          var o = JSON.parse(raw);
+          var ident = String((o && o.identifier) || "").trim();
+          var pwd = String((o && o.password) || "");
+          if (!ident || !pwd) return false;
+          document.getElementById("username").value = ident;
+          document.getElementById("password").value = pwd;
+          document.getElementById("rememberChk").checked = true;
+          setLastLoginIdentifier(ident);
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+      function savePendingAutoLogin(username, password) {
+        try {
+          localStorage.setItem(
+            CLIENT_PENDING_AUTO_LOGIN_KEY,
+            JSON.stringify({ username: String(username || ""), password: String(password || "") })
+          );
+        } catch (_) {}
+      }
+      function restorePendingAutoLogin() {
+        var userEl = document.getElementById("username");
+        var pwdEl = document.getElementById("password");
+        var u = (userEl.value || "").trim();
+        if (!u || (pwdEl.value || "").trim()) return;
+        try {
+          var raw = localStorage.getItem(CLIENT_PENDING_AUTO_LOGIN_KEY);
+          if (!raw) return;
+          var o = JSON.parse(raw);
+          if (!o || String(o.username || "") !== u || !o.password) return;
+          pwdEl.value = String(o.password);
+        } catch (_) {}
+      }
+      async function bootstrapClient() {
+        const form = new FormData();
+        form.append("device_token", getDeviceToken());
+        const ret = await fetch("/api/auth/client-bootstrap", { method: "POST", body: form });
+        if (!ret.ok) return;
+        const data = await ret.json();
+        const preferred = getLastLoginIdentifier().trim();
+        if (data.device_token) setDeviceToken(data.device_token);
+        if (data.username && !preferred && !document.getElementById("username").value.trim()) {
+          document.getElementById("username").value = data.username;
+        }
+        if (!data.existing && data.password) {
+          if (clientGateRequirePassword) {
+            return;
+          }
+          const currentId = (document.getElementById("username").value || "").trim();
+          if (!preferred || (data.username && preferred === String(data.username).trim()) || currentId === String(data.username || "").trim()) {
+            document.getElementById("password").value = data.password;
+            savePendingAutoLogin(data.username, data.password);
+          }
+        }
+      }
+      async function tryIdentifyByDevice() {
+        const tk = getDeviceToken();
+        if (!tk) return;
+        const ret = await fetch("/api/auth/device/identify?device_token=" + encodeURIComponent(tk));
+        if (!ret.ok) return;
+        const data = await ret.json();
+        if (data && data.ok && data.username && !getLastLoginIdentifier().trim() && !document.getElementById("username").value.trim()) {
+          document.getElementById("username").value = data.username;
+        }
+      }
+      function applyClientAuthSuccess(data) {
+        localStorage.setItem("token", data.access_token);
+        localStorage.setItem("profile", JSON.stringify(data.profile || {}));
+        const inputId = document.getElementById("username").value;
+        const inputPwd = document.getElementById("password").value;
+        setLastLoginIdentifier(inputId);
+        if (document.getElementById("rememberChk").checked) {
+          saveRememberedCredentials(inputId, inputPwd, data.profile || {});
+        } else {
+          clearRememberedCredentials();
+        }
+        try {
+          localStorage.removeItem(CLIENT_PENDING_AUTO_LOGIN_KEY);
+        } catch (_) {}
+        if (data.device_token) setDeviceToken(data.device_token);
+        if (data.must_change_password) {
+          location.href = "/client-change-password";
+          return;
+        }
+        location.href = "/client";
+      }
+      /** 已有有效 token，或已回填用户名+密码时静默登录；成功则跳转策略列表。 */
+      async function tryEnterClientSilently() {
+        var storedToken = "";
+        try {
+          storedToken = localStorage.getItem("token") || "";
+        } catch (_) {}
+        if (storedToken && clientGateRequirePassword && !_clientJwtIsPasswordAuth(storedToken)) {
+          try {
+            localStorage.removeItem("token");
+            localStorage.removeItem("profile");
+          } catch (_) {}
+          storedToken = "";
+        }
+        if (storedToken) {
+          try {
+            const r = await fetch("/api/auth/me", { headers: { Authorization: "Bearer " + storedToken } });
+            if (r.ok) {
+              const me = await r.json();
+              try {
+                localStorage.setItem("profile", JSON.stringify({
+                  username: me.username,
+                  role: me.role,
+                  org_id: me.org_id,
+                  must_change_password: !!me.must_change_password,
+                  nickname: me.nickname,
+                  phone: me.phone,
+                  email: me.email,
+                  bio: me.bio,
+                }));
+              } catch (_) {}
+              if (me && me.must_change_password) {
+                location.href = "/client-change-password";
+                return true;
+              }
+              location.href = "/client";
+              return true;
+            }
+            if (r.status === 401) {
+              try {
+                localStorage.removeItem("token");
+              } catch (_) {}
+            }
+          } catch (_) {}
+        }
+        var u = (document.getElementById("username").value || "").trim();
+        var p = document.getElementById("password").value || "";
+        if (!u || !p) return false;
+        const form = new FormData();
+        form.append("username", u);
+        form.append("password", p);
+        form.append("remember", rememberForLoginApi() ? "true" : "false");
+        form.append("device_token", getDeviceToken());
+        const ret = await fetch("/api/auth/login", { method: "POST", body: form });
+        if (!ret.ok) return false;
+        const data = await ret.json();
+        applyClientAuthSuccess(data);
+        return true;
+      }
+      function showClientLoginForm() {
+        var b = document.getElementById("bootScreen");
+        var s = document.getElementById("loginShell");
+        if (b) b.style.display = "none";
+        if (s) s.style.display = "block";
+      }
+      async function login() {
+        const form = new FormData();
+        form.append("username", document.getElementById("username").value);
+        form.append("password", document.getElementById("password").value);
+        form.append("remember", rememberForLoginApi() ? "true" : "false");
+        form.append("device_token", getDeviceToken());
+        const el = document.getElementById("msg");
+        try {
+          const ret = await fetch("/api/auth/login", { method: "POST", body: form });
+          if (!ret.ok) {
+            let errMsg = "登录失败";
+            try {
+              const e = await ret.json();
+              errMsg = (e && (e.detail || e.message)) ? String(e.detail || e.message) : errMsg;
+            } catch (_) {
+              try {
+                errMsg = await ret.text() || errMsg;
+              } catch (_) {}
+            }
+            throw new Error(errMsg);
+          }
+          const data = await ret.json();
+          applyClientAuthSuccess(data);
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
+      function togglePasswordVisibility() {
+        const pwd = document.getElementById("password");
+        const btn = document.getElementById("togglePwdBtn");
+        const show = pwd.type === "password";
+        pwd.type = show ? "text" : "password";
+        btn.textContent = show ? "隐藏" : "显示";
+        btn.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
+        btn.setAttribute("title", show ? "隐藏密码" : "显示密码");
+      }
+      (async function initLoginPage() {
+        let skipSilent = false;
+        try {
+          const sp = new URLSearchParams(location.search || "");
+          if (sp.get("logout") === "1") skipSilent = true;
+        } catch (_) {}
+        if (skipSilent) {
+          try {
+            localStorage.removeItem("token");
+            localStorage.removeItem("profile");
+            localStorage.removeItem("device_token");
+            localStorage.removeItem("client_pending_auto_login");
+          } catch (_) {}
+          try {
+            history.replaceState(null, "", "/client-login");
+          } catch (_) {}
+        }
+        let gateRequireLogin = true;
+        try {
+          const mr = await fetch("/api/public/client-access-mode");
+          if (mr.ok) {
+            const mj = await mr.json();
+            gateRequireLogin = !mj || mj.require_login !== false;
+            var allowReg = !mj || mj.allow_register !== false;
+            try {
+              var rb = document.getElementById("registerLinkBlock");
+              if (rb) rb.style.display = allowReg ? "inline" : "none";
+            } catch (_) {}
+          }
+        } catch (_) {}
+        clientGateRequirePassword = !!gateRequireLogin;
+        loginGateRememberedWasSystem = false;
+        var gateRememberedFull = false;
+        if (!skipSilent && !gateRequireLogin) {
+          location.href = "/client";
+          return;
+        }
+        if (gateRequireLogin) {
+          try {
+            document.getElementById("rememberChk").checked = false;
+            var rawCred = localStorage.getItem(CLIENT_REMEMBERED_CREDENTIALS_KEY);
+            if (rawCred) {
+              var oc = JSON.parse(rawCred);
+              var ident0 = String((oc && oc.identifier) || "").trim();
+              var pwd0 = String((oc && oc.password) || "");
+              var hasFlag = oc && Object.prototype.hasOwnProperty.call(oc, "is_system_password");
+              var iss = hasFlag ? !!oc.is_system_password : false;
+              if (ident0 && pwd0 && !iss) {
+                document.getElementById("username").value = ident0;
+                document.getElementById("password").value = pwd0;
+                document.getElementById("rememberChk").checked = true;
+                setLastLoginIdentifier(ident0);
+                gateRememberedFull = true;
+              } else if (ident0 && iss) {
+                document.getElementById("username").value = ident0;
+                document.getElementById("rememberChk").checked = true;
+                setLastLoginIdentifier(ident0);
+                loginGateRememberedWasSystem = true;
+              }
+            }
+          } catch (_) {}
+        }
+        var hasRemembered = false;
+        if (!gateRequireLogin) {
+          hasRemembered = restoreRememberedCredentials();
+        }
+        const preferred = getLastLoginIdentifier().trim();
+        if (preferred) document.getElementById("username").value = preferred;
+        await bootstrapClient();
+        await tryIdentifyByDevice();
+        if (preferred) document.getElementById("username").value = preferred;
+        if (!gateRequireLogin && hasRemembered) {
+          restoreRememberedCredentials();
+        }
+        if (!skipSilent && !gateRequireLogin) restorePendingAutoLogin();
+        if (gateRequireLogin && !gateRememberedFull) {
+          try {
+            document.getElementById("password").value = "";
+            document.getElementById("password").setAttribute("autocomplete", "off");
+            document.getElementById("username").setAttribute("autocomplete", "username");
+          } catch (_) {}
+        }
+        try {
+          if (!skipSilent && (await tryEnterClientSilently())) return;
+        } catch (_) {}
+        showClientLoginForm();
+      })();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

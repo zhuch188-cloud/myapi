@@ -1,0 +1,85 @@
+{% include 'partials/client_jwt_claims.html' %}
+      async function publicClientRequireLogin() {
+        try {
+          const r = await fetch("/api/public/client-access-mode");
+          if (!r.ok) return true;
+          const j = await r.json();
+          return !!(j && j.require_login);
+        } catch (_) {
+          return true;
+        }
+      }
+      async function ensureClientViewerSession() {
+        var need = await publicClientRequireLogin();
+        var t = "";
+        try {
+          t = localStorage.getItem("token") || "";
+        } catch (_) {}
+        if (need) {
+          if (!t || !_clientJwtIsPasswordAuth(t)) {
+            try {
+              localStorage.removeItem("token");
+              localStorage.removeItem("profile");
+            } catch (_) {}
+            location.href = "/client-login";
+            return false;
+          }
+          return true;
+        }
+        if (t) return true;
+        var dt = "";
+        try {
+          dt = localStorage.getItem("device_token") || "";
+        } catch (_) {}
+        if (!dt) {
+          try {
+            dt =
+              typeof crypto !== "undefined" && crypto.randomUUID
+                ? crypto.randomUUID()
+                : String(Date.now()) + "-" + String(Math.random()).slice(2, 10);
+            localStorage.setItem("device_token", dt);
+          } catch (_) {
+            location.href = "/client-login";
+            return false;
+          }
+        }
+        var form = new FormData();
+        form.append("device_token", dt);
+        var ret;
+        try {
+          ret = await fetch("/api/auth/client-session-from-device", { method: "POST", body: form });
+        } catch (_) {
+          location.href = "/client-login";
+          return false;
+        }
+        if (!ret.ok) {
+          location.href = "/client-login";
+          return false;
+        }
+        var data = {};
+        try {
+          data = await ret.json();
+        } catch (_) {
+          location.href = "/client-login";
+          return false;
+        }
+        if (data.device_token) {
+          try {
+            localStorage.setItem("device_token", data.device_token);
+          } catch (_) {}
+        }
+        if (data.access_token) {
+          try {
+            localStorage.setItem("token", data.access_token);
+            localStorage.setItem("profile", JSON.stringify(data.profile || {}));
+          } catch (_) {}
+        } else {
+          location.href = "/client-login";
+          return false;
+        }
+        if (data.must_change_password) {
+          location.href = "/client-change-password";
+          return false;
+        }
+        return true;
+      }

@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 用户管理</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1300px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      input, button, select { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto; padding: 6px 12px; border-radius: 8px; border: 1px solid #e2e8f0;
+        background: #f1f5f9; color: #94a3b8; font-size: 13px; cursor: pointer;
+      }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      .scroll { overflow-x: auto; }
+      .modal-mask {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.45);
+        z-index: 50;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        box-sizing: border-box;
+      }
+      .modal-card {
+        background: #fff;
+        border-radius: 12px;
+        max-width: 1100px;
+        width: 100%;
+        max-height: 92vh;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        box-shadow: 0 18px 50px rgba(15, 23, 42, 0.25);
+      }
+      .modal-head {
+        padding: 12px 14px;
+        border-bottom: 1px solid #e9eef5;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+      .modal-body {
+        padding: 12px 14px;
+        overflow-y: auto;
+        font-size: 13px;
+      }
+      .detail-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 8px 12px;
+      }
+      .kv { border: 1px solid #e9eef5; border-radius: 8px; padding: 8px; background: #f8fafc; }
+      .kv .k { font-size: 12px; color: #64748b; margin-bottom: 4px; }
+      .kv .v { font-weight: 600; color: #0f172a; word-break: break-all; white-space: normal; }
+      .section-title { margin: 14px 0 8px; font-weight: 700; color: #0f172a; }
+      .risk-pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+      .risk-low { background: #ecfdf3; color: #15803d; }
+      .risk-mid { background: #fffbeb; color: #b45309; }
+      .risk-high { background: #fef2f2; color: #b91c1c; }
+      table.detail-table td { white-space: normal; word-break: break-word; vertical-align: top; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表盘</a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更新</a>
+        <a href="/admin/nav-check">净值</a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+        <span id="profile" class="muted"></span>
+      </div>
+      <div class="card">
+        <div class="row">
+          <input id="q" placeholder="按用户名 / 昵称 / 手机 / 邮箱 搜索" />
+          <select id="st">
+            <option value="">全部状态</option>
+            <option value="active">active</option>
+            <option value="disabled">disabled</option>
+            <option value="locked">locked</option>
+          </select>
+          <button onclick="loadUsers()">查询</button>
+          <span id="msg" class="muted"></span>
+          <span class="muted" style="font-size:12px;">列表「页面请求次数」为 <code>user_access_logs</code> 累计条数（携带有效 JWT、响应返回后写入，与详情中 HTTP 访问一致）。</span>
+        </div>
+        <div class="scroll"><table id="tb"></table></div>
+      </div>
+      <div id="detailMask" class="modal-mask" onclick="if(event.target===this) closeDetail()">
+        <div class="modal-card" onclick="event.stopPropagation()">
+          <div class="modal-head">
+            <strong id="detailTitle">用户详情</strong>
+            <span id="detailSub" class="muted"></span>
+            <button type="button" class="secondary" style="margin-left:auto" onclick="closeDetail()">关闭</button>
+          </div>
+          <div id="detailBody" class="modal-body"></div>
+        </div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: "Bearer " + token } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); localStorage.removeItem("device_token"); location.href = "/admin-login"; }
+      async function api(path, options = {}) {
+        let res;
+        try {
+          res = await fetch(path, { ...options, headers: authHeaders(options.headers || {}) });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+        return res.json();
+      }
+      async function setStatus(uid, st) {
+        if (!confirm(`确认将用户状态改为 ${st} ?`)) return;
+        await api(`/api/admin/users/${uid}/status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: st }),
+        });
+        await loadUsers();
+      }
+      async function resetPwd(uid) {
+        if (!confirm("确认重置该用户密码为系统随机密码？")) return;
+        const ret = await api(`/api/admin/users/${uid}/reset-password`, { method: "POST" });
+        alert("新系统密码：" + (ret.password || ""));
+        await loadUsers();
+      }
+      async function revokeDevices(uid) {
+        if (!confirm("确认让该用户全部设备下线？")) return;
+        await api(`/api/admin/users/${uid}/revoke-devices`, { method: "POST" });
+        await loadUsers();
+      }
+      function esc(s) {
+        return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      }
+      function reasonCn(code) {
+        const m = {
+          bad_password: "密码错误",
+          user_not_found: "账号不存在",
+          account_disabled: "账号已禁用",
+          account_locked: "账号已锁定",
+          identifier_conflict: "登录标识重复（需管理员清理）",
+        };
+        return m[code] || code || "-";
+      }
+      function riskClass(level) {
+        if (level === "高") return "risk-high";
+        if (level === "中") return "risk-mid";
+        return "risk-low";
+      }
+      async function openDetail(uid) {
+        const mask = document.getElementById("detailMask");
+        const body = document.getElementById("detailBody");
+        const title = document.getElementById("detailTitle");
+        const sub = document.getElementById("detailSub");
+        mask.style.display = "flex";
+        title.textContent = "加载中…";
+        sub.textContent = "";
+        body.innerHTML = `<div class="muted">正在加载用户详情…</div>`;
+        try {
+          const d = await api(`/api/admin/users/${uid}/detail`);
+          const u = d.user || {};
+          title.textContent = `用户详情 · ${esc(u.username)}`;
+          sub.textContent = `ID ${u.id} · ${esc(u.role)} · ${esc(u.status)}`;
+          const risk = d.risk || {};
+          const stats = d.login_stats || {};
+          const kv = (k, v) => `<div class="kv"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
+          const pill = `<span class="risk-pill ${riskClass(risk.level)}">风险 ${esc(risk.level || "低")} · ${esc(risk.score ?? 0)}</span>`;
+          let html = "";
+          html += `<div class="detail-grid">`;
+          html += kv("用户名", esc(u.username));
+          html += kv("昵称", esc(u.nickname || "-"));
+          html += kv("手机", esc(u.contact_phone || "-"));
+          html += kv("邮箱", esc(u.contact_email || "-"));
+          html += kv("组织", esc(u.org_id || "-"));
+          html += kv("系统生成密码", Number(u.password_is_system_generated) ? "是" : "否");
+          html += kv("改密时间", esc(u.password_changed_at || "-"));
+          html += kv("创建 / 更新", `${esc(u.created_at || "-")} / ${esc(u.updated_at || "-")}`);
+          html += kv("最近登录（users 表）", `${esc(u.last_login_at || "-")} · IP ${esc(u.last_login_ip || "-")}`);
+          html += kv("锁定 / 失败计数", `locked_until ${esc(u.locked_until || "-")} · failed ${esc(u.failed_login_count ?? 0)}`);
+          html += kv("风险评估", `${pill}<div style="margin-top:6px;color:#475569;font-weight:500;font-size:12px;">${esc((risk.reasons || []).join("；") || "暂无异常信号")}</div>`);
+          html += kv("登录统计（login_events）",
+            `24h 失败 ${stats.fail_24h ?? 0} / 成功 ${stats.success_24h ?? 0}；` +
+            `7d 失败 ${stats.fail_7d ?? 0} / 成功 ${stats.success_7d ?? 0}；` +
+            `30d 失败 ${stats.fail_30d ?? 0}`
+          );
+          html += kv("最近轨迹时间",
+            `最近成功 ${esc(stats.last_success_login_event_at || "-")}；最近失败 ${esc(stats.last_fail_login_event_at || "-")}`
+          );
+          html += `</div>`;
+          if (u.profile_bio) {
+            html += `<div class="section-title">个人简介</div><div style="white-space:pre-wrap;border:1px solid #e9eef5;border-radius:8px;padding:8px;background:#f8fafc;">${esc(u.profile_bio)}</div>`;
+          }
+          html += `<div class="section-title">设备与会话（最近 50 条）</div>`;
+          html += `<div class="scroll"><table class="detail-table"><thead><tr>
+            <th>状态</th><th>可信</th><th>最近活跃</th><th>过期</th><th>最近 IP</th><th>UA</th>
+          </tr></thead><tbody>`;
+          (d.devices || []).forEach(dev => {
+            html += `<tr>
+              <td>${esc(dev.session_state)}</td>
+              <td>${Number(dev.trusted) ? "是" : "否"}</td>
+              <td>${esc(dev.last_seen_at || "-")}</td>
+              <td>${esc(dev.device_token_expires_at || "-")}</td>
+              <td>${esc(dev.ip_last || "-")}</td>
+              <td>${esc(dev.ua || "-")}</td>
+            </tr>`;
+          });
+          html += `</tbody></table></div>`;
+          html += `<div class="section-title">HTTP 访问（最近 100 条）</div>`;
+          html += `<p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45;">携带有效 JWT 的接口与页面请求（响应返回后写入）；不展示 IP/UA，避免与上方设备表、下方登录轨迹重复。</p>`;
+          html += `<div class="scroll"><table class="detail-table"><thead><tr>
+            <th>时间</th><th>方法</th><th>路径</th><th>状态</th>
+          </tr></thead><tbody>`;
+          const accLogs = d.access_logs || [];
+          if (accLogs.length) {
+            accLogs.forEach(log => {
+              html += `<tr>
+                <td>${esc(log.created_at)}</td>
+                <td>${esc(log.method)}</td>
+                <td style="word-break:break-all;white-space:normal;">${esc(log.path)}</td>
+                <td>${esc(log.status_code)}</td>
+              </tr>`;
+            });
+          } else {
+            html += `<tr><td colspan="4" class="muted">暂无记录</td></tr>`;
+          }
+          html += `</tbody></table></div>`;
+          html += `<div class="section-title">登录轨迹（最近 80 条）</div>`;
+          html += `<div class="scroll"><table class="detail-table"><thead><tr>
+            <th>时间</th><th>结果</th><th>类型</th><th>标识</th><th>原因</th><th>IP</th>
+          </tr></thead><tbody>`;
+          (d.login_events || []).forEach(ev => {
+            html += `<tr>
+              <td>${esc(ev.created_at)}</td>
+              <td>${esc(ev.result)}</td>
+              <td>${esc(ev.login_type)}</td>
+              <td>${esc(ev.login_identifier)}</td>
+              <td>${esc(reasonCn(ev.reason))}</td>
+              <td>${esc(ev.ip || "-")}</td>
+            </tr>`;
+          });
+          html += `</tbody></table></div>`;
+          html += `<div class="section-title">管理操作审计（最近 50 条）</div>`;
+          html += `<div class="scroll"><table class="detail-table"><thead><tr>
+            <th>时间</th><th>操作</th><th>操作者</th><th>详情</th><th>IP</th>
+          </tr></thead><tbody>`;
+          (d.audit_logs || []).forEach(a => {
+            let detail = "";
+            try { detail = typeof a.detail_json === "object" ? JSON.stringify(a.detail_json) : String(a.detail_json ?? ""); } catch (_) { detail = ""; }
+            html += `<tr>
+              <td>${esc(a.created_at)}</td>
+              <td>${esc(a.action)}</td>
+              <td>${esc(a.actor_user_id ?? "-")}</td>
+              <td>${esc(detail || "-")}</td>
+              <td>${esc(a.ip || "-")}</td>
+            </tr>`;
+          });
+          html += `</tbody></table></div>`;
+          body.innerHTML = html;
+        } catch (e) {
+          body.innerHTML = `<div style="color:#b91c1c;">加载失败：${esc(formatFetchError(e))}</div>`;
+        }
+      }
+      function closeDetail() {
+        document.getElementById("detailMask").style.display = "none";
+      }
+      async function loadUsers() {
+        const msg = document.getElementById("msg");
+        try {
+          const q = new URLSearchParams();
+          const kw = (document.getElementById("q").value || "").trim();
+          const st = (document.getElementById("st").value || "").trim();
+          if (kw) q.set("q", kw);
+          if (st) q.set("status_filter", st);
+          const d = await api(`/api/admin/users?${q.toString()}`);
+          const items = d.items || [];
+          msg.textContent = `共 ${items.length} 个用户`;
+          document.getElementById("tb").innerHTML = `
+            <thead><tr>
+              <th>ID</th><th>用户名</th><th>昵称</th><th>手机</th><th>邮箱</th><th>角色</th><th>状态</th><th>系统密码</th>
+              <th>改密时间</th><th>最近登录</th><th>IP</th><th>页面请求次数</th><th>操作</th>
+            </tr></thead>
+            <tbody>${items.map(i => `<tr>
+              <td>${i.id}</td><td>${esc(i.username)}</td><td>${esc(i.nickname || "-")}</td>
+              <td>${esc(i.contact_phone || "-")}</td><td>${esc(i.contact_email || "-")}</td>
+              <td>${esc(i.role)}</td><td>${esc(i.status)}</td>
+              <td>${Number(i.password_is_system_generated) ? "是" : "否"}</td>
+              <td>${i.password_changed_at || "-"}</td><td>${i.last_login_at || "-"}</td>
+              <td>${i.last_login_ip || "-"}</td><td>${i.page_request_count ?? 0}</td>
+              <td>
+                <button class="secondary" onclick="openDetail(${i.id})">详情</button>
+                <button class="secondary" onclick="setStatus(${i.id},'active')">启用</button>
+                <button class="secondary" onclick="setStatus(${i.id},'disabled')">禁用</button>
+                <button class="secondary" onclick="setStatus(${i.id},'locked')">锁定</button>
+                <button class="secondary" onclick="resetPwd(${i.id})">重置密码</button>
+                <button class="secondary" onclick="revokeDevices(${i.id})">踢设备</button>
+              </td>
+            </tr>`).join("")}</tbody>`;
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      loadUsers();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 数据导入</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1300px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      input, button, select, textarea { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      textarea { width: min(920px, 100%); min-height: 64px; font-family: inherit; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto; padding: 6px 12px; border-radius: 8px; border: 1px solid #e2e8f0;
+        background: #f1f5f9; color: #94a3b8; font-size: 13px; cursor: pointer;
+      }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; }
+      .scroll { overflow-x: auto; }
+      td.msg-cell { white-space: normal; word-break: break-word; max-width: 420px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表盘</a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更新</a>
+        <a href="/admin/nav-check">净值</a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+        <span id="profile" class="muted"></span>
+      </div>
+      <div class="card">
+        <h4 style="margin:0 0 8px">补充数据导入</h4>
+        <p class="muted" style="margin:0 0 10px">
+          支持 <strong>.xlsx / .xls / .xlsm / .csv</strong>。导入类型在 <code>data_import_definitions</code> 中配置；数据写入 <code>supplement_company_profiles</code>。
+          <strong>唯一键</strong>由导入文件中的<strong>列名</strong>指定（与表头一致）：可多列，多列时按顺序取值、规范化后拼接写入 <code>stock_code</code>（最长 512），库唯一键 <code>(definition_code, stock_code)</code> 相同则<strong>更新</strong>；唯一键列不再重复存为动态列，其余表头各对应一列（TEXT）。
+          默认可在 <code>meta_json.unique_source_columns</code>（数组，优先）或 <code>meta_json.unique_source_column</code>（字符串，支持英文逗号/中文逗号分隔多列）中配置；空则自动识别证券代码类列。
+        </p>
+        <div class="row">
+          <label>导入类型</label>
+          <select id="defCode" onchange="onDefinitionChange()"></select>
+          <button type="button" class="secondary" onclick="fillDefaultPath()">填入默认路径</button>
+        </div>
+        <div class="row" style="margin-top:8px;align-items:flex-start">
+          <label style="padding-top:8px">文件路径</label>
+          <textarea id="filePath" placeholder="留空则使用库中默认路径；支持 .xlsx/.xls/.csv"></textarea>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label>唯一键列</label>
+          <input id="uniqueCol" style="min-width:320px" placeholder="与文件表头一致；多列用英文逗号分隔，如 证券代码,公告日期" />
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button type="button" onclick="runImport()">开始导入</button>
+          <button type="button" class="secondary" onclick="loadAll()">刷新列表</button>
+          <span id="runMsg" class="muted"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h4 style="margin:0 0 8px">已注册导入项</h4>
+        <div class="scroll"><table id="defTb"></table></div>
+      </div>
+      <div class="card">
+        <h4 style="margin:0 0 8px">最近批次</h4>
+        <div class="scroll"><table id="batchTb"></table></div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      let definitions = [];
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: "Bearer " + token } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); localStorage.removeItem("device_token"); location.href = "/admin-login"; }
+      function esc(s) {
+        return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      }
+      async function api(path, options = {}) {
+        const opts = { ...options };
+        const h = authHeaders(opts.headers || {});
+        if (opts.body && typeof opts.body === "string" && !h["Content-Type"]) {
+          h["Content-Type"] = "application/json";
+        }
+        let res;
+        try {
+          res = await fetch(path, { ...opts, headers: h });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        const raw = await res.text();
+        let body = null;
+        try { body = raw ? JSON.parse(raw) : null; } catch (_) { body = { detail: raw }; }
+        if (!res.ok) {
+          const d = (body && body.detail) ? body.detail : raw || `HTTP ${res.status}`;
+          throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+        }
+        return body;
+      }
+      function fillDefSelect() {
+        const sel = document.getElementById("defCode");
+        sel.innerHTML = (definitions || []).map(d => {
+          const dis = Number(d.enabled) ? "" : "（已禁用）";
+          return `<option value="${esc(d.code)}">${esc(d.display_name || d.code)}${dis}</option>`;
+        }).join("") || `<option value="">（无）</option>`;
+      }
+      function defaultUniqueColFromMeta(d) {
+        if (!d || !d.meta_json) return "";
+        const m = d.meta_json;
+        if (Array.isArray(m.unique_source_columns) && m.unique_source_columns.length)
+          return m.unique_source_columns.join(",");
+        if (m.unique_source_column) return String(m.unique_source_column);
+        return "";
+      }
+      function displayUniqueColMeta(x) {
+        const m = x.meta_json;
+        if (!m) return "（自动）";
+        if (Array.isArray(m.unique_source_columns) && m.unique_source_columns.length)
+          return esc(m.unique_source_columns.join("，"));
+        if (m.unique_source_column && String(m.unique_source_column).trim())
+          return esc(String(m.unique_source_column));
+        return "（自动）";
+      }
+      function onDefinitionChange() {
+        fillDefaultPath();
+        const code = (document.getElementById("defCode").value || "").trim();
+        const d = (definitions || []).find(x => x.code === code);
+        document.getElementById("uniqueCol").value = defaultUniqueColFromMeta(d);
+      }
+      function fillDefaultPath() {
+        const code = (document.getElementById("defCode").value || "").trim();
+        const d = (definitions || []).find(x => x.code === code);
+        const p = (d && (d.effective_default_path || d.default_file_path)) || "";
+        document.getElementById("filePath").value = p;
+      }
+      async function loadDefinitions() {
+        const d = await api("/api/admin/data-import/definitions");
+        definitions = d.items || [];
+        fillDefSelect();
+        const rows = definitions.map(x => {
+          return `<tr>
+          <td>${esc(x.code)}</td>
+          <td>${esc(x.display_name)}</td>
+          <td>${esc(x.effective_default_path || x.default_file_path || "-")}</td>
+          <td>${displayUniqueColMeta(x)}</td>
+          <td>${Number(x.enabled) ? "是" : "否"}</td>
+          <td class="msg-cell">${esc(x.description || "-")}</td>
+        </tr>`;
+        }).join("");
+        document.getElementById("defTb").innerHTML = `
+          <thead><tr><th>代码</th><th>名称</th><th>默认路径</th><th>默认唯一键列</th><th>启用</th><th>说明</th></tr></thead>
+          <tbody>${rows || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
+        if (definitions.length && !(document.getElementById("filePath").value || "").trim()) {
+          fillDefaultPath();
+        }
+        onDefinitionChange();
+      }
+      async function loadBatches() {
+        const d = await api("/api/admin/data-import/batches?limit=50");
+        const items = d.items || [];
+        document.getElementById("batchTb").innerHTML = `
+          <thead><tr><th>ID</th><th>类型</th><th>文件</th><th>状态</th><th>成功</th><th>失败</th><th>时间</th><th>摘要</th></tr></thead>
+          <tbody>${items.map(b => `<tr>
+            <td>${b.id}</td>
+            <td>${esc(b.definition_code)}</td>
+            <td>${esc(b.source_file_path)}</td>
+            <td>${esc(b.status)}</td>
+            <td>${b.rows_ok ?? 0}</td>
+            <td>${b.rows_fail ?? 0}</td>
+            <td>${esc(b.created_at)}</td>
+            <td class="msg-cell">${esc((b.message || "").slice(0, 500))}</td>
+          </tr>`).join("") || "<tr><td colspan='8' class='muted'>暂无批次</td></tr>"}</tbody>`;
+      }
+      async function loadAll() {
+        const msg = document.getElementById("runMsg");
+        try {
+          msg.textContent = "加载中…";
+          await loadDefinitions();
+          await loadBatches();
+          msg.textContent = "";
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      async function runImport() {
+        const msg = document.getElementById("runMsg");
+        const code = (document.getElementById("defCode").value || "").trim();
+        if (!code) { msg.textContent = "请选择导入类型"; return; }
+        const file_path = (document.getElementById("filePath").value || "").trim();
+        const rawU = (document.getElementById("uniqueCol").value || "").trim();
+        const unique_source_columns = rawU
+          ? rawU.split(/[,，;；]/).map(s => s.trim()).filter(Boolean)
+          : [];
+        msg.textContent = "导入中…";
+        try {
+          const ret = await api("/api/admin/data-import/run", {
+            method: "POST",
+            body: JSON.stringify({ code, file_path, unique_source_columns }),
+          });
+          msg.textContent = ret.message || JSON.stringify(ret);
+          await loadBatches();
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      loadAll();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

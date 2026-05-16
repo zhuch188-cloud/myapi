@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - {{ strategy_name }} 持仓明细</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1300px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .nav a { margin-right: 12px; text-decoration: none; }
+      .nav a.nav-primary { color: #2463eb; font-weight: 600; font-size: 16px; }
+      .nav a.nav-secondary { color: #5b6b85; font-weight: 500; font-size: 14px; }
+      .nav a.nav-secondary:hover { color: #2463eb; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      button { padding: 8px 10px; border: none; border-radius: 8px; background: #2463eb; color: #fff; cursor: pointer; }
+      button.secondary { background: #667085; }
+      button.outline { background: #fff; color: #2463eb; border: 1px solid #2463eb; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      .scroll { overflow-x: auto; }
+      .muted { color: #667085; }
+      .meta-line { margin: 6px 0 0; font-size: 13px; }
+      .stock-link { color: #2463eb; text-decoration: none; }
+      .stock-link:hover { text-decoration: underline; }
+      th.sticky-col-1, td.sticky-col-1 {
+        position: sticky; left: 0; background: #fff; z-index: 3;
+        min-width: 80px; width: 80px; max-width: 80px; box-sizing: border-box;
+      }
+      th.sticky-col-2, td.sticky-col-2 { position: sticky; left: 80px; background: #fff; z-index: 3; }
+      th.sticky-col-1, th.sticky-col-2 { background: #f8fafc; z-index: 4; }
+      td.sticky-col-2, th.sticky-col-2 { box-shadow: 1px 0 0 #e9eef5; }
+      .ret-up { color: #d93026; font-weight: 600; }
+      .ret-down { color: #0d8943; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <a class="nav-primary" href="/client">策略列表</a>
+        <a class="nav-secondary" href="/client/strategy/{{ strategy_id }}/intro">策略介绍</a>
+        <a class="nav-secondary" href="/client/strategy/{{ strategy_id }}/nav">净值</a>
+        <a class="nav-secondary" href="/client/strategy/{{ strategy_id }}/holdings">持仓</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;">
+          <h4 id="strategyPageTitle" style="margin:0;">{{ strategy_name }} 持仓明细</h4>
+          <button id="followBtn" type="button" onclick="toggleFollow()">关注</button>
+        </div>
+        <div class="row">
+          <button class="secondary" type="button" id="prevPeriodBtn" onclick="prevPeriod()">上一期</button>
+          <button class="secondary" type="button" id="nextPeriodBtn" onclick="nextPeriod()">下一期</button>
+          <label>调仓日</label>
+          <select id="rebalanceSel" onchange="onRebalanceChange()"></select>
+        </div>
+        <p id="holdingsMeta" class="muted meta-line"></p>
+        <div class="scroll"><table id="holdingsTable"></table></div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/client_session_gate.html' %}
+{% include 'partials/client_logout_fn.html' %}
+      const STRATEGY_ID = {{ strategy_id | tojson }};
+      let token = localStorage.getItem("token") || "";
+      let rebalanceDates = [];
+      let currentRebalanceDate = "";
+      function authHeaders(extra) {
+        const h = Object.assign({}, extra || {});
+        if (token) h.Authorization = "Bearer " + token;
+        try {
+          const dt = localStorage.getItem("device_token");
+          if (dt) h["X-Device-Token"] = dt;
+        } catch (_) {}
+        return h;
+      }
+      async function ensureViewerAuth() {
+        if (token) return true;
+        if (!(await ensureClientViewerSession())) return false;
+        token = localStorage.getItem("token") || "";
+        return !!token;
+      }
+      function logout() { clientLogoutToLogin(); }
+      async function api(path, options) {
+        let res;
+        try {
+          res = await fetch(path, Object.assign({ headers: authHeaders() }, options || {}));
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || "HTTP " + res.status);
+        return res.json();
+      }
+      async function refreshFollowState() {
+        try {
+          const d = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID));
+          const base = (d.strategy_name || {{ strategy_name | tojson }}) + " 持仓明细";
+          document.getElementById("strategyPageTitle").textContent = base;
+          const btn = document.getElementById("followBtn");
+          if (d.is_followed) {
+            btn.textContent = "取消关注";
+            btn.className = "outline";
+          } else {
+            btn.textContent = "关注";
+            btn.className = "";
+          }
+          btn.dataset.followed = d.is_followed ? "1" : "0";
+        } catch (e) { /* 保留服务端标题 */ }
+      }
+      async function toggleFollow() {
+        const btn = document.getElementById("followBtn");
+        const followed = btn.dataset.followed === "1";
+        try {
+          if (followed) {
+            await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/follow", { method: "DELETE" });
+          } else {
+            await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/follow", { method: "POST" });
+          }
+          await refreshFollowState();
+        } catch (e) {
+          alert(e.message);
+        }
+      }
+      function pct(v) { return v == null ? "-" : (v * 100).toFixed(2) + "%"; }
+      function retClass(v) { if (v == null) return ""; const n = Number(v); return n > 0 ? "ret-up" : n < 0 ? "ret-down" : ""; }
+      function pctSigned(v) { const t = pct(v); const c = retClass(v); return c ? '<span class="' + c + '">' + t + "</span>" : t; }
+      function priceFmt(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      function num2(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      function mvYi(wan) { return wan == null ? "-" : (Number(wan) / 10000).toFixed(1); }
+      function setPeriodButtons() {
+        const idx = rebalanceDates.indexOf(currentRebalanceDate);
+        document.getElementById("prevPeriodBtn").disabled = idx < 0 || idx >= rebalanceDates.length - 1;
+        document.getElementById("nextPeriodBtn").disabled = idx <= 0;
+      }
+      async function loadRebalanceDates() {
+        const data = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/rebalance-dates?latest_only=1");
+        rebalanceDates = (data.items || []).map((x) => String(x).slice(0, 10));
+        const sel = document.getElementById("rebalanceSel");
+        sel.innerHTML = rebalanceDates.length ? rebalanceDates.map((d) => '<option value="' + d + '">' + d + "</option>").join("") : '<option value="">-</option>';
+        if (!currentRebalanceDate && rebalanceDates.length) currentRebalanceDate = rebalanceDates[0];
+        if (currentRebalanceDate && rebalanceDates.includes(currentRebalanceDate)) sel.value = currentRebalanceDate;
+        setPeriodButtons();
+      }
+      function onRebalanceChange() {
+        currentRebalanceDate = document.getElementById("rebalanceSel").value || "";
+        setPeriodButtons();
+        reloadHoldings();
+      }
+      function prevPeriod() {
+        const idx = rebalanceDates.indexOf(currentRebalanceDate);
+        if (idx >= 0 && idx < rebalanceDates.length - 1) {
+          currentRebalanceDate = rebalanceDates[idx + 1];
+          document.getElementById("rebalanceSel").value = currentRebalanceDate;
+          setPeriodButtons();
+          reloadHoldings();
+        }
+      }
+      function nextPeriod() {
+        const idx = rebalanceDates.indexOf(currentRebalanceDate);
+        if (idx > 0) {
+          currentRebalanceDate = rebalanceDates[idx - 1];
+          document.getElementById("rebalanceSel").value = currentRebalanceDate;
+          setPeriodButtons();
+          reloadHoldings();
+        }
+      }
+      async function reloadHoldings() {
+        if (!(await ensureViewerAuth())) return;
+        const q = new URLSearchParams({ all_rows: "1" });
+        if (currentRebalanceDate) q.set("rebalance_date", currentRebalanceDate);
+        const data = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/holdings?" + q.toString());
+        const m = data.meta || {};
+        if (m.current_rebalance_date && m.current_rebalance_date !== currentRebalanceDate) {
+          currentRebalanceDate = String(m.current_rebalance_date).slice(0, 10);
+          if (rebalanceDates.includes(currentRebalanceDate)) document.getElementById("rebalanceSel").value = currentRebalanceDate;
+        }
+        setPeriodButtons();
+        document.getElementById("holdingsMeta").textContent = m ? "行情日：" + (m.latest_trade_date || "—") : "";
+        const rowsHtml = (data.items || []).map(function (i) {
+          const stockUrl = "/client/strategy/" + encodeURIComponent(STRATEGY_ID) + "/stock/" + encodeURIComponent(i.stock_code || "");
+          return (
+            '<tr><td class="sticky-col-1"><a class="stock-link" href="' + stockUrl + '">' + (i.stock_code || "-") + "</a>" +
+            '</td><td class="sticky-col-2"><a class="stock-link" href="' + stockUrl + '">' + (i.stock_name || "-") + "</a></td>" +
+            "<td>" + pct(i.period_weight) + "</td><td>" + pct(i.latest_weight) + "</td><td>" + priceFmt(i.latest_price) + "</td>" +
+            "<td>" + pctSigned(i.period_return) + "</td><td>" + pctSigned(i.last_1d_pct) + "</td><td>" + pctSigned(i.ret_5d) + "</td>" +
+            "<td>" + pctSigned(i.ret_20d) + "</td><td>" + pctSigned(i.ret_60d) + "</td><td>" + pctSigned(i.ret_ytd) + "</td>" +
+            "<td>" + mvYi(i.market_cap) + "</td><td>" + (i.industry_name || "-") + "</td><td>" + num2(i.pe) + "</td><td>" + num2(i.pb) + "</td></tr>"
+          );
+        }).join("");
+        document.getElementById("holdingsTable").innerHTML =
+          '<thead><tr><th class="sticky-col-1">代码</th><th class="sticky-col-2">名称</th><th>本期权重</th><th>最新权重</th><th>最新价格</th><th>本期收益</th><th>1日</th><th>5日</th><th>20日</th><th>60日</th><th>今年以来</th><th>市值(亿)</th><th>行业</th><th>PE</th><th>PB</th></tr></thead><tbody>' + rowsHtml + "</tbody>";
+      }
+      (async function initHoldings() {
+        if (!(await ensureViewerAuth())) return;
+        await refreshFollowState();
+        try {
+          await loadRebalanceDates();
+          await reloadHoldings();
+        } catch (e) {
+          document.getElementById("holdingsMeta").textContent = "加载失败：" + e.message;
+        }
+      })();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

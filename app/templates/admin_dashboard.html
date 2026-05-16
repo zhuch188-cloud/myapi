@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 后台首页</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1300px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      button { padding: 8px 10px; border: none; border-radius: 8px; background: #2463eb; color: #fff; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      .kpi { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 10px; }
+      .kpi .box { border: 1px solid #e9eef5; border-radius: 8px; padding: 10px; background: #fff; }
+      .kpi .label { color: #667085; font-size: 12px; margin-bottom: 4px; }
+      .kpi .val { font-size: 24px; font-weight: 700; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      .scroll { overflow-x: auto; }
+      .kpi.kpi-access { margin-top: 10px; }
+      .two-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+      .metric-group-title {
+        margin: 12px 0 6px;
+        font-size: 13px;
+        color: #475569;
+        font-weight: 700;
+      }
+      @media (max-width: 900px) { .kpi { grid-template-columns: repeat(2, minmax(160px, 1fr)); } .two-cols { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表盘</a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更新</a>
+        <a href="/admin/nav-check">净值</a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+        <span id="profile" class="muted"></span>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <h3 style="margin:0;">后台首页仪表盘</h3>
+          <button class="secondary" onclick="loadDashboard()">刷新</button>
+          <span id="hint" class="muted"></span>
+        </div>
+        <div class="kpi" style="margin-top:10px;">
+          <div class="box"><div class="label">策略总数</div><div id="kpiTotal" class="val">-</div></div>
+          <div class="box"><div class="label">可见策略数</div><div id="kpiVisible" class="val">-</div></div>
+          <div class="box"><div class="label">运行中任务</div><div id="kpiRunning" class="val">-</div></div>
+          <div class="box"><div class="label">最近成功时间</div><div id="kpiLastOk" class="val" style="font-size:16px;">-</div></div>
+        </div>
+        <h4 style="margin:14px 0 0;">用户访问（核心指标）</h4>
+        <p class="muted" style="margin:4px 0 8px;font-size:12px;">统一口径：登录成功/失败 + viewer 请求活跃 + 设备活跃。按请求路径的明细在用户管理 → 用户详情中查看。</p>
+        <div class="metric-group-title">规模</div>
+        <div class="kpi kpi-access">
+          <div class="box"><div class="label">用户总数</div><div id="accUsersTotal" class="val">-</div></div>
+          <div class="box"><div class="label">近7日活跃用户（viewer）</div><div id="accActive7d" class="val">-</div></div>
+          <div class="box"><div class="label">viewer 有效设备数</div><div id="accViewerDev" class="val">-</div></div>
+          <div class="box"><div class="label">viewer 设备平均闲置（小时）</div><div id="accViewerIdle" class="val" style="font-size:18px;">-</div></div>
+        </div>
+        <div class="metric-group-title">活跃</div>
+        <div class="kpi kpi-access">
+          <div class="box"><div class="label">今日 API 请求（viewer）</div><div id="accApiToday" class="val">-</div></div>
+          <div class="box"><div class="label">近7日人均请求（viewer）</div><div id="accAvgReq7d" class="val" style="font-size:18px;">-</div></div>
+          <div class="box"><div class="label">7d 登录成功 / 失败</div><div id="accL7" class="val" style="font-size:18px;">-</div></div>
+          <div class="box"><div class="label">24h 登录成功 / 失败</div><div id="accL24" class="val" style="font-size:18px;">-</div></div>
+        </div>
+        <div class="metric-group-title">风险</div>
+        <div class="two-cols">
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:6px;">近24h 登录失败原因 Top</div>
+            <div class="scroll"><table id="accFailReasonTable"></table></div>
+          </div>
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:6px;">近24h 登录失败 Top IP</div>
+            <div class="scroll"><table id="accFailIpTable"></table></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h4 style="margin:0 0 8px;">前台访客访问</h4>
+        <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.45;">
+          勾选「须先显示登录页」时，未登录用户打开策略展示会先进入登录页（默认）。取消勾选后，同一浏览器可通过设备静默获得会话并直接进入策略列表（后台仍会创建或绑定 viewer 账号，便于统计与需登录的接口）。
+        </p>
+        <div class="row" style="align-items:center;flex-wrap:wrap;gap:10px 16px;">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;">
+            <input type="checkbox" id="clientRequireLoginChk" />
+            须先显示登录页
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;">
+            <input type="checkbox" id="clientAllowRegisterChk" />
+            允许新用户注册
+          </label>
+          <button type="button" class="secondary" onclick="saveClientAccessSetting()">保存设置</button>
+          <span id="clientAccessMsg" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h4 style="margin:0 0 8px;">正式上线前环境初始化</h4>
+        <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.45;">
+          适用于<strong>系统测试完毕、准备正式上线</strong>：与进程启动时相同，对数据库做最终对齐——检查并创建缺失表与索引、用 <code>INSERT IGNORE</code> 补全默认配置（如 <code>site_settings</code>）与种子账号（admin/editor/viewer，已存在则不改密）。<strong>不会</strong>删除或清空策略、持仓、前台用户等业务数据。执行前须再次输入<strong>内置超级用户 admin</strong>的当前登录密码（非您当前 JWT 会话密码，除非二者相同）。
+        </p>
+        <div class="row" style="align-items:center;flex-wrap:wrap;gap:10px;">
+          <input
+            id="systemInitAdminPwd"
+            type="password"
+            autocomplete="off"
+            placeholder="admin 当前登录密码"
+            style="min-width:200px;max-width:280px;padding:8px 10px;border:1px solid #ccd3de;border-radius:8px;font-size:14px;"
+          />
+          <button type="button" class="secondary" onclick="runSystemInit()">执行上线环境初始化</button>
+          <span id="systemInitMsg" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h4>最近更新任务（Top 10）</h4>
+        <div class="scroll"><table id="jobsTable"></table></div>
+      </div>
+    </div>
+
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); location.href = "/admin-login"; }
+      async function api(path, options = {}) {
+        let res;
+        try {
+          res = await fetch(path, { ...options, headers: authHeaders(options.headers || {}) });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+        return res.json();
+      }
+      function esc(s) {
+        return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      }
+      function reasonCn(code) {
+        const m = {
+          bad_password: "密码错误",
+          user_not_found: "账号不存在",
+          account_disabled: "账号已禁用",
+          account_locked: "账号已锁定",
+          identifier_conflict: "登录标识重复",
+          "(empty)": "—",
+        };
+        return m[code] || esc(code || "—");
+      }
+      function fmtSF(w) {
+        if (!w) return "-";
+        const ok = w.success ?? 0;
+        const fail = w.fail ?? 0;
+        return `${ok} / ${fail}`;
+      }
+      async function runSystemInit() {
+        const el = document.getElementById("systemInitMsg");
+        const pwdEl = document.getElementById("systemInitAdminPwd");
+        el.textContent = "";
+        const pwd = (pwdEl && pwdEl.value) ? String(pwdEl.value) : "";
+        if (!pwd.trim()) {
+          el.textContent = "请输入 admin 密码";
+          return;
+        }
+        if (
+          !confirm(
+            "确认：系统测试已结束，即将执行「正式上线前环境初始化」。\n\n将运行与启动时相同的数据库结构检查与默认数据补全，不会清空业务表数据。\n\n确定继续？"
+          )
+        )
+          return;
+        try {
+          const data = await api("/api/admin/system-init", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ admin_password: pwd }),
+          });
+          pwdEl.value = "";
+          el.textContent = (data && data.message) ? String(data.message) : "已完成";
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
+      async function saveClientAccessSetting() {
+        const el = document.getElementById("clientAccessMsg");
+        el.textContent = "";
+        try {
+          const require = document.getElementById("clientRequireLoginChk").checked;
+          const allowReg = document.getElementById("clientAllowRegisterChk").checked;
+          await api("/api/admin/client-access-settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              client_require_login: require,
+              client_allow_register: allowReg,
+            }),
+          });
+          el.textContent = "已保存";
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
+      async function loadDashboard() {
+        const hint = document.getElementById("hint");
+        try {
+          hint.textContent = "加载中...";
+          const [cfg, jobs, access] = await Promise.all([
+            api("/api/admin/strategies"),
+            api("/api/admin/update-jobs"),
+            api("/api/admin/access-overview"),
+          ]);
+          const items = cfg.items || [];
+          const jobItems = (jobs.items || []).slice(0, 10);
+          const visible = items.filter(x => x.is_visible).length;
+          const running = (jobs.items || []).filter(x => x.status === "RUNNING").length;
+          const lastOk = (jobs.items || []).find(x => x.status === "SUCCESS");
+          document.getElementById("kpiTotal").textContent = String(items.length);
+          document.getElementById("kpiVisible").textContent = String(visible);
+          document.getElementById("kpiRunning").textContent = String(running);
+          document.getElementById("kpiLastOk").textContent = lastOk ? (lastOk.finished_at || "-") : "-";
+
+          const u = access.users || {};
+          document.getElementById("accUsersTotal").textContent = String(u.total ?? "-");
+          const le = access.login_events || {};
+          document.getElementById("accL24").textContent = fmtSF(le["24h"]);
+          document.getElementById("accL7").textContent = fmtSF(le["7d"]);
+
+          const ve = access.viewer_engagement || {};
+          const apiCal = ve.api_requests_calendar || {};
+          const dv = ve.distinct_active_viewers_by_requests || {};
+          document.getElementById("accActive7d").textContent = String(dv.last_7_days ?? "-");
+          document.getElementById("accApiToday").textContent = String(apiCal.today ?? "-");
+          document.getElementById("accAvgReq7d").textContent = String(ve.avg_api_requests_per_active_viewer_7d ?? "-");
+          document.getElementById("accViewerDev").textContent = String(ve.viewer_active_devices ?? "-");
+          document.getElementById("accViewerIdle").textContent =
+            ve.viewer_devices_avg_idle_hours != null ? String(ve.viewer_devices_avg_idle_hours) : "—";
+
+          const ips = access.fail_top_ips_24h || [];
+          document.getElementById("accFailIpTable").innerHTML = ips.length
+            ? `<thead><tr><th>IP</th><th>次数</th></tr></thead><tbody>${ips.map(r => `<tr><td>${esc(r.ip)}</td><td>${r.count}</td></tr>`).join("")}</tbody>`
+            : `<thead><tr><th>IP</th><th>次数</th></tr></thead><tbody><tr><td colspan="2" class="muted">暂无数据</td></tr></tbody>`;
+
+          const rs = access.fail_reasons_24h || [];
+          document.getElementById("accFailReasonTable").innerHTML = rs.length
+            ? `<thead><tr><th>原因</th><th>次数</th></tr></thead><tbody>${rs.map(r => `<tr><td>${reasonCn(r.reason)}</td><td>${r.count}</td></tr>`).join("")}</tbody>`
+            : `<thead><tr><th>原因</th><th>次数</th></tr></thead><tbody><tr><td colspan="2" class="muted">暂无数据</td></tr></tbody>`;
+
+          document.getElementById("jobsTable").innerHTML = `
+            <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>触发人</th><th>开始时间</th><th>结束时间</th><th>消息</th></tr></thead>
+            <tbody>${jobItems.map(j => `<tr><td>${j.id}</td><td>${j.job_type||"-"}</td><td>${j.status||"-"}</td><td>${j.triggered_by||"-"}</td><td>${j.started_at||"-"}</td><td>${j.finished_at||"-"}</td><td>${j.message||""}</td></tr>`).join("")}</tbody>`;
+          const crl = access.client_require_login;
+          document.getElementById("clientRequireLoginChk").checked = crl !== false;
+          const car = access.client_allow_register;
+          document.getElementById("clientAllowRegisterChk").checked = car !== false;
+          document.getElementById("clientAccessMsg").textContent = "";
+
+          hint.textContent = `刷新时间：${new Date().toLocaleString()}`;
+        } catch (e) {
+          hint.textContent = `加载失败：${formatFetchError(e)}`;
+        }
+      }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      loadDashboard();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

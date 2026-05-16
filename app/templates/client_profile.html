@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 个人资料</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 900px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border: 1px solid #e9eef5; border-radius: 12px; padding: 18px; margin-bottom: 12px; box-shadow: 0 4px 14px rgba(20,33,61,.08); }
+      .card.nav-card {
+        padding: 12px;
+        margin-bottom: 12px;
+        border: none;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(20,33,61,.08);
+      }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+      .nav a { margin-right: 12px; text-decoration: none; }
+      .nav a.nav-primary { color: #2463eb; font-weight: 600; font-size: 16px; }
+      .nav a.nav-secondary { color: #5b6b85; font-weight: 500; font-size: 14px; }
+      .nav a.nav-secondary:hover { color: #2463eb; }
+      .row.nav { width: 100%; box-sizing: border-box; margin: 0 0 12px; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+        color: #94a3b8;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.logout-soft:hover { background: #e9eef5; color: #64748b; }
+      label.lbl { display: block; width: 100%; font-size: 13px; color: #667085; margin-bottom: 4px; }
+      input, textarea, button { padding: 9px 11px; border: 1px solid #ccd3de; border-radius: 8px; font-size: 14px; }
+      input, textarea { width: 100%; box-sizing: border-box; background: #fff; color: #1b2430; }
+      textarea { min-height: 96px; resize: vertical; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; font-weight: 700; min-width: 88px; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card nav-card row nav">
+        <a class="nav-primary" href="/client">策略列表</a>
+        <a class="nav-primary" href="/client-profile">个人资料</a>
+        <a class="nav-secondary" href="/client-change-password">修改密码</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+      </div>
+      <div class="card">
+        <h3 style="margin:0 0 6px;">个人资料</h3>
+        <p id="userLine" class="muted" style="margin:0 0 8px;"></p>
+        <p class="muted" style="margin:0 0 14px;font-size:12px;line-height:1.55;">
+          登录时除上方注册用户名外，已保存的昵称、邮箱、手机号与注册用户名一样，任选其一配合密码即可登录。
+        </p>
+        <div class="row">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="nick">昵称（用户名，可选）</label>
+            <input id="nick" type="text" maxlength="64" placeholder="展示用称呼" autocomplete="nickname" />
+          </div>
+        </div>
+        <div class="row">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="phone">手机（可选）</label>
+            <input id="phone" type="text" maxlength="32" placeholder="联系电话" autocomplete="tel" />
+          </div>
+        </div>
+        <div class="row">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="email">邮箱（可选）</label>
+            <input id="email" type="email" maxlength="255" placeholder="name@example.com" autocomplete="email" />
+          </div>
+        </div>
+        <div class="row">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="bio">备注（可选）</label>
+            <textarea id="bio" maxlength="500" placeholder="最多500字"></textarea>
+          </div>
+        </div>
+        <div class="row" id="newPwdRow" style="display:none;">
+          <div style="flex:1;min-width:200px;">
+            <label class="lbl" for="newPwd">新密码（系统分配密码时填写，至少6位）</label>
+            <input id="newPwd" type="password" maxlength="128" placeholder="保存资料时一并更新登录密码" autocomplete="new-password" />
+          </div>
+        </div>
+        <div class="row">
+          <button type="button" onclick="saveProfile()">保存</button>
+          <span id="msg" class="muted"></span>
+        </div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/client_session_gate.html' %}
+{% include 'partials/client_logout_fn.html' %}
+      function logout() { clientLogoutToLogin(); }
+      function authHeaders(extra = {}) {
+        const t = localStorage.getItem("token") || "";
+        let h = { ...extra };
+        if (t) h = { ...h, Authorization: "Bearer " + t };
+        try {
+          const dt = localStorage.getItem("device_token");
+          if (dt) h = { ...h, "X-Device-Token": dt };
+        } catch (_) {}
+        return h;
+      }
+      var profileIsSystemPassword = false;
+      function mergeLocalProfile(patch) {
+        try {
+          const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+          Object.assign(pf, patch);
+          localStorage.setItem("profile", JSON.stringify(pf));
+        } catch (_) {}
+      }
+      function patchRememberedCredentialsNotSystem() {
+        try {
+          var rk = "client_remembered_credentials";
+          var rawm = localStorage.getItem(rk);
+          if (rawm) {
+            var om = JSON.parse(rawm);
+            if (om && typeof om === "object") {
+              om.is_system_password = false;
+              localStorage.setItem(rk, JSON.stringify(om));
+            }
+          }
+        } catch (_) {}
+      }
+      async function readErrorMessage(ret, fallbackText) {
+        try {
+          const data = await ret.json();
+          if (data && typeof data.detail === "string" && data.detail.trim()) return data.detail.trim();
+          if (data && typeof data.message === "string" && data.message.trim()) return data.message.trim();
+        } catch (_) {}
+        try {
+          const t = await ret.text();
+          if (!t) return fallbackText;
+          try {
+            const j = JSON.parse(t);
+            if (j && typeof j.detail === "string" && j.detail.trim()) return j.detail.trim();
+            if (j && typeof j.message === "string" && j.message.trim()) return j.message.trim();
+          } catch (_) {}
+          return t;
+        } catch (_) {
+          return fallbackText;
+        }
+      }
+      async function loadMe() {
+        let ret;
+        try {
+          ret = await fetch("/api/auth/me", { headers: authHeaders() });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!ret.ok) throw new Error();
+        const data = await ret.json();
+        document.getElementById("userLine").textContent =
+          "注册用户名：" + (data.username || "") + "　角色：" + (data.role || "");
+        document.getElementById("nick").value = data.nickname != null ? String(data.nickname) : "";
+        document.getElementById("phone").value = data.phone != null ? String(data.phone) : "";
+        document.getElementById("email").value = data.email != null ? String(data.email) : "";
+        document.getElementById("bio").value = data.bio != null ? String(data.bio) : "";
+        profileIsSystemPassword = !!data.password_is_system_generated;
+        var npRow = document.getElementById("newPwdRow");
+        var npEl = document.getElementById("newPwd");
+        if (npRow && npEl) {
+          if (profileIsSystemPassword) {
+            npRow.style.display = "";
+            npEl.value = "";
+          } else {
+            npRow.style.display = "none";
+            npEl.value = "";
+          }
+        }
+      }
+      async function saveProfile() {
+        const el = document.getElementById("msg");
+        el.textContent = "";
+        el.style.color = "";
+        const body = {
+          nickname: document.getElementById("nick").value || "",
+          phone: document.getElementById("phone").value || "",
+          email: document.getElementById("email").value || "",
+          bio: document.getElementById("bio").value || "",
+        };
+        if (profileIsSystemPassword) {
+          const np = (document.getElementById("newPwd").value || "").trim();
+          body.new_password = np;
+          if (np && np.length < 6) {
+            el.style.color = "#d92d20";
+            el.textContent = "新密码至少6位";
+            return;
+          }
+        }
+        try {
+          let ret;
+          try {
+            ret = await fetch("/api/auth/profile", {
+              method: "PUT",
+              headers: authHeaders({ "Content-Type": "application/json" }),
+              body: JSON.stringify(body),
+            });
+          } catch (e) {
+            throw new Error(formatFetchError(e));
+          }
+          if (!ret.ok) throw new Error(await readErrorMessage(ret, "保存失败"));
+          const data = await ret.json();
+          mergeLocalProfile({
+            nickname: data.nickname,
+            phone: data.phone,
+            email: data.email,
+            bio: data.bio,
+            must_change_password: false,
+            password_is_system_generated: !!data.password_is_system_generated,
+          });
+          if (data.access_token) {
+            try {
+              localStorage.setItem("token", data.access_token);
+            } catch (_) {}
+            patchRememberedCredentialsNotSystem();
+          }
+          if (data.password_is_system_generated === false) {
+            profileIsSystemPassword = false;
+            var npR = document.getElementById("newPwdRow");
+            var npI = document.getElementById("newPwd");
+            if (npR) npR.style.display = "none";
+            if (npI) npI.value = "";
+          }
+          el.textContent = "已保存";
+        } catch (e) {
+          el.style.color = "#d92d20";
+          el.textContent = formatFetchError(e);
+        }
+      }
+      (async function init() {
+        if (!(await ensureClientViewerSession())) return;
+        try {
+          await loadMe();
+        } catch (_) {
+          location.href = "/client-login";
+        }
+      })();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

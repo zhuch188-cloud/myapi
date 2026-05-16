@@ -1,0 +1,996 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 个股资料</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1100px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+      .nav a { margin-right: 12px; text-decoration: none; }
+      .nav a.nav-primary { color: #2463eb; font-weight: 600; font-size: 16px; }
+      .nav a.nav-secondary { color: #5b6b85; font-weight: 500; font-size: 14px; }
+      .nav a.nav-secondary:hover { color: #2463eb; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      .nav-actions { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+      .nav-actions a { margin-right: 0; }
+      .muted { color: #667085; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      .kv-table { table-layout: fixed; }
+      .kv-table th, .kv-table td { width: 25%; }
+      .kv-table th { color: #667085; font-weight: 500; background: #f8fafc; font-size: 12px; padding: 5px 6px; }
+      .kv-table td { font-weight: 600; }
+      /* 前十大股东：不按 25% 均分；序号极窄，名称加宽 */
+      .kv-table.kv-table-holders th,
+      .kv-table.kv-table-holders td { width: auto; }
+      .kv-table.kv-table-holders th.col-rank,
+      .kv-table.kv-table-holders td.col-rank {
+        width: 2.75em;
+        max-width: 2.75em;
+        min-width: 2.75em;
+        box-sizing: border-box;
+        text-align: center;
+        white-space: nowrap;
+        padding-left: 4px;
+        padding-right: 4px;
+      }
+      .kv-table.kv-table-holders col.cg-rank { width: 2.75em; }
+      /* 剩余宽度尽量给股东名称 */
+      .kv-table.kv-table-holders col.cg-name { width: auto; }
+      /* 约「持股量(万）」表头宽度；略留余量以容纳千分位数字 */
+      .kv-table.kv-table-holders col.cg-vol { width: 7.5em; }
+      /* 约「持股比例」四字宽度 */
+      .kv-table.kv-table-holders col.cg-pct { width: 4.35em; }
+      .kv-table.kv-table-holders th.col-name,
+      .kv-table.kv-table-holders td.col-name {
+        width: auto;
+        white-space: normal;
+        word-break: break-word;
+      }
+      .kv-table.kv-table-holders th.col-vol,
+      .kv-table.kv-table-holders td.col-vol {
+        white-space: nowrap;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+      .kv-table.kv-table-holders th.col-pct,
+      .kv-table.kv-table-holders td.col-pct {
+        white-space: nowrap;
+        text-align: center;
+        box-sizing: border-box;
+      }
+      .ret-up { color: #d93026; font-weight: 600; }
+      .ret-down { color: #0d8943; font-weight: 600; }
+      .chart-wrap { border: 1px solid #e9eef5; border-radius: 8px; padding: 8px; background: #fff; width: 100%; box-sizing: border-box; }
+      #trendChart { display: block; width: 100%; max-width: 100%; }
+      .profile-block { margin-bottom: 14px; }
+      .profile-block strong { display: block; margin-bottom: 6px; color: #0f172a; }
+      .profile-text { color: #334155; font-size: 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+      .income-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-top: 0; padding-top: 0; font-size: 13px; }
+      .income-toolbar label { color: #667085; }
+      .income-toolbar select { padding: 4px 8px; border-radius: 6px; border: 1px solid #e9eef5; font-size: 13px; }
+      .income-chart-canvas { display: block; width: 100%; max-width: 100%; }
+      .income-chart-section { margin-top: 4px; padding-top: 12px; border-top: 1px solid #e9eef5; }
+      .income-subchart-title { font-size: 13px; font-weight: 600; color: #334155; margin: 10px 0 6px; }
+      .income-chart-section.income-disabled .income-toolbar,
+      .income-chart-section.income-disabled .chart-wrap { opacity: 0.55; pointer-events: none; }
+      /* AI 摘要 Markdown：与上方「公司简介」等 profile-block / profile-text 风格一致 */
+      .ai-brief-md {
+        font-size: 14px;
+        line-height: 1.55;
+        color: #334155;
+        white-space: normal;
+        word-break: break-word;
+      }
+      .ai-brief-md h1,
+      .ai-brief-md h2,
+      .ai-brief-md h3,
+      .ai-brief-md h4,
+      .ai-brief-md h5,
+      .ai-brief-md h6 {
+        display: block;
+        margin: 14px 0 6px;
+        font-size: 14px;
+        font-weight: 700;
+        color: #0f172a;
+        line-height: 1.45;
+      }
+      .ai-brief-md > *:first-child {
+        margin-top: 0;
+      }
+      .ai-brief-md p {
+        margin: 0 0 8px;
+      }
+      .ai-brief-md ul,
+      .ai-brief-md ol {
+        margin: 0 0 10px;
+        padding-left: 1.25em;
+        color: #334155;
+      }
+      .ai-brief-md li {
+        margin: 4px 0;
+      }
+      .ai-brief-md table {
+        border-collapse: collapse;
+        width: 100%;
+        max-width: 100%;
+        font-size: 13px;
+        margin: 8px 0 10px;
+      }
+      .ai-brief-md th,
+      .ai-brief-md td {
+        border-bottom: 1px solid #e9eef5;
+        padding: 6px;
+        text-align: left;
+        white-space: normal;
+      }
+      .ai-brief-md th {
+        color: #667085;
+        font-weight: 500;
+        background: #f8fafc;
+        font-size: 12px;
+      }
+      .ai-brief-md td {
+        font-weight: 600;
+        color: #334155;
+      }
+      .ai-brief-md strong {
+        color: #0f172a;
+        font-weight: 700;
+      }
+      .ai-brief-md hr {
+        border: none;
+        border-top: 1px solid #e9eef5;
+        margin: 12px 0;
+      }
+      .ai-brief-heading {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px 14px;
+        margin: 0 0 8px;
+      }
+      .ai-brief-heading h4 {
+        margin: 0;
+      }
+      .ai-brief-btn {
+        padding: 6px 14px;
+        font-size: 13px;
+        border-radius: 6px;
+        border: 1px solid #2463eb;
+        background: #2463eb;
+        color: #fff;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      .ai-brief-btn:hover:not(:disabled) {
+        background: #1d4fd7;
+        border-color: #1d4fd7;
+      }
+      .ai-brief-btn:disabled {
+        opacity: 0.65;
+        cursor: not-allowed;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <a class="nav-primary" href="/client">策略列表</a>
+        <a class="nav-secondary" href="/client/strategy/{{ strategy_id }}/intro">策略介绍</a>
+        <a class="nav-secondary" href="/client/strategy/{{ strategy_id }}/nav">净值</a>
+        <a class="nav-secondary" href="/client/strategy/{{ strategy_id }}/holdings">持仓</a>
+        <span class="nav-actions">
+          <a class="nav-primary" href="/client-profile">个人资料</a>
+        </span>
+      </div>
+
+      <div class="card">
+        <h4 style="margin:0 0 8px;" id="title">个股资料</h4>
+        <div style="overflow-x:auto;"><table id="factsTable" class="kv-table"></table></div>
+      </div>
+
+      <div class="card">
+        <h4 style="margin:0 0 8px;">近一年走势</h4>
+        <div class="chart-wrap">
+          <canvas id="trendChart" width="1000" height="260"></canvas>
+        </div>
+      </div>
+
+      <div class="card">
+        <h4 style="margin:0 0 8px;">历史持有期与权重</h4>
+        <div style="overflow-x:auto;"><table id="histTable"></table></div>
+      </div>
+
+      <div class="card">
+        <p class="muted" id="profileLoading" style="margin:0 0 8px;">加载中…</p>
+        <div id="profileBox" style="display:none;">
+          <div class="profile-block">
+            <strong>公司简介</strong>
+            <div id="pfIntro" class="profile-text muted">-</div>
+          </div>
+          <div class="profile-block">
+            <strong>产品及业务</strong>
+            <div id="pfProducts" class="profile-text muted">-</div>
+          </div>
+          <div class="profile-block">
+            <strong>收入构成</strong>
+            <div id="pfRevenue" class="profile-text muted">-</div>
+          </div>
+          <div id="incomeChartBlock" class="income-chart-section">
+            <strong style="display:block;margin-bottom:8px;color:#0f172a;font-size:14px;">财务图示</strong>
+            <div class="income-toolbar">
+              <span>
+                <label for="incomeReportKind">报告期</label>
+                <select id="incomeReportKind" aria-label="报告期">
+                  <option value="q1">一季报</option>
+                  <option value="interim">中报</option>
+                  <option value="q3">三季报</option>
+                  <option value="annual">年报</option>
+                </select>
+              </span>
+              <span>
+                <label for="incomeMode">口径</label>
+                <select id="incomeMode" aria-label="口径">
+                  <option value="cumulative">累计</option>
+                  <option value="single">单季</option>
+                </select>
+              </span>
+            </div>
+            <div class="income-subchart-title">营业收入</div>
+            <div class="chart-wrap">
+              <canvas id="incomeChartRevenue" class="income-chart-canvas" width="900" height="210"></canvas>
+            </div>
+            <div class="income-subchart-title">归属母公司净利润</div>
+            <div class="chart-wrap">
+              <canvas id="incomeChartProfit" class="income-chart-canvas" width="900" height="210"></canvas>
+            </div>
+            <p class="muted" id="incomeChartNote" style="margin:6px 0 0;font-size:12px;"></p>
+            <div class="income-subchart-title">前十大股东（最近一期）</div>
+            <p class="muted" id="top10HoldersAsOf" style="margin:0 0 6px;font-size:12px;display:none;"></p>
+            <div style="overflow-x:auto;">
+              <table id="top10HoldersTable" class="kv-table kv-table-holders" style="font-size:12px;"></table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="aiBriefCard" style="display:none;">
+        <div class="ai-brief-heading">
+          <h4>AI查询信息（仅供参考）</h4>
+          <button type="button" id="aiBriefBtn" class="ai-brief-btn">点击查看</button>
+        </div>
+        <p id="aiBriefMeta" class="muted" style="display:none;margin:0 0 8px;font-size:12px;line-height:1.45;"></p>
+        <p id="aiBriefLoading" class="muted" style="margin:0 0 8px;display:none;">查询中…</p>
+        <div id="aiBriefText" class="profile-text ai-brief-md" style="display:none;"></div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js" crossorigin="anonymous"></script>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/client_session_gate.html' %}
+      const STRATEGY_ID = {{ strategy_id | tojson }};
+      const STOCK_CODE = {{ stock_code | tojson }};
+      let token = localStorage.getItem("token") || "";
+      function authHeaders(extra) {
+        const h = Object.assign({}, extra || {});
+        if (token) h.Authorization = "Bearer " + token;
+        try {
+          const dt = localStorage.getItem("device_token");
+          if (dt) h["X-Device-Token"] = dt;
+        } catch (_) {}
+        return h;
+      }
+      async function ensureViewerAuth() {
+        if (token) return true;
+        if (!(await ensureClientViewerSession())) return false;
+        token = localStorage.getItem("token") || "";
+        return !!token;
+      }
+      async function api(path, options) {
+        let res;
+        try {
+          res = await fetch(path, Object.assign({ headers: authHeaders() }, options || {}));
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || "HTTP " + res.status);
+        return res.json();
+      }
+      function pct(v) { return v == null ? "-" : (Number(v) * 100).toFixed(2) + "%"; }
+      function pctSigned(v) { if (v == null) return "-"; const n = Number(v); const t = pct(v); if (n > 0) return '<span class="ret-up">' + t + "</span>"; if (n < 0) return '<span class="ret-down">' + t + "</span>"; return t; }
+      function esc(s) { return String(s == null ? "" : s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
+      function num2(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      function price(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      function mvYi(v) { return v == null ? "-" : (Number(v) / 10000).toFixed(1); }
+      function setProfileField(id, text) {
+        const el = document.getElementById(id);
+        const t = text == null || String(text).trim() === "" ? "-" : String(text);
+        el.textContent = t;
+        el.classList.toggle("muted", t === "-");
+      }
+      function fmtCompactDate(d) {
+        const s = String(d || "");
+        if (s.length < 8) return s;
+        return s.slice(0, 4) + "-" + s.slice(4, 6) + "-" + s.slice(6, 8);
+      }
+      /** 走势图横轴：年月即可，避免与多日重叠 */
+      function fmtTrendAxisDate(d) {
+        const s = String(d || "");
+        if (s.length < 8) return s;
+        return s.slice(0, 4) + "-" + s.slice(4, 6);
+      }
+      /** 近一年曲线至多 maxTicks 个横轴刻度（含首尾），均匀取样 */
+      function trendAxisLabelIndices(n, maxTicks) {
+        const cap = Math.max(2, Math.min(maxTicks || 5, n));
+        if (n <= cap) return Array.from({ length: n }, (_, i) => i);
+        const setIdx = new Set();
+        for (let k = 0; k < cap; k++) {
+          setIdx.add(Math.round((k * (n - 1)) / Math.max(1, cap - 1)));
+        }
+        return Array.from(setIdx).sort(function (a, b) { return a - b; });
+      }
+      let _trendResizeTimer = null;
+      function drawStockTrendChart(trend, stockDisplayName) {
+        const c = document.getElementById("trendChart");
+        const wrap = c && c.closest(".chart-wrap");
+        if (!c || !wrap) return;
+        if (!trend || trend.error) {
+          const msg = trend && trend.error ? String(trend.error) : "暂无走势数据";
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          let w = Math.floor(wrap.clientWidth) || 800;
+          const h = 260;
+          c.style.width = w + "px";
+          c.style.height = h + "px";
+          c.width = Math.floor(w * dpr);
+          c.height = Math.floor(h * dpr);
+          const ctx = c.getContext("2d");
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, w, h);
+          ctx.fillStyle = "#667085";
+          ctx.font = "13px Arial";
+          ctx.fillText(msg, 12, 28);
+          return;
+        }
+        const dates = trend.dates || [];
+        const sn = trend.stock_norm || [];
+        const inn = trend.index_norm || [];
+        const benchName = trend.benchmark_name || "指数";
+        const n = Math.min(dates.length, sn.length, inn.length);
+        if (n < 2) {
+          const msg0 = "有效数据点不足，无法绘图";
+          const dpr0 = Math.min(window.devicePixelRatio || 1, 2);
+          let w0 = Math.floor(wrap.clientWidth) || 800;
+          const h0 = 260;
+          c.style.width = w0 + "px";
+          c.style.height = h0 + "px";
+          c.width = Math.floor(w0 * dpr0);
+          c.height = Math.floor(h0 * dpr0);
+          const ctx0 = c.getContext("2d");
+          ctx0.setTransform(dpr0, 0, 0, dpr0, 0, 0);
+          ctx0.fillStyle = "#fff";
+          ctx0.fillRect(0, 0, w0, h0);
+          ctx0.fillStyle = "#667085";
+          ctx0.font = "13px Arial";
+          ctx0.fillText(msg0, 12, 28);
+          return;
+        }
+        const rs = [];
+        for (let i = 0; i < n; i++) {
+          const a = Number(sn[i]);
+          const b = Number(inn[i]);
+          if (Number.isFinite(a)) rs.push(a / 100 - 1);
+          if (Number.isFinite(b)) rs.push(b / 100 - 1);
+        }
+        if (!rs.length) {
+          drawStockTrendChart({ error: "数据无效" }, stockDisplayName);
+          return;
+        }
+        let rtTop = Math.max.apply(null, rs);
+        let rtBottom = Math.min.apply(null, rs);
+        if (rtTop <= rtBottom) {
+          rtTop = rtBottom + 1e-6;
+        }
+        const pad = 0.02 * (rtTop - rtBottom);
+        rtTop += pad;
+        rtBottom -= pad;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        let w = Math.floor(wrap.clientWidth) || 800;
+        const h = 260;
+        c.style.width = w + "px";
+        c.style.height = h + "px";
+        c.width = Math.floor(w * dpr);
+        c.height = Math.floor(h * dpr);
+        const ctx = c.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, w, h);
+        const padL = 52;
+        const padR = 14;
+        const padT = 36;
+        const padB = 36;
+        const plotW = w - padL - padR;
+        const plotH = h - padT - padB;
+        const yOf = (r) => padT + ((rtTop - r) * plotH) / (rtTop - rtBottom);
+        const xOf = (i) => padL + (n <= 1 ? 0 : (i * plotW) / (n - 1));
+        ctx.strokeStyle = "#e9eef5";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padL, yOf(0));
+        ctx.lineTo(padL + plotW, yOf(0));
+        ctx.stroke();
+        ctx.fillStyle = "#667085";
+        ctx.font = "11px Arial";
+        ctx.textAlign = "right";
+        for (let k = 0; k <= 4; k++) {
+          const r = rtBottom + (k * (rtTop - rtBottom)) / 4;
+          const y = yOf(r);
+          ctx.fillText((r * 100).toFixed(1) + "%", padL - 6, y + 4);
+          ctx.beginPath();
+          ctx.strokeStyle = "#f1f5f9";
+          ctx.moveTo(padL, y);
+          ctx.lineTo(padL + plotW, y);
+          ctx.stroke();
+        }
+        const labelIdx = trendAxisLabelIndices(n, 5);
+        ctx.textAlign = "center";
+        ctx.fillStyle = "#667085";
+        ctx.font = "11px Arial";
+        labelIdx.forEach(function (i) {
+          ctx.fillText(fmtTrendAxisDate(dates[i]), xOf(i), h - 10);
+        });
+        function lineSeries(vals, color) {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          let started = false;
+          for (let i = 0; i < n; i++) {
+            const v = Number(vals[i]);
+            if (!Number.isFinite(v)) continue;
+            const r = v / 100 - 1;
+            const x = xOf(i);
+            const y = yOf(r);
+            if (!started) {
+              ctx.moveTo(x, y);
+              started = true;
+            } else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+        lineSeries(sn, "#2463eb");
+        lineSeries(inn, "#94a3b8");
+        ctx.textAlign = "left";
+        ctx.font = "11px Arial";
+        const stockLblRaw = (stockDisplayName && String(stockDisplayName).trim()) ? String(stockDisplayName).trim() : "个股";
+        let stockLbl = stockLblRaw;
+        const maxLbl = Math.max(80, Math.floor(plotW * 0.42));
+        while (stockLbl.length > 1 && ctx.measureText(stockLbl).width > maxLbl) {
+          stockLbl = stockLbl.slice(0, -1);
+        }
+        if (stockLbl !== stockLblRaw && stockLbl.length > 0) stockLbl += "…";
+        let lx = padL;
+        const ly = 14;
+        ctx.fillStyle = "#2463eb";
+        ctx.fillRect(lx, ly - 5, 12, 3);
+        ctx.fillStyle = "#1b2430";
+        ctx.fillText(stockLbl, lx + 16, ly);
+        lx += 16 + ctx.measureText(stockLbl).width + 14;
+        ctx.fillStyle = "#94a3b8";
+        ctx.fillRect(lx, ly - 5, 12, 3);
+        ctx.fillStyle = "#1b2430";
+        ctx.fillText(benchName, lx + 16, ly);
+      }
+      let _incomeResizeTimer = null;
+      let _incomeHoverRaf = null;
+      window._incomeHoverI = null;
+      window._incomeChartGeom = null;
+      function _incomeHoverMove(e) {
+        const g = window._incomeChartGeom;
+        if (!g || !g.n) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const rel = mx - g.padL;
+        const i = Math.max(0, Math.min(g.n - 1, Math.floor((rel + g.step * 0.5) / g.step)));
+        if (window._incomeHoverI === i) return;
+        window._incomeHoverI = i;
+        if (_incomeHoverRaf != null) cancelAnimationFrame(_incomeHoverRaf);
+        _incomeHoverRaf = requestAnimationFrame(function () {
+          _incomeHoverRaf = null;
+          drawIncomeChart();
+        });
+      }
+      function _incomeHoverLeave() {
+        window._incomeHoverI = null;
+        if (_incomeHoverRaf != null) cancelAnimationFrame(_incomeHoverRaf);
+        _incomeHoverRaf = requestAnimationFrame(function () {
+          _incomeHoverRaf = null;
+          drawIncomeChart();
+        });
+      }
+      function _incomeBindHoverOnce() {
+        if (window._incomeHoverBound) return;
+        window._incomeHoverBound = true;
+        ["incomeChartRevenue", "incomeChartProfit"].forEach(function (id) {
+          const el = document.getElementById(id);
+          if (el) {
+            el.addEventListener("mousemove", _incomeHoverMove);
+            el.addEventListener("mouseleave", _incomeHoverLeave);
+          }
+        });
+      }
+      function _drawIncomeCanvasMessage(canvasId, msg) {
+        const c = document.getElementById(canvasId);
+        const wrap = c && c.closest(".chart-wrap");
+        if (!c || !wrap) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.floor(wrap.clientWidth) || 800;
+        const h = 210;
+        c.style.width = w + "px";
+        c.style.height = h + "px";
+        c.width = Math.floor(w * dpr);
+        c.height = Math.floor(h * dpr);
+        const ctx = c.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = "#667085";
+        ctx.font = "13px Arial";
+        const lines = msg.length > 56 ? [msg.slice(0, 56), msg.slice(56, 112)] : [msg];
+        lines.forEach(function (line, j) {
+          ctx.fillText(line, 12, 26 + j * 18);
+        });
+      }
+      function _paintIncomeMetric(canvasId, w, h, dpr, opts) {
+        const c = document.getElementById(canvasId);
+        if (!c) return;
+        c.style.width = w + "px";
+        c.style.height = h + "px";
+        c.width = Math.floor(w * dpr);
+        c.height = Math.floor(h * dpr);
+        const ctx = c.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, w, h);
+        const pts = opts.pts;
+        const n = opts.n;
+        const barVals = opts.barVals;
+        const yoyVals = opts.yoyVals;
+        const barColor = opts.barColor;
+        const lineColor = opts.lineColor;
+        const legendBar = opts.legendBar;
+        const legendLine = opts.legendLine;
+        let barMax = 0.01;
+        let barMin = 0;
+        for (let i = 0; i < n; i++) {
+          if (barVals[i] != null) {
+            barMax = Math.max(barMax, barVals[i]);
+            barMin = Math.min(barMin, barVals[i]);
+          }
+        }
+        if (barMin >= 0) barMin = 0;
+        else barMin *= 1.08;
+        if (barMax <= 0) barMax = 0.01;
+        else barMax = Math.max(barMax, 0) * 1.08;
+        if (barMax <= barMin) barMax = barMin + 0.01;
+        let yoyMin = 0;
+        let yoyMax = 0;
+        for (let i = 0; i < n; i++) {
+          if (yoyVals[i] != null) {
+            yoyMin = Math.min(yoyMin, yoyVals[i]);
+            yoyMax = Math.max(yoyMax, yoyVals[i]);
+          }
+        }
+        if (yoyMin === yoyMax) {
+          yoyMin -= 0.1;
+          yoyMax += 0.1;
+        }
+        const padL = 44;
+        const padR = 44;
+        const padT = 36;
+        const padB = 36;
+        const plotW = w - padL - padR;
+        const plotH = h - padT - padB;
+        const barSpan = barMax - barMin;
+        const yBar = function (v) {
+          return padT + plotH - ((v - barMin) * plotH) / barSpan;
+        };
+        const yYoy = function (r) {
+          return padT + ((yoyMax - r) * plotH) / (yoyMax - yoyMin);
+        };
+        const step = n <= 0 ? plotW : plotW / n;
+        ctx.strokeStyle = "#e9eef5";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padL, yBar(0));
+        ctx.lineTo(padL + plotW, yBar(0));
+        ctx.stroke();
+        ctx.fillStyle = "#667085";
+        ctx.font = "10px Arial";
+        ctx.textAlign = "right";
+        for (let k = 0; k <= 4; k++) {
+          const v = barMin + (barSpan * k) / 4;
+          const y = yBar(v);
+          ctx.fillText(v.toFixed(1), padL - 4, y + 3);
+          ctx.strokeStyle = "#f1f5f9";
+          ctx.beginPath();
+          ctx.moveTo(padL, y);
+          ctx.lineTo(padL + plotW, y);
+          ctx.stroke();
+        }
+        ctx.textAlign = "left";
+        ctx.fillStyle = "#94a3b8";
+        for (let k = 0; k <= 4; k++) {
+          const r = yoyMin + ((yoyMax - yoyMin) * k) / 4;
+          const y = yYoy(r);
+          ctx.fillText((r * 100).toFixed(0) + "%", padL + plotW + 4, y + 3);
+        }
+        const bw = Math.min(32, step * 0.36);
+        for (let i = 0; i < n; i++) {
+          const cx = padL + (i + 0.5) * step;
+          if (barVals[i] != null) {
+            const y0 = yBar(0);
+            const y1 = yBar(barVals[i]);
+            const top = Math.min(y0, y1);
+            const hbar = Math.abs(y0 - y1);
+            ctx.fillStyle = barColor;
+            ctx.fillRect(cx - bw / 2, top, bw, Math.max(hbar, 1));
+            const lab = Number(barVals[i]).toFixed(2);
+            ctx.save();
+            ctx.fillStyle = "#334155";
+            ctx.font = "10px Arial";
+            ctx.textAlign = "center";
+            const plotTop = padT;
+            const plotBot = padT + plotH;
+            if (top - 3 >= plotTop + 2) {
+              ctx.textBaseline = "bottom";
+              ctx.fillText(lab, cx, top - 2);
+            } else {
+              ctx.textBaseline = "top";
+              ctx.fillText(lab, cx, Math.min(top + hbar + 2, plotBot - 2));
+            }
+            ctx.restore();
+          }
+        }
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < n; i++) {
+          const r = yoyVals[i];
+          if (r == null || !Number.isFinite(r)) {
+            started = false;
+            continue;
+          }
+          const x = padL + (i + 0.5) * step;
+          const y = yYoy(r);
+          if (!started) {
+            ctx.moveTo(x, y);
+            started = true;
+          } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        const hi = window._incomeHoverI;
+        if (hi != null && hi >= 0 && hi < n) {
+          const xh = padL + (hi + 0.5) * step;
+          ctx.strokeStyle = "rgba(100,116,139,0.55)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.moveTo(xh, padT);
+          ctx.lineTo(xh, padT + plotH);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        ctx.textAlign = "center";
+        ctx.fillStyle = "#667085";
+        ctx.font = "10px Arial";
+        for (let i = 0; i < n; i++) {
+          const rp = (pts[i] && pts[i].report_period) || "";
+          ctx.fillText(rp.length >= 8 ? rp.slice(0, 4) + "-" + rp.slice(4, 6) : rp, padL + (i + 0.5) * step, h - 10);
+        }
+        ctx.textAlign = "left";
+        ctx.font = "10px Arial";
+        let lx = padL;
+        const ly = 14;
+        ctx.fillStyle = barColor;
+        ctx.fillRect(lx, ly - 4, 10, 3);
+        ctx.fillStyle = "#1b2430";
+        ctx.fillText(legendBar, lx + 14, ly);
+        lx += 14 + ctx.measureText(legendBar).width + 12;
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(lx, ly - 2);
+        ctx.lineTo(lx + 14, ly - 2);
+        ctx.stroke();
+        ctx.fillStyle = "#1b2430";
+        ctx.fillText(legendLine, lx + 18, ly);
+      }
+      function drawIncomeChart() {
+        const series = window._lastIncomeSeries;
+        const wrapR = document.getElementById("incomeChartRevenue") && document.getElementById("incomeChartRevenue").closest(".chart-wrap");
+        const incBlock = document.getElementById("incomeChartBlock");
+        if (!wrapR || series == null) return;
+        if (incBlock) incBlock.classList.toggle("income-disabled", !!series.error);
+        const noteEl = document.getElementById("incomeChartNote");
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.floor(wrapR.clientWidth) || 800;
+        const h = 210;
+        if (!series || series.error) {
+          const msg = series && series.error ? String(series.error) : "暂无财务序列";
+          _drawIncomeCanvasMessage("incomeChartRevenue", msg);
+          _drawIncomeCanvasMessage("incomeChartProfit", msg);
+          if (noteEl) noteEl.textContent = series && series.error ? String(series.error) : "";
+          window._incomeChartGeom = null;
+          return;
+        }
+        const kind = document.getElementById("incomeReportKind").value;
+        const mode = document.getElementById("incomeMode").value;
+        const grp = series[kind];
+        const pts = grp && grp[mode] ? grp[mode] : [];
+        if (noteEl) noteEl.textContent = "柱状：亿元；折线：同比增速。";
+        if (!pts.length) {
+          _drawIncomeCanvasMessage("incomeChartRevenue", "暂无该口径下的数据点");
+          _drawIncomeCanvasMessage("incomeChartProfit", "暂无该口径下的数据点");
+          window._incomeChartGeom = null;
+          return;
+        }
+        const n = pts.length;
+        const revYi = [];
+        const profYi = [];
+        const yoyR = [];
+        const yoyP = [];
+        for (let i = 0; i < n; i++) {
+          const p = pts[i] || {};
+          revYi.push(p.revenue != null && Number.isFinite(Number(p.revenue)) ? Number(p.revenue) / 1e8 : null);
+          profYi.push(p.profit != null && Number.isFinite(Number(p.profit)) ? Number(p.profit) / 1e8 : null);
+          yoyR.push(p.revenue_yoy != null && Number.isFinite(Number(p.revenue_yoy)) ? Number(p.revenue_yoy) : null);
+          yoyP.push(p.profit_yoy != null && Number.isFinite(Number(p.profit_yoy)) ? Number(p.profit_yoy) : null);
+        }
+        const padL = 44;
+        const padR = 44;
+        const padT = 36;
+        const padB = 36;
+        const plotW = w - padL - padR;
+        const step = n <= 0 ? plotW : plotW / n;
+        window._incomeChartGeom = { padL: padL, padR: padR, padT: padT, padB: padB, step: step, n: n, w: w, h: h };
+        _incomeBindHoverOnce();
+        _paintIncomeMetric("incomeChartRevenue", w, h, dpr, {
+          pts: pts,
+          n: n,
+          barVals: revYi,
+          yoyVals: yoyR,
+          barColor: "#2463eb",
+          lineColor: "#ea580c",
+          legendBar: "营收（亿元）",
+          legendLine: "同比",
+        });
+        _paintIncomeMetric("incomeChartProfit", w, h, dpr, {
+          pts: pts,
+          n: n,
+          barVals: profYi,
+          yoyVals: yoyP,
+          barColor: "#0d8943",
+          lineColor: "#7c3aed",
+          legendBar: "净利（亿元）",
+          legendLine: "同比",
+        });
+      }
+      window.addEventListener("resize", function () {
+        clearTimeout(_trendResizeTimer);
+        clearTimeout(_incomeResizeTimer);
+        _trendResizeTimer = setTimeout(function () {
+          if (window._lastTrendPayload !== undefined) {
+            drawStockTrendChart(window._lastTrendPayload, window._lastTrendStockName || "");
+          }
+        }, 150);
+        _incomeResizeTimer = setTimeout(function () {
+          if (window._lastIncomeSeries != null) drawIncomeChart();
+        }, 150);
+      });
+      async function load() {
+        if (!(await ensureViewerAuth())) return;
+        const data = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/stocks/" + encodeURIComponent(STOCK_CODE));
+        const x = data.latest || {};
+        const stockTitle = (x.stock_name || "-") + "（" + (x.stock_code || "-") + "）";
+        document.getElementById("title").textContent = stockTitle + "个股资料";
+        window._lastTrendPayload = data.trend || null;
+        const stockNameForChart = (x.stock_name && String(x.stock_name).trim()) ? String(x.stock_name).trim() : "";
+        window._lastTrendStockName = stockNameForChart;
+        drawStockTrendChart(data.trend || { error: "无走势数据" }, stockNameForChart);
+        const kv = [
+          ["行情日", x.trade_date || "-"], ["调仓日", x.rebalance_date || "-"],
+          ["本期权重", pct(x.period_weight)], ["最新权重", pct(x.latest_weight)],
+          ["价格", price(x.latest_price)], ["本期", pctSigned(x.period_return)],
+          ["1日", pctSigned(x.last_1d_pct)], ["5交易日", pctSigned(x.ret_5d)],
+          ["20交易日", pctSigned(x.ret_20d)], ["今年以来", pctSigned(x.ret_ytd)],
+          ["行业", x.industry_name || "-"], ["市值(亿)", mvYi(x.market_cap)],
+          ["PB", num2(x.pb)], ["PE", num2(x.pe)],
+        ];
+        const kvRows = [];
+        for (let i = 0; i < kv.length; i += 2) {
+          const a = kv[i] || ["", ""], b = kv[i + 1] || ["", ""];
+          kvRows.push("<tr><th>" + a[0] + "</th><td>" + a[1] + "</td><th>" + b[0] + "</th><td>" + b[1] + "</td></tr>");
+        }
+        document.getElementById("factsTable").innerHTML = "<tbody>" + kvRows.join("") + "</tbody>";
+        const hist = data.history || [];
+        const rows = [];
+        for (let i = 0; i < hist.length; i += 2) {
+          const a = hist[i] || {}, b = hist[i + 1] || {};
+          rows.push("<tr><td>" + (a.snapshot_date || "-") + "</td><td>" + pct(a.period_weight) + "</td><td>" + (b.snapshot_date || "-") + "</td><td>" + pct(b.period_weight) + "</td></tr>");
+        }
+        document.getElementById("histTable").innerHTML = "<thead><tr><th>日期</th><th>权重</th><th>日期</th><th>权重</th></tr></thead><tbody>" + rows.join("") + "</tbody>";
+        const cp = data.company_profile || {};
+        setProfileField("pfIntro", cp["公司简介"]);
+        setProfileField("pfProducts", cp["产品及业务"]);
+        setProfileField("pfRevenue", cp["收入构成"]);
+        document.getElementById("profileLoading").style.display = "none";
+        document.getElementById("profileBox").style.display = "block";
+        const aiCard = document.getElementById("aiBriefCard");
+        if (aiCard) aiCard.style.display = "block";
+        const inc = data.income_series;
+        window._lastIncomeSeries =
+          inc != null && typeof inc === "object" ? inc : { error: "接口未返回 income_series，请更新后端后重试" };
+        const incBlock = document.getElementById("incomeChartBlock");
+        if (incBlock) {
+          if (!window._incomeControlsBound) {
+            window._incomeControlsBound = true;
+            document.getElementById("incomeReportKind").addEventListener("change", drawIncomeChart);
+            document.getElementById("incomeMode").addEventListener("change", drawIncomeChart);
+          }
+          drawIncomeChart();
+        }
+        const th = data.top10_holders;
+        const thTable = document.getElementById("top10HoldersTable");
+        const thAsOf = document.getElementById("top10HoldersAsOf");
+        function fmtVolWan(v) {
+          if (v == null || !Number.isFinite(Number(v))) return "-";
+          const wan = Math.round(Number(v) / 10000);
+          return wan.toLocaleString("zh-CN", { maximumFractionDigits: 0, minimumFractionDigits: 0 });
+        }
+        function fmtPct(v) {
+          if (v == null || !Number.isFinite(Number(v))) return "-";
+          const x = Number(v);
+          if (x >= 0 && x <= 1) return (x * 100).toFixed(2) + "%";
+          if (x > 1 && x <= 100) return x.toFixed(2) + "%";
+          return x.toFixed(2) + "%";
+        }
+        if (thTable) {
+          if (th && !th.error && th.items && th.items.length) {
+            const ed = th.as_of_end_dt || "";
+            const ad = th.as_of_ann_dt || "";
+            if (thAsOf) {
+              thAsOf.style.display = "block";
+              thAsOf.textContent =
+                "截止日期 " + (ed.length === 8 ? ed.slice(0, 4) + "-" + ed.slice(4, 6) + "-" + ed.slice(6, 8) : ed) +
+                (ad ? "；公告日 " + (ad.length >= 8 ? ad.slice(0, 4) + "-" + ad.slice(4, 6) + "-" + ad.slice(6, 8) : ad) : "");
+            }
+            const head =
+              "<colgroup><col class=\"cg-rank\" /><col class=\"cg-name\" /><col class=\"cg-vol\" /><col class=\"cg-pct\" /></colgroup>" +
+              "<thead><tr><th class=\"col-rank\">序号</th><th class=\"col-name\">股东名称</th><th class=\"col-vol\">持股量(万）</th><th class=\"col-pct\">持股比例</th></tr></thead>";
+            const body = th.items
+              .map(function (it) {
+                const nm = esc(it.holder_name || "-");
+                return (
+                  "<tr><td class=\"col-rank\">" +
+                  (it.rank != null ? String(it.rank) : "-") +
+                  "</td><td class=\"col-name\">" +
+                  nm +
+                  "</td><td class=\"col-vol\">" +
+                  fmtVolWan(it.hold_vol) +
+                  "</td><td class=\"col-pct\">" +
+                  fmtPct(it.hold_pct) +
+                  "</td></tr>"
+                );
+              })
+              .join("");
+            thTable.innerHTML = head + "<tbody>" + body + "</tbody>";
+          } else {
+            if (thAsOf) {
+              thAsOf.style.display = "none";
+              thAsOf.textContent = "";
+            }
+            const msg = th && th.error ? esc(String(th.error)) : "暂无股东数据";
+            thTable.innerHTML = "<tbody><tr><td colspan=\"4\" class=\"muted\">" + msg + "</td></tr></tbody>";
+          }
+        }
+      }
+      async function loadAiBrief() {
+        const loading = document.getElementById("aiBriefLoading");
+        const textEl = document.getElementById("aiBriefText");
+        const metaEl = document.getElementById("aiBriefMeta");
+        const btn = document.getElementById("aiBriefBtn");
+        if (!loading || !textEl) return;
+        const btnLabel = btn ? btn.textContent : "";
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = "查询中…";
+        }
+        if (metaEl) metaEl.style.display = "none";
+        loading.style.display = "block";
+        textEl.style.display = "none";
+        textEl.textContent = "";
+        try {
+          const path =
+            "/api/strategies/" +
+            encodeURIComponent(STRATEGY_ID) +
+            "/stocks/" +
+            encodeURIComponent(STOCK_CODE) +
+            "/ai-brief";
+          let res;
+          try {
+            res = await fetch(path, { headers: authHeaders() });
+          } catch (e) {
+            throw new Error(formatFetchError(e));
+          }
+          let data = {};
+          try {
+            data = await res.json();
+          } catch (_) {}
+          if (!res.ok) {
+            const msg = (data && (data.detail || data.message)) ? String(data.detail || data.message) : "HTTP " + res.status;
+            throw new Error(msg);
+          }
+          loading.style.display = "none";
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = "重新查询";
+          }
+          if (metaEl && data.context) {
+            const c = data.context;
+            const s = c.window_start && String(c.window_start).length >= 8
+              ? String(c.window_start).slice(0, 4) + "-" + String(c.window_start).slice(4, 6) + "-" + String(c.window_start).slice(6, 8)
+              : (c.window_start || "—");
+            const wd = c.window_days != null && Number.isFinite(Number(c.window_days)) ? String(c.window_days) : "";
+            metaEl.textContent =
+              "查询窗口" + (wd ? "（约 " + wd + " 个自然日）" : "") +
+              "：自 " + s + " 至 " + (c.server_today || "—") + "；含新闻与研报要点（联网检索，仅供参考）";
+            metaEl.style.display = "block";
+          }
+          if (data.error) {
+            textEl.innerHTML = "";
+            textEl.textContent = String(data.error);
+            textEl.classList.add("muted");
+          } else {
+            const raw = data.text && String(data.text).trim() ? String(data.text).trim() : "（无内容）";
+            textEl.classList.remove("muted");
+            if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined" && raw !== "（无内容）") {
+              try {
+                textEl.innerHTML = DOMPurify.sanitize(marked.parse(raw, { breaks: true }));
+              } catch (_) {
+                textEl.textContent = raw;
+              }
+            } else {
+              textEl.textContent = raw;
+            }
+          }
+          textEl.style.display = "block";
+        } catch (e) {
+          loading.style.display = "none";
+          textEl.textContent = formatFetchError(e);
+          textEl.classList.add("muted");
+          textEl.style.display = "block";
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = btnLabel || "点击查看";
+          }
+        }
+      }
+      (function bindAiBriefClick() {
+        const btn = document.getElementById("aiBriefBtn");
+        if (btn) btn.addEventListener("click", function () { loadAiBrief(); });
+      })();
+      load().catch((e) => {
+        document.getElementById("title").textContent = "加载失败：" + formatFetchError(e);
+        document.getElementById("profileLoading").textContent = "加载失败";
+      });
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>

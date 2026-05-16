@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }}</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      input, button, select { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      .scroll { overflow-x: auto; }
+      .muted { color: #667085; }
+      /* A 股习惯：涨红跌绿 */
+      .ret-up { color: #d93026; font-weight: 600; }
+      .ret-down { color: #0d8943; font-weight: 600; }
+      @media (max-width: 768px) { .container { padding: 10px; } .card { padding: 10px; } }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card">
+        <h3>策略展示系统（Python）</h3>
+        <div id="loginBox" class="row">
+          <input id="username" placeholder="用户名" value="admin" />
+          <input id="password" type="password" placeholder="密码" value="admin123" />
+          <button onclick="login()">登录</button>
+          <span id="msg" class="muted"></span>
+        </div>
+      </div>
+
+      <div id="main" style="display:none;">
+        <div class="card row">
+          <strong id="profile"></strong>
+          <button class="secondary" onclick="manualUpdate()">立即更新</button>
+          <button onclick="importData()">导入策略文件</button>
+        </div>
+        <p id="updateStatus" class="muted" style="margin:0 0 12px;"></p>
+        <p class="muted" style="margin:-8px 0 12px;font-size:12px;">
+          更新在后台执行。多策略、多调仓期时 Wind 查询多，数分钟至半小时属常见；下方状态若持续变化说明未卡死。若超过 45 分钟无变化，请查 MySQL 进程或重启服务。
+        </p>
+
+        <div class="card">
+          <h4>策略列表</h4>
+          <div id="strategyList"></div>
+        </div>
+
+        <div class="card">
+          <h4>后台检查：策略配置</h4>
+          <div class="row">
+            <button class="secondary" onclick="loadAdminStrategies()">刷新策略配置</button>
+            <span id="adminCfgInfo" class="muted"></span>
+          </div>
+          <div class="scroll">
+            <table id="adminCfgTable"></table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h4>持仓明细</h4>
+          <p id="holdingsMeta" class="muted" style="margin:0 0 8px;"></p>
+          <p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.5;">
+            仅展示<strong>最新行情日</strong>数据。本期收益=策略<strong>最近调仓日</strong>起首个<strong>交易日</strong>收盘，至最新收盘的涨跌幅。
+            5/20/60 日收益=相对<strong>第 N 个交易日之前</strong>收盘的涨跌幅（按日 K 序列，非自然日）。
+            YTD=相对<strong>上年最后一个交易日</strong>收盘的涨跌幅；当年上市、上年无 K 的标的会显示「-」。
+            行业/市值等仍依赖 Wind 表完整性（见下方说明）。
+          </p>
+          <div class="row">
+            <label>每页</label>
+            <select id="pageSize" onchange="reloadHoldings()">
+              <option>20</option>
+              <option selected>50</option>
+              <option>100</option>
+            </select>
+            <button class="secondary" onclick="prevPage()">上一页</button>
+            <button class="secondary" onclick="nextPage()">下一页</button>
+            <span id="pageInfo" class="muted"></span>
+          </div>
+          <div class="scroll">
+            <table id="holdingsTable"></table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h4>后台检查：净值序列</h4>
+          <div class="row">
+            <label>开始日</label><input id="navStartDate" type="date" />
+            <label>结束日</label><input id="navEndDate" type="date" />
+            <button class="secondary" onclick="loadNav()">查询净值</button>
+            <span id="navInfo" class="muted"></span>
+          </div>
+          <div class="scroll">
+            <table id="navTable"></table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = "";
+      let currentStrategyId = "";
+      let page = 1;
+
+      async function api(path, options = {}) {
+        let res;
+        try {
+          res = await fetch(path, {
+            ...options,
+            headers: {
+              ...(options.headers || {}),
+              ...(token ? { Authorization: `Bearer ${token}` } : {})
+            }
+          });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || `HTTP ${res.status}`);
+        }
+        return res.json();
+      }
+
+      async function login() {
+        const form = new FormData();
+        form.append("username", document.getElementById("username").value);
+        form.append("password", document.getElementById("password").value);
+        try {
+          let ret;
+          try {
+            ret = await fetch("/api/auth/login", { method: "POST", body: form });
+          } catch (e) {
+            throw new Error(formatFetchError(e));
+          }
+          if (!ret.ok) throw new Error("登录失败");
+          const data = await ret.json();
+          token = data.access_token;
+          document.getElementById("profile").textContent = `${data.profile.username} (${data.profile.role})`;
+          document.getElementById("main").style.display = "block";
+          document.getElementById("msg").textContent = "登录成功";
+          loadStrategies();
+          loadAdminStrategies();
+        } catch (e) {
+          document.getElementById("msg").textContent = formatFetchError(e);
+        }
+      }
+
+      async function loadStrategies() {
+        const data = await api("/api/strategies");
+        const box = document.getElementById("strategyList");
+        box.innerHTML = "";
+        data.items.forEach((s) => {
+          const btn = document.createElement("button");
+          btn.textContent = `${s.strategy_name} (${s.benchmark_code})`;
+          btn.onclick = async () => {
+            currentStrategyId = s.strategy_id;
+            page = 1;
+            reloadHoldings();
+            loadNav();
+          };
+          box.appendChild(btn);
+        });
+        if (data.items.length > 0) {
+          currentStrategyId = data.items[0].strategy_id;
+          reloadHoldings();
+          loadNav();
+        }
+      }
+
+      async function reloadHoldings() {
+        if (!currentStrategyId) return;
+        const pageSize = Number(document.getElementById("pageSize").value);
+        const q = new URLSearchParams({
+          page: String(page),
+          page_size: String(pageSize)
+        });
+        const data = await api(`/api/strategies/${currentStrategyId}/holdings?${q.toString()}`);
+        const pages = data.total === 0 ? 0 : Math.ceil(data.total / pageSize);
+        document.getElementById("pageInfo").textContent = `第 ${data.page} 页 / 共 ${pages} 页（${data.total} 条）`;
+        const m = data.meta;
+        document.getElementById("holdingsMeta").textContent = m
+          ? `Wind：远程 SQL Server；行情日 ${m.latest_trade_date || "—"}；当日共 ${m.rebalance_periods} 个调仓期截面。更新：先「导入」再「立即更新」。`
+          : "";
+        const t = document.getElementById("holdingsTable");
+        t.innerHTML = `
+          <thead><tr>
+            <th>行情日</th><th>调仓日</th><th>代码</th><th>名称</th><th>本期权重</th><th>最新权重</th><th>最新价格</th>
+            <th>本期收益</th><th>1日</th><th>5交易日</th><th>20交易日</th><th>60交易日</th><th>今年以来</th>
+            <th>市值(亿)</th><th>行业</th><th>PE</th><th>PB</th>
+          </tr></thead>
+          <tbody>
+            ${data.items.map(i => `<tr>
+              <td>${i.trade_date || "-"}</td>
+              <td>${i.rebalance_date || "-"}</td>
+              <td>${i.stock_code || "-"}</td>
+              <td>${i.stock_name || "-"}</td>
+              <td>${pct(i.period_weight)}</td>
+              <td>${pct(i.latest_weight)}</td>
+              <td>${priceFmt(i.latest_price)}</td>
+              <td>${pctSigned(i.period_return)}</td>
+              <td>${pctSigned(i.last_1d_pct)}</td>
+              <td>${pctSigned(i.ret_5d)}</td>
+              <td>${pctSigned(i.ret_20d)}</td>
+              <td>${pctSigned(i.ret_60d)}</td>
+              <td>${pctSigned(i.ret_ytd)}</td>
+              <td>${mvYi(i.market_cap)}</td>
+              <td>${i.industry_name || "-"}</td>
+              <td>${num2(i.pe)}</td>
+              <td>${num2(i.pb)}</td>
+            </tr>`).join("")}
+          </tbody>
+        `;
+      }
+
+      async function loadAdminStrategies() {
+        try {
+          const data = await api("/api/admin/strategies");
+          const items = data.items || [];
+          document.getElementById("adminCfgInfo").textContent = `共 ${items.length} 个策略配置`;
+          const t = document.getElementById("adminCfgTable");
+          t.innerHTML = `
+            <thead><tr>
+              <th>策略ID</th><th>显示名</th><th>文件目录</th><th>文件名</th><th>权重模式</th>
+              <th>基准代码</th><th>基准名称</th><th>可见</th><th>状态</th><th>更新时间</th>
+            </tr></thead>
+            <tbody>
+              ${items.map(i => `<tr>
+                <td>${i.strategy_id || "-"}</td>
+                <td>${i.strategy_name || "-"}</td>
+                <td>${i.file_dir || ""}</td>
+                <td>${i.file_name || "-"}</td>
+                <td>holding（固定）</td>
+                <td>${i.benchmark_code || "-"}</td>
+                <td>${i.benchmark_name || "-"}</td>
+                <td>${i.is_visible ? "是" : "否"}</td>
+                <td>${i.status || "-"}</td>
+                <td>${i.updated_at || "-"}</td>
+              </tr>`).join("")}
+            </tbody>
+          `;
+        } catch (e) {
+          document.getElementById("adminCfgInfo").textContent = `加载失败：${formatFetchError(e)}`;
+        }
+      }
+
+      async function loadNav() {
+        if (!currentStrategyId) return;
+        const startDate = document.getElementById("navStartDate").value;
+        const endDate = document.getElementById("navEndDate").value;
+        const q = new URLSearchParams({ limit: "5000" });
+        if (startDate) q.set("start_date", startDate);
+        if (endDate) q.set("end_date", endDate);
+        try {
+          const data = await api(`/api/strategies/${currentStrategyId}/nav?${q.toString()}`);
+          const items = data.items || [];
+          const newest = items.length ? items[0].trade_date : "-";
+          const oldest = items.length ? items[items.length - 1].trade_date : "-";
+          document.getElementById("navInfo").textContent = `${currentStrategyId}：${items.length} 条（${oldest} ~ ${newest}，日期倒序）`;
+          const t = document.getElementById("navTable");
+          t.innerHTML = `
+            <thead><tr>
+              <th>日期</th><th>单位净值</th><th>当日收益</th><th>调仓日</th>
+            </tr></thead>
+            <tbody>
+              ${items.map(i => `<tr>
+                <td>${i.trade_date || "-"}</td>
+                <td>${i.nav_unit == null ? "-" : Number(i.nav_unit).toFixed(2)}</td>
+                <td>${pctSigned(i.daily_ret)}</td>
+                <td>${i.rebalance_date || "-"}</td>
+              </tr>`).join("")}
+            </tbody>
+          `;
+        } catch (e) {
+          document.getElementById("navInfo").textContent = `加载失败：${formatFetchError(e)}`;
+        }
+      }
+
+      function pct(v) { return v == null ? "-" : (v * 100).toFixed(2) + "%"; }
+      function retClass(v) {
+        if (v == null || v === "") return "";
+        const n = Number(v);
+        if (n > 0) return "ret-up";
+        if (n < 0) return "ret-down";
+        return "";
+      }
+      function pctSigned(v) {
+        if (v == null) return "-";
+        const t = pct(v);
+        const c = retClass(v);
+        return c ? `<span class="${c}">${t}</span>` : t;
+      }
+      function num(v) { return v == null ? "-" : Number(v).toLocaleString(); }
+      function priceFmt(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      function num2(v) { return v == null ? "-" : Number(v).toFixed(2); }
+      /** Wind S_VAL_MV 一般为万元 → 亿元 = 原值/10000，保留 1 位小数 */
+      function mvYi(wan) {
+        if (wan == null) return "-";
+        const yi = Number(wan) / 10000;
+        return yi.toFixed(1);
+      }
+      function prevPage() { if (page > 1) { page -= 1; reloadHoldings(); } }
+      function nextPage() { page += 1; reloadHoldings(); }
+
+      async function importData() {
+        try {
+          const data = await api("/api/admin/import", { method: "POST" });
+          let msg = `导入结束：成功 ${data.imported} 个策略文件，失败 ${data.failed} 个。`;
+          if (data.errors && data.errors.length) msg += "\n\n" + data.errors.join("\n");
+          alert(msg);
+          reloadHoldings();
+        } catch (e) { alert(formatFetchError(e)); }
+      }
+      function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+      async function manualUpdate() {
+        const el = document.getElementById("updateStatus");
+        try {
+          el.textContent = "正在排队启动更新…";
+          const ret = await api("/api/admin/update", { method: "POST" });
+          if (!ret.queued) {
+            el.textContent = "已返回（未排队），请查看接口响应";
+            reloadHoldings();
+            return;
+          }
+          const targetId = ret.job_id;
+          if (targetId == null) {
+            el.textContent = "接口未返回 job_id，请升级后端或查看 /api/admin/update-jobs";
+            return;
+          }
+          const deadline = Date.now() + 45 * 60 * 1000;
+          while (Date.now() < deadline) {
+            const jobs = await api("/api/admin/update-jobs");
+            const j = (jobs.items || []).find((x) => x.id === targetId);
+            if (!j) {
+              el.textContent = `未在列表中找到任务 #${targetId}，请刷新或查库 strategy_update_jobs`;
+              await sleep(2000);
+              continue;
+            }
+            el.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
+            if (j.status !== "RUNNING") {
+              reloadHoldings();
+              if (j.status === "FAILED") alert(`更新失败：${j.message || "未知错误"}`);
+              return;
+            }
+            await sleep(2000);
+          }
+          el.textContent += "（已轮询 45 分钟，若仍 RUNNING 请查数据库/进程）";
+        } catch (e) {
+          el.textContent = "";
+          alert(formatFetchError(e));
+        }
+      }
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>
