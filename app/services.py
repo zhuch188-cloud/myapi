@@ -43,9 +43,10 @@ def _safe_return(a: float | None, b: float | None) -> float | None:
 def _compact_date(v: object) -> str:
     if v is None:
         return ""
+    d = _row_sql_date(v)
+    if d is not None:
+        return d.strftime("%Y%m%d")
     if isinstance(v, datetime):
-        return v.strftime("%Y%m%d")
-    if isinstance(v, date):
         return v.strftime("%Y%m%d")
     s = str(v).strip().replace("-", "")
     return s[:8] if len(s) >= 8 else s.zfill(8)
@@ -368,17 +369,17 @@ def _run_update_try_build_work_item(
     ).mappings().all()
     if not rebalance_rows:
         return None
-    latest_rb = rebalance_rows[0]["rebalance_date"]
-    latest_rb_compact = (
-        latest_rb.strftime("%Y%m%d")
-        if hasattr(latest_rb, "strftime")
-        else str(latest_rb).replace("-", "")[:8]
-    )
+    latest_rb = _row_sql_date(rebalance_rows[0]["rebalance_date"])
+    if latest_rb is None:
+        return None
+    latest_rb_compact = _compact_date(latest_rb)
     rb_positions: list = []
     code_keys: set[str] = set()
     min_rb_date: date | None = None
     for rb in rebalance_rows:
-        rebalance = rb["rebalance_date"]
+        rebalance = _row_sql_date(rb["rebalance_date"])
+        if rebalance is None:
+            continue
         if min_rb_date is None or rebalance < min_rb_date:
             min_rb_date = rebalance
         positions = db.execute(
@@ -881,7 +882,9 @@ def run_update(
         latest_trade = mtd["d"] if mtd else None
         if not latest_trade:
             raise RuntimeError("No trade date in winddb")
-        trade_date = datetime.strptime(str(latest_trade), "%Y%m%d").date()
+        trade_date = _row_sql_date(latest_trade)
+        if trade_date is None:
+            trade_date = datetime.strptime(_compact_date(latest_trade), "%Y%m%d").date()
 
         selected_set = {str(x).strip() for x in (selected_strategy_ids or []) if str(x).strip()}
         if selected_set:
@@ -1060,11 +1063,7 @@ def run_update(
                     ytd_close = wind_bulk.last_close_before_calendar_date(
                         series, f"{trade_date.year}0101"
                     )
-                    rb_compact_this = (
-                        rebalance.strftime("%Y%m%d")
-                        if hasattr(rebalance, "strftime")
-                        else str(rebalance).replace("-", "")[:8]
-                    )
+                    rb_compact_this = _compact_date(rebalance)
                     period_start_close = wind_bulk.first_close_on_or_after(series, rb_compact_this)
 
                     px = latest_adj if (latest_adj is not None and latest_adj > 0) else latest_price
@@ -1332,7 +1331,9 @@ def _rebuild_nav_for_strategy(
         ).mappings().all()
         if not rb_rows:
             return False, wind
-        min_rb = rb_rows[0]["rebalance_date"]
+        min_rb = _row_sql_date(rb_rows[0]["rebalance_date"])
+        if min_rb is None:
+            return False, wind
         pos_rows = db.execute(
             text(
                 """
@@ -1343,10 +1344,12 @@ def _rebuild_nav_for_strategy(
             ),
             {"sid": sid},
         ).mappings().all()
-        rb_map = {}
+        rb_map: dict[date, list[tuple[str, float]]] = {}
         code_set: set[str] = set()
         for r in pos_rows:
-            rd = r["rebalance_date"]
+            rd = _row_sql_date(r["rebalance_date"])
+            if rd is None:
+                continue
             sc = str(r["stock_code"]).strip().upper()
             w = float(r.get("holding_weight") or 0.0)
             rb_map.setdefault(rd, []).append((sc, w))
@@ -1378,7 +1381,9 @@ def _rebuild_nav_for_strategy(
         latest_trade = mtd_nav["d"] if mtd_nav else None
         if not latest_trade:
             raise RuntimeError("No trade date in winddb")
-        latest_trade_c = str(latest_trade)
+        latest_trade_c = _compact_date(latest_trade)
+        if len(latest_trade_c) < 8:
+            latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
     codes_for_eod = sorted(code_set)
     if wind_bundle is not None:
@@ -1561,7 +1566,9 @@ def rebuild_nav_series(
         if do_commit:
             db.commit()
         return {"rebuilt": 0, "failed": len(sids), "errors": ["No trade date in winddb"]}, wind
-    latest_trade_c = str(latest_trade)
+    latest_trade_c = _compact_date(latest_trade)
+    if len(latest_trade_c) < 8:
+        latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
     plans = _batch_nav_mysql_plans(db, sids, mode_l)
     union_codes: set[str] = set()

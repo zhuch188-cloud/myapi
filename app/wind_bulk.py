@@ -101,12 +101,16 @@ def _year_compact_segments(st_compact: str, td_compact: str) -> list[tuple[str, 
     return out if out else [(st, td)]
 
 
-def bulk_eod_start_compact(trade_date: date, min_rebalance_date: date) -> str:
+def bulk_eod_start_compact(trade_date: date | str | Any, min_rebalance_date: date | str | Any) -> str:
     """EOD 拉取起点：须包含「上年」行情，以便 YTD 用上年末最后交易日收盘；并覆盖最早调仓与约 260+ 交易日回溯。"""
-    y_prev = f"{trade_date.year - 1}0101"
-    rb = min_rebalance_date.strftime("%Y%m%d")
-    lb = (trade_date - timedelta(days=420)).strftime("%Y%m%d")
-    return min(y_prev, rb, lb)
+    td_c = _dt_compact(trade_date)
+    rb_c = _dt_compact(min_rebalance_date)
+    if len(td_c) < 8 or len(rb_c) < 8:
+        raise ValueError("invalid trade_date or min_rebalance_date for EOD range")
+    td_d = datetime.strptime(td_c[:8], "%Y%m%d").date()
+    y_prev = f"{td_d.year - 1}0101"
+    lb = (td_d - timedelta(days=420)).strftime("%Y%m%d")
+    return min(y_prev, rb_c, lb)
 
 
 def load_eod_by_code(
