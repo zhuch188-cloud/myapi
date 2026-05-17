@@ -116,7 +116,7 @@
       </div>
     </div>
     <script>
-{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/js_fetch_err_public.html' %}
 {% include 'partials/client_jwt_claims.html' %}
       /** 首次自动开户返回的密码仅在本次 bootstrap 响应里出现；刷新后 existing=true 不再下发，暂存到此键便于同浏览器再次登录（登录成功或修改密码后清除）。 */
       var CLIENT_PENDING_AUTO_LOGIN_KEY = "client_pending_auto_login";

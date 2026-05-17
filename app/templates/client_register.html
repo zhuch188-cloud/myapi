@@ -39,7 +39,7 @@
       </div>
     </div>
     <script>
-{% include 'partials/js_fetch_err.html' %}
+{% include 'partials/js_fetch_err_public.html' %}
       /** 避免携带登录页自动开户生成的 device_token，防止设备记录被挂到新注册用户上 */
       try {
         localStorage.removeItem("device_token");

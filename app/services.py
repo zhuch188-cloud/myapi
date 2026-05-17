@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app import wind_bulk, wind_sql
 from app.sql_dialect import sql_minutes_ago, sql_now
+from app.timeutil import now_naive
 
 _log = logging.getLogger(__name__)
 _job_running = False
@@ -194,7 +195,7 @@ def _format_update_job_failure_message(exc: BaseException) -> str:
 
 def _mark_update_job_failed(db: Session, job_id: int, message: str, do_commit: bool) -> None:
     """将任务标为 FAILED；主 Session 失效时用新连接补写，避免界面长期卡在 RUNNING。"""
-    params = {"ft": datetime.now(), "m": message[:65000], "id": job_id}
+    params = {"ft": now_naive(), "m": message[:65000], "id": job_id}
     upd = text(
         "UPDATE strategy_update_jobs SET status='FAILED', finished_at=:ft, message=:m WHERE id=:id"
     )
@@ -859,7 +860,7 @@ def run_update(
         )
     _job_running = True
 
-    started = datetime.now()
+    started = now_naive()
     if existing_job_id is not None:
         job_id = int(existing_job_id)
     else:
@@ -1178,7 +1179,7 @@ def run_update(
             text(
                 "UPDATE strategy_update_jobs SET status='SUCCESS', finished_at=:ft, message=:m WHERE id=:id"
             ),
-            {"ft": datetime.now(), "m": "全部完成", "id": job_id},
+            {"ft": now_naive(), "m": "全部完成", "id": job_id},
         )
         if do_commit:
             db.commit()

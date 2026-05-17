@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services import normalize_code
-from app.sql_dialect import list_table_columns, quote_ident
+from app.sql_dialect import list_table_columns, quote_ident, sql_now
 
 CODE_COMPANY_PROFILE_EXCEL = "company_profile_excel"
 _IMPORT_ROW_CHUNK = 200
@@ -333,10 +333,10 @@ def _touch_import_batch_progress(
 ) -> None:
     db.execute(
         text(
-            """
+            f"""
             UPDATE data_import_batches
             SET rows_ok=:ok, rows_fail=:fail, resume_from_row=:rr,
-                rows_total=:rt, message=:m, progress_at=datetime('now')
+                rows_total=:rt, message=:m, progress_at={sql_now()}
             WHERE id=:id
             """
         ),
@@ -708,10 +708,10 @@ def import_company_profile_excel(
             msg += "；" + "；".join(fail_samples)
         db.execute(
             text(
-                """
+                f"""
                 UPDATE data_import_batches
                 SET status='SUCCESS', rows_ok=:ok, rows_fail=:fail, rows_total=:rt,
-                    resume_from_row=:rt, message=:m, progress_at=datetime('now')
+                    resume_from_row=:rt, message=:m, progress_at={sql_now()}
                 WHERE id=:id
                 """
             ),
@@ -741,11 +741,11 @@ def import_company_profile_excel(
         try:
             db.execute(
                 text(
-                    """
+                    f"""
                     UPDATE data_import_batches
                     SET status='FAILED', rows_ok=:ok, rows_fail=:fail,
                         resume_from_row=:rr, rows_total=:rt, message=:m,
-                        progress_at=datetime('now')
+                        progress_at={sql_now()}
                     WHERE id=:id
                     """
                 ),

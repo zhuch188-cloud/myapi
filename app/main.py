@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import settings
+from app.timeutil import now, now_naive, today as beijing_today
 from app.bg_threads import spawn_daemon
 from app.boot import boot_error, is_ready, start_background_boot
 from app.db import DatabaseNotReadyError
@@ -462,7 +463,7 @@ def _find_user_by_device_token(db: Session, device_token: str) -> dict | None:
     token = str(device_token or "").strip()
     if not token:
         return None
-    now = datetime.now()
+    now = now_naive()
     h = _device_token_hash(token)
     row = db.execute(
         text(
@@ -500,7 +501,7 @@ def _upsert_device_for_user(
     token = str(device_token or "").strip()
     if not token:
         token = secrets.token_urlsafe(48)
-    now = datetime.now()
+    now = now_naive()
     exp = now + timedelta(days=_DEVICE_TOKEN_DAYS)
     h = _device_token_hash(token)
     ip = _client_ip(request)
@@ -1506,11 +1507,11 @@ def login(
         raise HTTPException(status_code=403, detail="account disabled")
     if norm_user_status(user.get("status")) == "locked":
         lock_to = user.get("locked_until")
-        # 与 datetime.now() 直接比较：若 locked_until 为 timezone-aware 会抛 TypeError（外网/部分驱动常见）→ 500
+        # 与北京时间 now() 比较 epoch：若 locked_until 为 timezone-aware 亦可用 timestamp 比较
         lock_active = False
         if lock_to and isinstance(lock_to, datetime):
             try:
-                lock_active = lock_to.timestamp() > datetime.now().timestamp()
+                lock_active = lock_to.timestamp() > now().timestamp()
             except (TypeError, ValueError, OSError):
                 lock_active = False
         if lock_active:
@@ -1538,7 +1539,7 @@ def login(
         lock_until = None
         new_status = user.get("status") or "active"
         if fail_cnt >= _LOGIN_FAIL_LOCK_THRESHOLD:
-            lock_until = datetime.now() + timedelta(minutes=_LOGIN_LOCK_MINUTES)
+            lock_until = now_naive() + timedelta(minutes=_LOGIN_LOCK_MINUTES)
             new_status = "locked"
             fail_cnt = 0
         _insert_login_event(
@@ -1593,7 +1594,7 @@ def login(
             WHERE id=:id
             """
         ),
-        {"now_dt": datetime.now(), "ip": _client_ip(request), "id": user["id"]},
+        {"now_dt": now_naive(), "ip": _client_ip(request), "id": user["id"]},
     )
     _insert_login_event(
         db,
@@ -1724,7 +1725,7 @@ def client_session_from_device(
                 WHERE id=:id
                 """
             ),
-            {"now_dt": datetime.now(), "ip": _client_ip(request), "id": uid},
+            {"now_dt": now_naive(), "ip": _client_ip(request), "id": uid},
         )
         _insert_login_event(
             db,
@@ -1810,7 +1811,7 @@ def auth_register(request: Request, payload: RegisterPayload, db: Session = Depe
                       password_is_system_generated, password_changed_at,
                       nickname, contact_phone, contact_email
                     ) VALUES (
-                      :u, :p, 'viewer', 'org-client', 'active', 0, datetime('now'),
+                      :u, :p, 'viewer', 'org-client', 'active', 0, datetime('now', '+8 hours'),
                       :nk, :ph, :em
                     )
                     """
@@ -1864,7 +1865,7 @@ def auth_register(request: Request, payload: RegisterPayload, db: Session = Depe
             WHERE id=:id
             """
         ),
-        {"now_dt": datetime.now(), "ip": _client_ip(request), "id": user_rec["id"]},
+        {"now_dt": now_naive(), "ip": _client_ip(request), "id": user_rec["id"]},
     )
     db.commit()
     prow = db.execute(
@@ -1930,7 +1931,7 @@ def auth_forgot_password(request: Request, payload: ForgotPasswordPayload, db: S
         return generic
     raw_token = secrets.token_urlsafe(32)
     th = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-    exp = datetime.now() + timedelta(hours=_PASSWORD_RESET_TOKEN_HOURS)
+    exp = now_naive() + timedelta(hours=_PASSWORD_RESET_TOKEN_HOURS)
     db.execute(
         text(
             """
@@ -1963,7 +1964,7 @@ def auth_reset_password(payload: ResetPasswordPayload, db: Session = Depends(get
         text(
             """
             SELECT id, user_id FROM password_reset_tokens
-            WHERE token_hash=:h AND used_at IS NULL AND expires_at > datetime('now')
+            WHERE token_hash=:h AND used_at IS NULL AND expires_at > datetime('now', '+8 hours')
             LIMIT 1
             """
         ),
@@ -1972,7 +1973,7 @@ def auth_reset_password(payload: ResetPasswordPayload, db: Session = Depends(get
     if not row:
         raise HTTPException(status_code=400, detail="链接无效或已过期")
     uid = int(row["user_id"])
-    now_dt = datetime.now()
+    now_dt = now_naive()
     db.execute(
         text(
             """
@@ -1980,7 +1981,7 @@ def auth_reset_password(payload: ResetPasswordPayload, db: Session = Depends(get
             SET password=:p,
                 password_is_system_generated=0,
                 password_changed_at=:now_dt,
-                updated_at=datetime('now')
+                updated_at=datetime('now', '+8 hours')
             WHERE id=:id
             """
         ),
@@ -2026,7 +2027,7 @@ def change_password(
     system_gen = bool(int(row.get("password_is_system_generated") or 0))
     if not system_gen and str(row["password"] or "") != old_pwd:
         raise HTTPException(status_code=400, detail="old password incorrect")
-    now_dt = datetime.now()
+    now_dt = now_naive()
     db.execute(
         text(
             """
@@ -2117,8 +2118,8 @@ def auth_profile_put(
                     profile_bio=:bio,
                     password=:pwd,
                     password_is_system_generated=0,
-                    password_changed_at=datetime('now'),
-                    updated_at=datetime('now')
+                    password_changed_at=datetime('now', '+8 hours'),
+                    updated_at=datetime('now', '+8 hours')
                 WHERE id=:id
                 """
             ),
@@ -2140,7 +2141,7 @@ def auth_profile_put(
                     contact_phone=:ph,
                     contact_email=:em,
                     profile_bio=:bio,
-                    updated_at=datetime('now')
+                    updated_at=datetime('now', '+8 hours')
                 WHERE id=:id
                 """
             ),
@@ -2752,12 +2753,7 @@ def strategy_stock_ai_brief(
 
     name = (str(row.get("stock_name") or "").strip()) or code
 
-    try:
-        from zoneinfo import ZoneInfo
-
-        end_d = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    except Exception:
-        end_d = date.today()
+    end_d = beijing_today()
     ai_brief_lookback_days = 30
     start_d = end_d - timedelta(days=ai_brief_lookback_days)
     w_start = start_d.strftime("%Y%m%d")
@@ -3298,7 +3294,7 @@ def admin_normalize_strategy_upload_paths(
         if new_dir != old_dir:
             db.execute(
                 text(
-                    "UPDATE strategy_configs SET file_dir=:fd, updated_at=datetime('now') WHERE strategy_id=:sid"
+                    "UPDATE strategy_configs SET file_dir=:fd, updated_at=datetime('now', '+8 hours') WHERE strategy_id=:sid"
                 ),
                 {"fd": new_dir, "sid": sid},
             )
@@ -3619,7 +3615,7 @@ def admin_sync(
         text(
             """
             UPDATE admin_sync_jobs
-            SET status='FAILED', finished_at=datetime('now'),
+            SET status='FAILED', finished_at=datetime('now', '+8 hours'),
                 message=COALESCE(message, '') || '（僵尸RUNNING：后台未正常结束，已自动标记失败）'
             WHERE status='RUNNING'
               AND started_at IS NOT NULL
@@ -3633,7 +3629,7 @@ def admin_sync(
         text(
             """
             UPDATE admin_sync_jobs
-            SET status='FAILED', finished_at=datetime('now'), message='排队超时（未在 2 分钟内启动），请重试'
+            SET status='FAILED', finished_at=datetime('now', '+8 hours'), message='排队超时（未在 2 分钟内启动），请重试'
             WHERE status='QUEUED' AND created_at < datetime('now', '-2 minutes')
             """
         )
@@ -3884,7 +3880,7 @@ def admin_update(
                 status_code=409,
                 detail=f"已有进行中的更新任务 id={row[0]}，请稍候或刷新页面查看进度",
             )
-        started = datetime.now()
+        started = now_naive()
         job_id = db.execute(
             text(
                 """
@@ -4052,7 +4048,7 @@ async def admin_data_import_upload(
         text(
             """
             UPDATE data_import_definitions
-            SET default_file_path=:p, updated_at=datetime('now')
+            SET default_file_path=:p, updated_at=datetime('now', '+8 hours')
             WHERE code=:c
             """
         ),
@@ -4093,7 +4089,7 @@ async def admin_strategy_upload_data_file(
         text(
             """
             UPDATE strategy_configs
-            SET file_dir=:fd, file_name=:fn, updated_at=datetime('now')
+            SET file_dir=:fd, file_name=:fn, updated_at=datetime('now', '+8 hours')
             WHERE strategy_id=:sid
             """
         ),
@@ -4146,7 +4142,7 @@ async def admin_batch_strategy_upload_data_files(
             text(
                 """
                 UPDATE strategy_configs
-                SET file_dir=:fd, file_name=:fn, updated_at=datetime('now')
+                SET file_dir=:fd, file_name=:fn, updated_at=datetime('now', '+8 hours')
                 WHERE strategy_id=:sid
                 """
             ),
@@ -4243,7 +4239,7 @@ def _mark_data_import_batch_running(db: Session, batch_id: int, message: str) ->
         text(
             """
             UPDATE data_import_batches
-            SET status='RUNNING', message=:m, progress_at=datetime('now')
+            SET status='RUNNING', message=:m, progress_at=datetime('now', '+8 hours')
             WHERE id=:id
             """
         ),
@@ -4636,7 +4632,7 @@ def admin_access_overview(
             """
             SELECT COUNT(*) AS c
             FROM user_devices
-            WHERE revoked_at IS NULL AND device_token_expires_at > datetime('now')
+            WHERE revoked_at IS NULL AND device_token_expires_at > datetime('now', '+8 hours')
             """
         )
     ).mappings().first()
@@ -4797,7 +4793,7 @@ def admin_access_overview(
             SELECT COUNT(*) AS c
             FROM user_devices d
             INNER JOIN users u ON u.id = d.user_id AND u.role = 'viewer'
-            WHERE d.revoked_at IS NULL AND d.device_token_expires_at > datetime('now')
+            WHERE d.revoked_at IS NULL AND d.device_token_expires_at > datetime('now', '+8 hours')
             """
         )
     ).mappings().first()
@@ -4810,7 +4806,7 @@ def admin_access_overview(
             FROM user_devices d
             INNER JOIN users u ON u.id = d.user_id AND u.role = 'viewer'
             WHERE d.revoked_at IS NULL
-              AND d.device_token_expires_at > datetime('now')
+              AND d.device_token_expires_at > datetime('now', '+8 hours')
               AND d.last_seen_at IS NOT NULL
             """
         )
@@ -5000,7 +4996,7 @@ def admin_user_detail(
               device_token_expires_at,
               CASE
                 WHEN revoked_at IS NOT NULL THEN 'revoked'
-                WHEN device_token_expires_at <= datetime('now') THEN 'expired'
+                WHEN device_token_expires_at <= datetime('now', '+8 hours') THEN 'expired'
                 ELSE 'active'
               END AS session_state
             FROM user_devices
@@ -5125,7 +5121,7 @@ def admin_user_status(
     if target_status not in ("active", "disabled", "locked"):
         raise HTTPException(status_code=400, detail="invalid status")
     db.execute(
-        text("UPDATE users SET status=:st, updated_at=datetime('now') WHERE id=:id"),
+        text("UPDATE users SET status=:st, updated_at=datetime('now', '+8 hours') WHERE id=:id"),
         {"st": target_status, "id": user_id},
     )
     _audit_log(
@@ -5155,7 +5151,7 @@ def admin_reset_password(
             SET password=:p,
                 password_is_system_generated=1,
                 password_changed_at=NULL,
-                updated_at=datetime('now')
+                updated_at=datetime('now', '+8 hours')
             WHERE id=:id
             """
         ),
@@ -5180,7 +5176,7 @@ def admin_revoke_devices(
     db: Session = Depends(get_session),
 ):
     db.execute(
-        text("UPDATE user_devices SET revoked_at=datetime('now') WHERE user_id=:id AND revoked_at IS NULL"),
+        text("UPDATE user_devices SET revoked_at=datetime('now', '+8 hours') WHERE user_id=:id AND revoked_at IS NULL"),
         {"id": user_id},
     )
     _audit_log(

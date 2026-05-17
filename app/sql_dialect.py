@@ -8,33 +8,36 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.timeutil import SQLITE_NOW_BEIJING as _NOW_BJ
+
 
 def sql_now() -> str:
-    return "datetime('now')"
+    """SQLite/Turso 当前北京时间（库内 datetime('now') 为 UTC，+8 对齐上海）。"""
+    return _NOW_BJ
 
 
 def sql_curdate() -> str:
-    return "date('now')"
+    return f"date({_NOW_BJ})"
 
 
 def sql_hours_ago(param: str = ":hrs") -> str:
-    return f"datetime('now', printf('-%d hours', {param}))"
+    return f"datetime({_NOW_BJ}, printf('-%d hours', {param}))"
 
 
 def sql_days_ago(days: int) -> str:
-    return f"datetime('now', '-{int(days)} days')"
+    return f"datetime({_NOW_BJ}, '-{int(days)} days')"
 
 
 def sql_curdate_days_ago(days: int) -> str:
-    return f"date('now', '-{int(days)} days')"
+    return f"date(datetime({_NOW_BJ}, '-{int(days)} days'))"
 
 
 def sql_minutes_ago(param: str = ":mins") -> str:
-    return f"datetime('now', printf('-%d minutes', {param}))"
+    return f"datetime({_NOW_BJ}, printf('-%d minutes', {param}))"
 
 
 def sql_timestampdiff_hours(col: str) -> str:
-    return f"(julianday(datetime('now')) - julianday({col})) * 24"
+    return f"(julianday({_NOW_BJ}) - julianday({col})) * 24"
 
 
 def quote_ident(name: str) -> str:

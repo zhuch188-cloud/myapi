@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     supplement_import_remote_batch_size: int = 50
     # RUNNING 超过该分钟数且 progress_at 未更新，视为僵死，可续传
     supplement_import_stale_running_minutes: int = 12
-    # 定时数据更新：分 时 日 月 星期（APScheduler：星期一=0，周一至周五为 0-4）
+    # 定时数据更新：分 时 日 月 星期（APScheduler：星期一=0，周一至周五为 0-4；触发时区见 app.timeutil.BEIJING_TZ）
     daily_job_cron: str = "0 17 * * 0-4"
     # 火山方舟（豆包等）：个股 AI 摘要等使用。ARK_MODEL 为控制台「推理接入点」ID（ep-xxx）或模型名
     ark_api_key: str = ""

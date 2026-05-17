@@ -18,17 +18,4 @@ function formatFetchError(err) {
   }
   return raw;
 }
-(function () {
-  if (window.__fpSlidingTokenFetch) return;
-  window.__fpSlidingTokenFetch = true;
-  var orig = window.fetch;
-  window.fetch = function () {
-    return orig.apply(this, arguments).then(function (res) {
-      try {
-        var v = res.headers.get("X-Access-Token-Renewal");
-        if (v && String(v).trim()) localStorage.setItem("token", String(v).trim());
-      } catch (e) {}
-      return res;
-    });
-  };
-})();
+{% include 'partials/js_fetch_err_sliding_token.html' %}

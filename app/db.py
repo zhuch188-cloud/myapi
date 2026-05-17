@@ -133,7 +133,7 @@ def _apply_runtime_schema_migrations(conn) -> None:
                 errors_json TEXT NULL,
                 message TEXT NULL,
                 triggered_by TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
                 started_at TEXT NULL,
                 finished_at TEXT NULL
             )
@@ -272,8 +272,8 @@ _SCHEMA_STATEMENTS = [
         contact_phone TEXT NULL,
         contact_email TEXT NULL,
         profile_bio TEXT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS uk_users_nickname ON users (nickname)",
@@ -292,7 +292,7 @@ _SCHEMA_STATEMENTS = [
         ip_first TEXT NULL,
         ip_last TEXT NULL,
         last_seen_at TEXT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         revoked_at TEXT NULL
     )
     """,
@@ -308,7 +308,7 @@ _SCHEMA_STATEMENTS = [
         detail_json TEXT NULL,
         ip TEXT NULL,
         ua TEXT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_logs (target_user_id)",
@@ -321,7 +321,7 @@ _SCHEMA_STATEMENTS = [
         token_hash TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         used_at TEXT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_pwd_reset_hash ON password_reset_tokens (token_hash)",
@@ -337,7 +337,7 @@ _SCHEMA_STATEMENTS = [
         reason TEXT NULL,
         ip TEXT NULL,
         ua TEXT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_login_user_created ON login_events (user_id, created_at)",
@@ -347,7 +347,7 @@ _SCHEMA_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS site_settings (
         setting_key TEXT PRIMARY KEY,
         setting_value TEXT NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     """
@@ -370,7 +370,7 @@ _SCHEMA_STATEMENTS = [
         status_code INTEGER NOT NULL,
         ip TEXT NULL,
         user_agent TEXT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_ual_user_id ON user_access_logs (user_id)",
@@ -393,7 +393,7 @@ _SCHEMA_STATEMENTS = [
         strategy_category TEXT NOT NULL DEFAULT '',
         rebalance_frequency TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled','disabled')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     """
@@ -438,7 +438,7 @@ _SCHEMA_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS user_strategy_follows (
         username TEXT NOT NULL,
         strategy_id TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         PRIMARY KEY (username, strategy_id)
     )
     """,
@@ -466,7 +466,7 @@ _SCHEMA_STATEMENTS = [
         triggered_by TEXT NOT NULL,
         result_json TEXT NULL,
         checkpoint_json TEXT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         started_at TEXT NULL,
         finished_at TEXT NULL
     )
@@ -484,7 +484,7 @@ _SCHEMA_STATEMENTS = [
         benchmark_nav REAL NULL,
         rebalance_date TEXT NULL,
         source_job_id INTEGER NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         UNIQUE (strategy_id, trade_date)
     )
     """,
@@ -499,8 +499,8 @@ _SCHEMA_STATEMENTS = [
         meta_json TEXT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
         sort_order INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     """
@@ -516,7 +516,7 @@ _SCHEMA_STATEMENTS = [
         checkpoint_json TEXT NULL,
         message TEXT NULL,
         actor_user_id INTEGER NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_data_import_batches_code ON data_import_batches (definition_code)",
@@ -527,7 +527,7 @@ _SCHEMA_STATEMENTS = [
         definition_code TEXT NOT NULL,
         stock_code TEXT NOT NULL,
         last_batch_id INTEGER NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         UNIQUE (definition_code, stock_code)
     )
     """,

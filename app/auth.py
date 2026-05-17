@@ -1,5 +1,5 @@
 import hashlib
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from jose import jwt, JWTError
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
@@ -11,6 +11,7 @@ from starlette.responses import Response
 from app.config import settings
 from app.db import get_session
 from app.sql_dialect import sql_curdate, sql_now
+from app.timeutil import utc_now
 
 # 响应头：携带 JWT 的成功请求由中间件写入新令牌，前端 fetch 包装器写入 localStorage
 ACCESS_TOKEN_RENEWAL_HEADER = "X-Access-Token-Renewal"
@@ -69,7 +70,7 @@ def _record_viewer_activity(db: Session, user_id: int, request: Request) -> None
 
 
 def create_access_token(username: str, extra_claims: dict | None = None) -> str:
-    expires = datetime.now(timezone.utc) + timedelta(
+    expires = utc_now() + timedelta(
         minutes=settings.access_token_expire_minutes
     )
     payload = {"sub": username, "exp": expires}

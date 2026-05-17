@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import logging
 import smtplib
-from datetime import datetime
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
 from app.config import Settings
+from app.timeutil import now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ def send_contact_us_message(
     subject = f"[联系我们] {safe_title}"[:900]
     body = (
         f"{head}"
-        f"提交时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"提交时间：{now_naive().strftime('%Y-%m-%d %H:%M:%S')} (北京时间)\n\n"
         f"标题：\n{safe_title}\n\n"
         f"联系方式：\n{safe_contact if safe_contact else '（未填写）'}\n\n"
         f"内容：\n{safe_content}\n"
@@ -127,7 +127,7 @@ def smtp_send_test(settings: Settings, to_addr: str) -> tuple[bool, str]:
     if not from_addr:
         return False, "未配置 SMTP_FROM_ADDR 或 SMTP_USER（发件人）"
     subject = "SMTP 连通测试"
-    body = f"这是一封来自 Strategy Showcase 管理端的 SMTP 测试邮件。\n发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    body = f"这是一封来自 Strategy Showcase 管理端的 SMTP 测试邮件。\n发送时间：{now_naive().strftime('%Y-%m-%d %H:%M:%S')} (北京时间)\n"
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = formataddr(("Strategy Showcase SMTP Test", from_addr))

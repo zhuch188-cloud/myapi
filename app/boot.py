@@ -13,6 +13,7 @@ from sqlalchemy import text
 from app.config import settings
 from app.db import init_database
 from app.sql_dialect import sql_now
+from app.timeutil import BEIJING_TZ
 from app import wind_sql
 
 _log = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ def _start_scheduler(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], 
         day=cron_raw[2],
         month=cron_raw[3],
         day_of_week=cron_raw[4],
+        timezone=BEIJING_TZ,
     )
     scheduler.add_job(scheduled_fn, trigger=trigger, id="daily_update", replace_existing=True)
     scheduler.start()
