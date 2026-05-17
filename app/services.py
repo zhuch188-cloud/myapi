@@ -16,7 +16,14 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from app.config import settings
 from app import wind_bulk, wind_sql
-from app.sql_dialect import sql_minutes_ago, sql_now
+from app.sql_dialect import (
+    sql_date_compact_expr,
+    sql_max_date_expr,
+    sql_minutes_ago,
+    sql_now,
+    sql_order_date_asc,
+    sql_order_date_desc,
+)
 from app.timeutil import now_naive
 
 _log = logging.getLogger(__name__)
@@ -93,8 +100,8 @@ def latest_rebalance_date_by_strategy(db: Session) -> dict[str, str]:
     """各策略在 strategy_positions 中已导入的最大调仓日（最新一期）。"""
     rows = db.execute(
         text(
-            """
-            SELECT strategy_id, MAX(rebalance_date) AS latest_rb
+            f"""
+            SELECT strategy_id, {sql_max_date_expr("rebalance_date")} AS latest_rb
             FROM strategy_positions
             GROUP BY strategy_id
             """
@@ -349,8 +356,8 @@ def _run_update_try_build_work_item(
     bench_code = str(bench_code_raw or "").strip().upper() if bench_code_raw else ""
     last_row = db.execute(
         text(
-            """
-            SELECT MAX(trade_date) AS d
+            f"""
+            SELECT {sql_max_date_expr("trade_date")} AS d
             FROM strategy_holding_daily
             WHERE strategy_id=:sid
             """
@@ -360,13 +367,16 @@ def _run_update_try_build_work_item(
     last_td = _row_sql_date(last_row["d"]) if last_row else None
     if (not full_refresh) and last_td is not None and last_td >= trade_date:
         rb_pos_row = db.execute(
-            text("SELECT MAX(rebalance_date) AS m FROM strategy_positions WHERE strategy_id=:sid"),
+            text(
+                f"SELECT {sql_max_date_expr('rebalance_date')} AS m "
+                "FROM strategy_positions WHERE strategy_id=:sid"
+            ),
             {"sid": sid},
         ).mappings().first()
         rb_hold_row = db.execute(
             text(
-                """
-                SELECT MAX(rebalance_date) AS m
+                f"""
+                SELECT {sql_max_date_expr("rebalance_date")} AS m
                 FROM strategy_holding_daily
                 WHERE strategy_id=:sid AND trade_date=:td
                 """
@@ -387,11 +397,11 @@ def _run_update_try_build_work_item(
             return None
     rebalance_rows = db.execute(
         text(
-            """
+            f"""
             SELECT DISTINCT rebalance_date
             FROM strategy_positions
             WHERE strategy_id=:sid
-            ORDER BY rebalance_date DESC
+            ORDER BY {sql_order_date_desc("rebalance_date")}
             """
         ),
         {"sid": sid},
@@ -491,8 +501,8 @@ def _import_write_positions_one_strategy(
     else:
         max_row = db.execute(
             text(
-                """
-                SELECT MAX(rebalance_date) AS d
+                f"""
+                SELECT {sql_max_date_expr("rebalance_date")} AS d
                 FROM strategy_positions
                 WHERE strategy_id=:sid
                 """
@@ -1125,13 +1135,14 @@ def run_update(
                 if i_rb == 1 and rb_d is not None and total_weight > 0:
                     mx = db.execute(
                         text(
-                            """
-                            SELECT MAX(trade_date) AS m
+                            f"""
+                            SELECT {sql_max_date_expr("trade_date")} AS m
                             FROM strategy_nav_daily
-                            WHERE strategy_id=:sid AND trade_date < :td
+                            WHERE strategy_id=:sid
+                              AND {sql_date_compact_expr("trade_date")} < :td_cmp
                             """
                         ),
-                        {"sid": sid, "td": trade_date},
+                        {"sid": sid, "td_cmp": _compact_date(trade_date)},
                     ).mappings().first()
                     last_nt = _row_sql_date(mx["m"]) if mx and mx.get("m") is not None else None
                     if trade_date == rb_d:
@@ -1266,7 +1277,7 @@ def _batch_nav_mysql_plans(db: Session, strategy_ids: list[str], _mode_l: str) -
             SELECT strategy_id, rebalance_date, stock_code, holding_weight
             FROM strategy_positions
             WHERE strategy_id IN ({quoted})
-            ORDER BY strategy_id, rebalance_date, stock_code
+            ORDER BY strategy_id, {sql_order_date_asc("rebalance_date")}, stock_code
             """
         )
     ).mappings().all()
@@ -1349,11 +1360,11 @@ def _rebuild_nav_for_strategy(
     else:
         rb_rows = db.execute(
             text(
-                """
+                f"""
                 SELECT DISTINCT rebalance_date
                 FROM strategy_positions
                 WHERE strategy_id=:sid
-                ORDER BY rebalance_date ASC
+                ORDER BY {sql_order_date_asc("rebalance_date")}
                 """
             ),
             {"sid": sid},

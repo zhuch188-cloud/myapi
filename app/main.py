@@ -38,9 +38,13 @@ from app.sql_dialect import (
     list_table_columns,
     quote_ident as _sql_quote_ident,
     sql_curdate,
+    sql_date_compact_expr,
     sql_hours_ago,
+    sql_max_date_expr,
     sql_minutes_ago,
     sql_now,
+    sql_order_date_asc,
+    sql_order_date_desc,
     sql_timestampdiff_hours,
     sql_year,
 )
@@ -1033,11 +1037,11 @@ def _anchor_from_rebalance_period(
     """
     first = db.execute(
         text(
-            """
+            f"""
             SELECT nav_unit, benchmark_nav
             FROM strategy_nav_daily
             WHERE strategy_id=:sid AND rebalance_date = :rd
-            ORDER BY trade_date ASC
+            ORDER BY {sql_order_date_asc("trade_date")}
             LIMIT 1
             """
         ),
@@ -1050,12 +1054,12 @@ def _anchor_from_rebalance_period(
     if b0 is None or b0 <= 0:
         b2 = db.execute(
             text(
-                """
+                f"""
                 SELECT benchmark_nav
                 FROM strategy_nav_daily
                 WHERE strategy_id=:sid AND rebalance_date = :rd
                   AND benchmark_nav IS NOT NULL AND benchmark_nav > 0
-                ORDER BY trade_date ASC
+                ORDER BY {sql_order_date_asc("trade_date")}
                 LIMIT 1
                 """
             ),
@@ -1096,19 +1100,21 @@ def _excess_anchor_nav_bench_for_range(
                 if an[0] is not None and an[1] is not None and an[0] > 0 and an[1] > 0:
                     return an
 
+        sd_cmp = str(sd).strip().replace("-", "")[:8]
         pr = db.execute(
             text(
-                """
+                f"""
                 SELECT nav_unit, benchmark_nav
                 FROM strategy_nav_daily
-                WHERE strategy_id=:sid AND trade_date < :sd
+                WHERE strategy_id=:sid
+                  AND {sql_date_compact_expr("trade_date")} < :sd_cmp
                   AND nav_unit IS NOT NULL AND benchmark_nav IS NOT NULL
                   AND nav_unit > 0 AND benchmark_nav > 0
-                ORDER BY trade_date DESC
+                ORDER BY {sql_order_date_desc("trade_date")}
                 LIMIT 1
                 """
             ),
-            {"sid": strategy_id, "sd": sd},
+            {"sid": strategy_id, "sd_cmp": sd_cmp},
         ).mappings().first()
         if pr:
             try:
@@ -1127,21 +1133,23 @@ def _excess_anchor_nav_bench_for_range(
             if an[0] is not None and an[1] is not None and an[0] > 0 and an[1] > 0:
                 return an
 
+    sd_cmp = str(sd).strip().replace("-", "")[:8] if sd else None
+    ed_cmp = str(ed).strip().replace("-", "")[:8] if ed else None
     ar0 = db.execute(
         text(
-            """
+            f"""
             SELECT nav_unit, benchmark_nav
             FROM strategy_nav_daily
             WHERE strategy_id=:sid
-              AND (:sd IS NULL OR trade_date >= :sd)
-              AND (:ed IS NULL OR trade_date <= :ed)
+              AND (:sd_cmp IS NULL OR {sql_date_compact_expr("trade_date")} >= :sd_cmp)
+              AND (:ed_cmp IS NULL OR {sql_date_compact_expr("trade_date")} <= :ed_cmp)
               AND nav_unit IS NOT NULL AND benchmark_nav IS NOT NULL
               AND nav_unit > 0 AND benchmark_nav > 0
-            ORDER BY trade_date ASC
+            ORDER BY {sql_order_date_asc("trade_date")}
             LIMIT 1
             """
         ),
-        {"sid": strategy_id, "sd": sd, "ed": ed},
+        {"sid": strategy_id, "sd_cmp": sd_cmp, "ed_cmp": ed_cmp},
     ).mappings().first()
     if not ar0:
         return None, None
@@ -1164,17 +1172,18 @@ def _prepend_nav_row_before_range_start(
         return list(chart_rows)
     if _start_date_is_declared_rebalance(db, strategy_id, sd):
         return list(chart_rows)
+    sd_cmp = str(sd).strip().replace("-", "")[:8]
     pre = db.execute(
         text(
-            """
+            f"""
             SELECT trade_date, nav_unit, daily_ret, benchmark_ret, benchmark_nav, rebalance_date
             FROM strategy_nav_daily
-            WHERE strategy_id=:sid AND trade_date < :sd
-            ORDER BY trade_date DESC
+            WHERE strategy_id=:sid AND {sql_date_compact_expr("trade_date")} < :sd_cmp
+            ORDER BY {sql_order_date_desc("trade_date")}
             LIMIT 1
             """
         ),
-        {"sid": strategy_id, "sd": sd},
+        {"sid": strategy_id, "sd_cmp": sd_cmp},
     ).mappings().first()
     if not pre:
         return list(chart_rows)
@@ -2407,9 +2416,9 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
     td_row = db.execute(
         text(
             f"""
-            SELECT MAX(z.td) AS d
+                SELECT MAX(z.td) AS d
             FROM (
-                SELECT MAX(trade_date) AS td
+                SELECT {sql_max_date_expr("trade_date")} AS td
                 FROM strategy_holding_daily
                 WHERE strategy_id IN ({quoted_visible})
                 GROUP BY strategy_id
@@ -2438,13 +2447,13 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
                 SELECT h.strategy_id, h.stock_code, h.stock_name, h.last_1d_pct, h.period_return, h.ret_5d
                 FROM strategy_holding_daily h
                 INNER JOIN (
-                    SELECT strategy_id, MAX(trade_date) AS td
+                    SELECT strategy_id, {sql_max_date_expr("trade_date")} AS td
                     FROM strategy_holding_daily
                     WHERE strategy_id IN ({in_clause})
                     GROUP BY strategy_id
                 ) lt ON lt.strategy_id = h.strategy_id AND h.trade_date = lt.td
                 INNER JOIN (
-                    SELECT strategy_id, trade_date, MAX(rebalance_date) AS rb
+                    SELECT strategy_id, trade_date, {sql_max_date_expr("rebalance_date")} AS rb
                     FROM strategy_holding_daily
                     WHERE strategy_id IN ({in_clause})
                     GROUP BY strategy_id, trade_date
@@ -2578,7 +2587,10 @@ def strategy_holdings(
         raise HTTPException(status_code=400, detail="page_size must be 20, 50, or 100")
 
     latest_td_row = db.execute(
-        text("SELECT MAX(trade_date) AS d FROM strategy_holding_daily WHERE strategy_id=:sid"),
+        text(
+            f"SELECT {sql_max_date_expr('trade_date')} AS d "
+            "FROM strategy_holding_daily WHERE strategy_id=:sid"
+        ),
         {"sid": strategy_id},
     ).mappings().first()
     latest_trade_date = latest_td_row["d"] if latest_td_row else None
@@ -2602,8 +2614,8 @@ def strategy_holdings(
     if selected_rb is None:
         rb_row = db.execute(
             text(
-                """
-                SELECT MAX(rebalance_date) AS rb
+                f"""
+                SELECT {sql_max_date_expr("rebalance_date")} AS rb
                 FROM strategy_holding_daily
                 WHERE strategy_id=:sid AND trade_date=:td
                 """
@@ -2697,14 +2709,15 @@ def strategy_rebalance_dates(
     if int(latest_only or 0) == 1:
         rows = db.execute(
             text(
-                """
+                f"""
                 SELECT DISTINCT rebalance_date
                 FROM strategy_holding_daily
                 WHERE strategy_id=:sid
                   AND trade_date = (
-                    SELECT MAX(trade_date) FROM strategy_holding_daily WHERE strategy_id=:sid
+                    SELECT {sql_max_date_expr("trade_date")}
+                    FROM strategy_holding_daily WHERE strategy_id=:sid
                   )
-                ORDER BY rebalance_date DESC
+                ORDER BY {sql_order_date_desc("rebalance_date")}
                 """
             ),
             {"sid": strategy_id},
@@ -2712,11 +2725,11 @@ def strategy_rebalance_dates(
     else:
         rows = db.execute(
             text(
-                """
+                f"""
                 SELECT DISTINCT rebalance_date
                 FROM strategy_positions
                 WHERE strategy_id=:sid
-                ORDER BY rebalance_date DESC
+                ORDER BY {sql_order_date_desc("rebalance_date")}
                 """
             ),
             {"sid": strategy_id},
@@ -2737,7 +2750,10 @@ def strategy_stock_profile(
         raise HTTPException(status_code=400, detail="invalid stock_code")
 
     latest_td_row = db.execute(
-        text("SELECT MAX(trade_date) AS d FROM strategy_holding_daily WHERE strategy_id=:sid"),
+        text(
+            f"SELECT {sql_max_date_expr('trade_date')} AS d "
+            "FROM strategy_holding_daily WHERE strategy_id=:sid"
+        ),
         {"sid": strategy_id},
     ).mappings().first()
     latest_trade_date = latest_td_row["d"] if latest_td_row else None
@@ -3004,13 +3020,13 @@ def strategy_nav(
         total = int(cnt_row["c"] or 0) if cnt_row else 0
         rows = db.execute(
             text(
-                """
+                f"""
                 SELECT trade_date, nav_unit, daily_ret, benchmark_ret, benchmark_nav, rebalance_date
                 FROM strategy_nav_daily
                 WHERE strategy_id=:sid
                   AND (:sd IS NULL OR trade_date >= :sd)
                   AND (:ed IS NULL OR trade_date <= :ed)
-                ORDER BY trade_date DESC
+                ORDER BY {sql_order_date_desc("trade_date")}
                 LIMIT :lim OFFSET :off
                 """
             ),
@@ -3020,13 +3036,13 @@ def strategy_nav(
         if want_chart:
             chart_rows = db.execute(
                 text(
-                    """
+                    f"""
                     SELECT trade_date, nav_unit, daily_ret, benchmark_ret, benchmark_nav, rebalance_date
                     FROM strategy_nav_daily
                     WHERE strategy_id=:sid
                       AND (:sd IS NULL OR trade_date >= :sd)
                       AND (:ed IS NULL OR trade_date <= :ed)
-                    ORDER BY trade_date ASC
+                    ORDER BY {sql_order_date_asc("trade_date")}
                     """
                 ),
                 {"sid": strategy_id, "sd": start_date, "ed": end_date},
@@ -3052,13 +3068,13 @@ def strategy_nav(
         raise HTTPException(status_code=400, detail="limit must be between 1 and 10000")
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT trade_date, nav_unit, daily_ret, benchmark_ret, benchmark_nav, rebalance_date
             FROM strategy_nav_daily
             WHERE strategy_id=:sid
               AND (:sd IS NULL OR trade_date >= :sd)
               AND (:ed IS NULL OR trade_date <= :ed)
-            ORDER BY trade_date DESC
+            ORDER BY {sql_order_date_desc("trade_date")}
             LIMIT :limit
             """
         ),
@@ -3073,13 +3089,13 @@ def strategy_nav(
     if want_chart:
         chart_rows = db.execute(
             text(
-                """
+                f"""
                 SELECT trade_date, nav_unit, daily_ret, benchmark_ret, benchmark_nav, rebalance_date
                 FROM strategy_nav_daily
                 WHERE strategy_id=:sid
                   AND (:sd IS NULL OR trade_date >= :sd)
                   AND (:ed IS NULL OR trade_date <= :ed)
-                ORDER BY trade_date ASC
+                ORDER BY {sql_order_date_asc("trade_date")}
                 LIMIT :limit
                 """
             ),
@@ -3112,13 +3128,13 @@ def strategy_nav_metrics(
 
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT trade_date, nav_unit, daily_ret, benchmark_ret, benchmark_nav
             FROM strategy_nav_daily
             WHERE strategy_id=:sid
               AND (:sd IS NULL OR trade_date >= :sd)
               AND (:ed IS NULL OR trade_date <= :ed)
-            ORDER BY trade_date ASC
+            ORDER BY {sql_order_date_asc("trade_date")}
             """
         ),
         {"sid": strategy_id, "sd": start_date, "ed": end_date},

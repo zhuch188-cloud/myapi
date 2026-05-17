@@ -45,6 +45,28 @@ def sql_year(col: str) -> str:
     return f"strftime('%Y', {col})"
 
 
+def sql_date_compact_expr(col: str) -> str:
+    """
+    将 TEXT 日期列规范为 YYYYMMDD 字符串，便于 MAX/MIN/ORDER BY 按日历序比较。
+    兼容 'YYYY-MM-DD' 与 'YYYY-MM-DD HH:MM:SS'；迁库后勿对裸 TEXT 用 MAX(col) 字典序。
+    """
+    c = str(col).strip()
+    return f"REPLACE(SUBSTR({c}, 1, 10), '-', '')"
+
+
+def sql_max_date_expr(col: str) -> str:
+    """TEXT 日期列的日历最大日（返回 YYYYMMDD 形态，读出后须 _row_sql_date）。"""
+    return f"MAX({sql_date_compact_expr(col)})"
+
+
+def sql_order_date_asc(col: str) -> str:
+    return f"{sql_date_compact_expr(col)} ASC"
+
+
+def sql_order_date_desc(col: str) -> str:
+    return f"{sql_date_compact_expr(col)} DESC"
+
+
 def quote_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
