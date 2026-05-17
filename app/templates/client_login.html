@@ -111,7 +111,8 @@
           </span>
           <a href="/client-forgot-password">忘记密码</a>
           <span style="color:#cbd5e1;"> · </span>
-          <a href="/client/contact">联系我们</a>
+          <a class="fp-nav-contact" href="/client/contact" style="display:none;">联系我们</a>
+          <a class="fp-nav-feedback" href="/client/feedback" style="display:none;">意见建议</a>
         </p>
       </div>
     </div>
@@ -453,6 +454,7 @@
         showClientLoginForm();
       })();
     </script>
+{% include 'partials/client_nav_features_script.html' %}
 {% include 'partials/site_disclaimer.html' %}
   </body>
 </html>

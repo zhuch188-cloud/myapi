@@ -44,6 +44,8 @@ from app.sql_dialect import (
     sql_timestampdiff_hours,
 )
 from app.mail import send_contact_us_message, send_password_reset_email, smtp_send_test
+from app.client_messages import insert_client_submission, list_client_submissions
+from app.client_safe import public_message
 from app.auth import SlidingJWTAccessMiddleware, create_access_token, get_current_user, require_roles, norm_user_status
 from app import ark_client, stock_trend, wind_holders, wind_income, wind_sql
 from app.services import (
@@ -686,6 +688,8 @@ def _insert_login_event(
 
 _CLIENT_LOGIN_SETTING_KEY = "client_require_login"
 _CLIENT_REGISTER_SETTING_KEY = "client_allow_register"
+_CLIENT_CONTACT_ENABLED_KEY = "client_contact_enabled"
+_CLIENT_FEEDBACK_ENABLED_KEY = "client_feedback_enabled"
 _SUPERUSER_LOGIN_USERNAME = "admin"
 
 
@@ -709,6 +713,62 @@ def _client_register_allowed(db: Session) -> bool:
     """True：前台开放自助注册；False：隐藏注册入口并拒绝注册接口。"""
     v = _site_setting_get(db, _CLIENT_REGISTER_SETTING_KEY, "1").lower()
     return v not in ("0", "false", "no", "off")
+
+
+def _site_setting_bool(db: Session, key: str, default: str) -> bool:
+    v = _site_setting_get(db, key, default).lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _client_contact_enabled(db: Session) -> bool:
+    return _site_setting_bool(db, _CLIENT_CONTACT_ENABLED_KEY, "1")
+
+
+def _client_feedback_enabled(db: Session) -> bool:
+    return _site_setting_bool(db, _CLIENT_FEEDBACK_ENABLED_KEY, "0")
+
+
+def _submit_client_message(
+    db: Session,
+    *,
+    kind: str,
+    title: str,
+    content: str,
+    contact: str,
+    user: dict | None,
+    public_guest: bool,
+    client_ip: str,
+) -> dict:
+    """写入数据库；联系我们另尝试发邮件（失败不影响入库成功）。"""
+    uid = int(user["id"]) if user and user.get("id") is not None else None
+    uname = str(user.get("username") or "").strip() if user else ""
+    insert_client_submission(
+        db,
+        kind=kind,
+        title=title,
+        content=content,
+        contact_info=contact,
+        user_id=uid,
+        username=uname,
+        public_guest=public_guest,
+        client_ip=client_ip,
+    )
+    db.commit()
+    mail_ok = None
+    if kind == "contact":
+        mail_ok, _mail_err = send_contact_us_message(
+            settings,
+            title=title,
+            content=content,
+            contact=contact,
+            from_username=uname,
+            public_guest=public_guest,
+            client_ip=client_ip,
+        )
+    out: dict = {"ok": True, "saved": True}
+    if kind == "contact":
+        out["mail_sent"] = bool(mail_ok)
+    return out
 
 
 def _site_setting_upsert(db: Session, key: str, value: str) -> None:
@@ -1686,6 +1746,8 @@ def public_client_access_mode(db: Session = Depends(get_session)):
     return {
         "require_login": _client_require_login_enabled(db),
         "allow_register": _client_register_allowed(db),
+        "contact_enabled": _client_contact_enabled(db),
+        "feedback_enabled": _client_feedback_enabled(db),
     }
 
 
@@ -2166,39 +2228,89 @@ def auth_profile_put(
 
 
 @app.post("/api/client/contact")
-def client_contact_submit(payload: ClientContactPayload, user=Depends(get_current_user)):
-    """登录用户提交「联系我们」；邮件发往服务端配置的收件箱（不在响应中返回）。"""
+def client_contact_submit(
+    payload: ClientContactPayload,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
+    if not _client_contact_enabled(db):
+        raise HTTPException(status_code=403, detail=public_message("forbidden"))
     title, content, contact = _validated_contact_fields(payload)
-    uname = str(user.get("username") or "").strip()
-    ok, err_msg = send_contact_us_message(
-        settings,
+    return _submit_client_message(
+        db,
+        kind="contact",
         title=title,
         content=content,
         contact=contact,
-        from_username=uname,
+        user=user,
+        public_guest=False,
+        client_ip="",
     )
-    if not ok:
-        raise HTTPException(status_code=503, detail=err_msg or "发送失败")
-    return {"ok": True}
 
 
 @app.post("/api/public/contact")
-def public_contact_submit(payload: ClientContactPayload, request: Request):
-    """未登录用户提交「联系我们」（如无法登录）；邮件发往配置的收件箱，正文标注为公开入口。"""
+def public_contact_submit(
+    payload: ClientContactPayload,
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    if not _client_contact_enabled(db):
+        raise HTTPException(status_code=403, detail=public_message("forbidden"))
     _public_contact_rate_check(_client_ip(request))
     title, content, contact = _validated_contact_fields(payload)
-    ok, err_msg = send_contact_us_message(
-        settings,
+    return _submit_client_message(
+        db,
+        kind="contact",
         title=title,
         content=content,
         contact=contact,
-        from_username="",
+        user=None,
         public_guest=True,
         client_ip=_client_ip(request),
     )
-    if not ok:
-        raise HTTPException(status_code=503, detail=err_msg or "发送失败")
-    return {"ok": True}
+
+
+@app.post("/api/client/feedback")
+def client_feedback_submit(
+    payload: ClientContactPayload,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
+    if not _client_feedback_enabled(db):
+        raise HTTPException(status_code=403, detail=public_message("forbidden"))
+    title, content, contact = _validated_contact_fields(payload)
+    return _submit_client_message(
+        db,
+        kind="feedback",
+        title=title,
+        content=content,
+        contact=contact,
+        user=user,
+        public_guest=False,
+        client_ip="",
+    )
+
+
+@app.post("/api/public/feedback")
+def public_feedback_submit(
+    payload: ClientContactPayload,
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    if not _client_feedback_enabled(db):
+        raise HTTPException(status_code=403, detail=public_message("forbidden"))
+    _public_contact_rate_check(_client_ip(request))
+    title, content, contact = _validated_contact_fields(payload)
+    return _submit_client_message(
+        db,
+        kind="feedback",
+        title=title,
+        content=content,
+        contact=contact,
+        user=None,
+        public_guest=True,
+        client_ip=_client_ip(request),
+    )
 
 
 @app.get("/api/strategies")
@@ -4863,6 +4975,8 @@ def admin_access_overview(
         "viewer_engagement": viewer_engagement,
         "client_require_login": _client_require_login_enabled(db),
         "client_allow_register": _client_register_allowed(db),
+        "client_contact_enabled": _client_contact_enabled(db),
+        "client_feedback_enabled": _client_feedback_enabled(db),
     }
 
 
@@ -4892,6 +5006,22 @@ def admin_client_access_settings(
             allow_reg = bool(raw_r)
         _site_setting_upsert(db, _CLIENT_REGISTER_SETTING_KEY, "1" if allow_reg else "0")
         detail_audit["client_allow_register"] = allow_reg
+    if "client_contact_enabled" in p:
+        raw_c = p.get("client_contact_enabled")
+        if isinstance(raw_c, str):
+            contact_on = raw_c.strip().lower() not in ("0", "false", "no", "off", "")
+        else:
+            contact_on = bool(raw_c)
+        _site_setting_upsert(db, _CLIENT_CONTACT_ENABLED_KEY, "1" if contact_on else "0")
+        detail_audit["client_contact_enabled"] = contact_on
+    if "client_feedback_enabled" in p:
+        raw_f = p.get("client_feedback_enabled")
+        if isinstance(raw_f, str):
+            feedback_on = raw_f.strip().lower() not in ("0", "false", "no", "off", "")
+        else:
+            feedback_on = bool(raw_f)
+        _site_setting_upsert(db, _CLIENT_FEEDBACK_ENABLED_KEY, "1" if feedback_on else "0")
+        detail_audit["client_feedback_enabled"] = feedback_on
     if detail_audit:
         _audit_log(
             db,
@@ -4905,7 +5035,27 @@ def admin_client_access_settings(
         "ok": True,
         "client_require_login": _client_require_login_enabled(db),
         "client_allow_register": _client_register_allowed(db),
+        "client_contact_enabled": _client_contact_enabled(db),
+        "client_feedback_enabled": _client_feedback_enabled(db),
     }
+
+
+@app.get("/api/admin/client-messages")
+def admin_list_client_messages(
+    kind: str | None = None,
+    limit: int = 80,
+    offset: int = 0,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    k = (kind or "").strip().lower()
+    if k and k not in ("contact", "feedback"):
+        raise HTTPException(status_code=400, detail="kind must be contact or feedback")
+    items, total = list_client_submissions(
+        db, kind=k or None, limit=limit, offset=offset
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @app.post("/api/admin/system-init")
@@ -5316,9 +5466,35 @@ def client_profile_page(request: Request):
 
 
 @app.get("/client/contact", response_class=HTMLResponse)
-def client_contact_page(request: Request):
+def client_contact_page(request: Request, db: Session = Depends(get_session)):
+    if not _client_contact_enabled(db):
+        return templates.TemplateResponse(
+            "client_feature_disabled.html",
+            {"request": request, "app_name": settings.app_name, "feature_name": "联系我们"},
+        )
     return templates.TemplateResponse(
         "client_contact.html",
+        {"request": request, "app_name": settings.app_name},
+    )
+
+
+@app.get("/client/feedback", response_class=HTMLResponse)
+def client_feedback_page(request: Request, db: Session = Depends(get_session)):
+    if not _client_feedback_enabled(db):
+        return templates.TemplateResponse(
+            "client_feature_disabled.html",
+            {"request": request, "app_name": settings.app_name, "feature_name": "意见建议"},
+        )
+    return templates.TemplateResponse(
+        "client_feedback.html",
+        {"request": request, "app_name": settings.app_name},
+    )
+
+
+@app.get("/admin/client-messages", response_class=HTMLResponse)
+def admin_client_messages_page(request: Request):
+    return templates.TemplateResponse(
+        "admin_client_messages.html",
         {"request": request, "app_name": settings.app_name},
     )
 

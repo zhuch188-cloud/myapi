@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 留言管理</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      button, select { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto; padding: 6px 12px; border-radius: 8px; border: 1px solid #e2e8f0;
+        background: #f1f5f9; color: #94a3b8; font-size: 13px; cursor: pointer;
+      }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 8px; text-align: left; vertical-align: top; }
+      td.content-cell { max-width: 360px; white-space: normal; word-break: break-word; }
+      .kind-contact { color: #2463eb; font-weight: 600; }
+      .kind-feedback { color: #7c3aed; font-weight: 600; }
+      .pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表�?/a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更�?/a>
+        <a href="/admin/nav-check">净�?/a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <a href="/admin/client-messages">留言管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退�?/button>
+        <span id="profile" class="muted"></span>
+      </div>
+      <div class="card">
+        <h4 style="margin:0 0 10px;">前台留言（联系我�?/ 意见建议�?/h4>
+        <div class="row">
+          <label>类型</label>
+          <select id="kindSel">
+            <option value="">全部</option>
+            <option value="contact">联系我们</option>
+            <option value="feedback">意见建议</option>
+          </select>
+          <button onclick="page=1;loadMessages()">查询</button>
+          <span id="msg" class="muted"></span>
+        </div>
+        <div style="overflow-x:auto;margin-top:10px;">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>类型</th>
+                <th>标题</th>
+                <th>内容</th>
+                <th>联系方式</th>
+                <th>用户</th>
+                <th>访客</th>
+                <th>IP</th>
+                <th>时间</th>
+              </tr>
+            </thead>
+            <tbody id="tb"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button class="secondary" id="btnFirst" onclick="goFirst()">首页</button>
+          <button class="secondary" id="btnPrev" onclick="goPrev()">上一�?/button>
+          <button class="secondary" id="btnNext" onclick="goNext()">下一�?/button>
+          <span id="pagerInfo" class="muted"></span>
+        </div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      let page = 1;
+      const pageSize = 50;
+      let total = 0;
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: "Bearer " + token } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); location.href = "/admin-login"; }
+      async function api(path, options = {}) {
+        let res;
+        try {
+          res = await fetch(path, { ...options, headers: authHeaders(options.headers || {}) });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+        return res.json();
+      }
+      function esc(s) {
+        return String(s ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+      function kindLabel(k) {
+        if (k === "contact") return '<span class="kind-contact">联系我们</span>';
+        if (k === "feedback") return '<span class="kind-feedback">意见建议</span>';
+        return esc(k);
+      }
+      function fmtTime(t) {
+        if (!t) return "-";
+        return String(t).replace("T", " ").slice(0, 19);
+      }
+      function totalPages() { return Math.max(1, Math.ceil(total / pageSize)); }
+      function updatePager() {
+        const tp = totalPages();
+        document.getElementById("pagerInfo").textContent =
+          `�?${total} 条，�?${page} / ${tp} 页`;
+        document.getElementById("btnFirst").disabled = page <= 1;
+        document.getElementById("btnPrev").disabled = page <= 1;
+        document.getElementById("btnNext").disabled = page >= tp;
+      }
+      function goFirst() { if (page > 1) { page = 1; loadMessages(); } }
+      function goPrev() { if (page > 1) { page -= 1; loadMessages(); } }
+      function goNext() { if (page < totalPages()) { page += 1; loadMessages(); } }
+      async function loadMessages() {
+        const el = document.getElementById("msg");
+        el.textContent = "加载中�?;
+        const kind = document.getElementById("kindSel").value || "";
+        const q = new URLSearchParams({ limit: String(pageSize), offset: String((page - 1) * pageSize) });
+        if (kind) q.set("kind", kind);
+        try {
+          const data = await api(`/api/admin/client-messages?${q}`);
+          total = Number(data.total || 0);
+          const items = data.items || [];
+          document.getElementById("tb").innerHTML = items.map((r) => {
+            const user = r.user_id
+              ? `${esc(r.username || "")} (#${r.user_id})`
+              : (r.username ? esc(r.username) : "-");
+            const guest = r.is_public_guest ? "�? : "�?;
+            const preview = esc((r.content || "").slice(0, 280)) + ((r.content || "").length > 280 ? "�? : "");
+            return `<tr>
+              <td>${r.id}</td>
+              <td>${kindLabel(r.kind)}</td>
+              <td>${esc(r.title)}</td>
+              <td class="content-cell">${preview}</td>
+              <td>${esc(r.contact_info || "-")}</td>
+              <td>${user}</td>
+              <td>${guest}</td>
+              <td>${esc(r.client_ip || "-")}</td>
+              <td>${fmtTime(r.created_at)}</td>
+            </tr>`;
+          }).join("") || '<tr><td colspan="9" class="muted">暂无记录</td></tr>';
+          updatePager();
+          el.textContent = "";
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      loadMessages();
+    </script>
+  </body>
+</html>

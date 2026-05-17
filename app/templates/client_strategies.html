@@ -97,7 +97,7 @@
           <a class="nav-primary" href="/client-profile">个人资料</a>
           <span id="profileHintSysPwd" class="sys-profile-hint" style="display: none;">(请及时更新)</span>
         </span>
-        <a class="nav-primary" href="/client/contact">联系我们</a>
+        {% include 'partials/client_nav_contact_feedback.html' %}
         <button type="button" class="logout-soft" onclick="logout()">退出</button>
       </div>
       <div id="msg" class="card muted" style="display:none;"></div>

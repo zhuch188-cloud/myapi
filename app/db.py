@@ -150,6 +150,30 @@ def _apply_runtime_schema_migrations(conn) -> None:
             "CREATE INDEX IF NOT EXISTS idx_strategy_import_created ON strategy_import_jobs (created_at)"
         )
     )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS client_feedback_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN ('contact', 'feedback')),
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                contact_info TEXT NULL,
+                user_id INTEGER NULL,
+                username TEXT NULL,
+                is_public_guest INTEGER NOT NULL DEFAULT 0,
+                client_ip TEXT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+            )
+            """
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_client_fb_kind_created "
+            "ON client_feedback_submissions (kind, created_at)"
+        )
+    )
 
 
 def init_database() -> None:
@@ -171,6 +195,22 @@ def init_database() -> None:
                 """
                 INSERT OR IGNORE INTO site_settings (setting_key, setting_value)
                 VALUES ('client_allow_register', '1')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO site_settings (setting_key, setting_value)
+                VALUES ('client_contact_enabled', '1')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO site_settings (setting_key, setting_value)
+                VALUES ('client_feedback_enabled', '0')
                 """
             )
         )

@@ -52,6 +52,7 @@
       <div class="card nav-card row nav">
         <a class="nav-primary" href="/client">策略列表</a>
         <a class="nav-primary" href="/client-profile">个人资料</a>
+        {% include 'partials/client_nav_contact_feedback.html' %}
         <span class="nav-here">联系我们</span>
         <button type="button" id="navLogoutBtn" class="logout-soft" onclick="logout()">退出</button>
         <a id="guestNavLogin" class="nav-primary" href="/client-login" style="display:none;margin-left:auto;">登录</a>

@@ -1,0 +1,27 @@
+<script>
+async function applyClientNavFeatures() {
+  try {
+    const res = await fetch("/api/public/client-access-mode");
+    if (!res.ok) return;
+    const m = await res.json();
+    const show = (on) => (on ? "" : "none");
+    document.querySelectorAll(".fp-nav-contact").forEach((el) => {
+      el.style.display = show(!!m.contact_enabled);
+    });
+    document.querySelectorAll(".fp-nav-feedback").forEach((el) => {
+      el.style.display = show(!!m.feedback_enabled);
+    });
+    const here = document.querySelector(".nav-here");
+    if (here) {
+      const t = (here.textContent || "").trim();
+      if (t === "联系我们") {
+        document.querySelectorAll(".fp-nav-contact").forEach((el) => { el.style.display = "none"; });
+      }
+      if (t === "意见建议") {
+        document.querySelectorAll(".fp-nav-feedback").forEach((el) => { el.style.display = "none"; });
+      }
+    }
+  } catch (e) {}
+}
+applyClientNavFeatures();
+</script>
