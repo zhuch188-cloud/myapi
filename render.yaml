@@ -5,6 +5,8 @@ services:
     name: myapi
     runtime: docker
     dockerfilePath: ./Dockerfile
+    # 轻量探针，避免全量同步/OOM 重启时 /health 因 pyodbc 枚举等拖过 5s 被判失败
+    healthCheckPath: /health/live
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.0"

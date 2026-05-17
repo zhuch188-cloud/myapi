@@ -108,7 +108,7 @@
           <span id="jobMsg" class="muted"></span>
         </div>
         <p class="muted" style="margin:0;font-size:12px;line-height:1.45;">
-          「导入并提取」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：失败后在下方任务表点「续传」。全量/增量指导入持仓表的方式，与是否重建净值无关（「导入并提取」会额外做净值与快照）。
+          「导入并提取」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：失败后在下方任务表点「续传」；若不再继续可点「放弃」，该任务将终止且不可续传。全量/增量指导入持仓表的方式，与是否重建净值无关（「导入并提取」会额外做净值与快照）。
         </p>
       </div>
       <div class="card">
@@ -122,6 +122,11 @@
       <div class="card">
         <h4>导入并提取任务 <button type="button" class="secondary" onclick="loadSyncJobs()">刷新</button></h4>
         <div class="scroll"><table id="syncJobTb"></table></div>
+      </div>
+      <div class="card">
+        <h4>数据更新任务 <button type="button" class="secondary" onclick="loadUpdateJobs()">刷新</button></h4>
+        <p class="muted" style="margin:0 0 8px;font-size:12px;">「仅更新最新交易日」与全量同步第 3 步的进度写入说明列，关闭页面后点刷新仍可查看。</p>
+        <div class="scroll"><table id="updateJobTb"></table></div>
       </div>
     </div>
     <script>
@@ -421,6 +426,15 @@
           if (ret.import_job_id != null) await pollImportJob(ret.import_job_id);
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
+      function jobMsgCell(j) {
+        const at = j.progress_at ? `<div class="muted" style="font-size:11px">${esc(j.progress_at)}</div>` : "";
+        const body = esc((j.message || "").slice(0, 280));
+        return at + body;
+      }
+      function resumableJobButtons(resumeFn, abandonFn, id) {
+        return `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px;margin-right:4px" onclick="${resumeFn}(${id})">续传</button>`
+          + `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="${abandonFn}(${id})">放弃</button>`;
+      }
       async function resumeImportJob(jobId) {
         const msg = document.getElementById("jobMsg");
         try {
@@ -432,6 +446,15 @@
           if (ret.import_job_id != null) await pollImportJob(ret.import_job_id);
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
+      async function abandonImportJob(jobId) {
+        if (!confirm(`确定放弃策略导入任务 #${jobId}？放弃后不可续传。`)) return;
+        const msg = document.getElementById("jobMsg");
+        try {
+          const ret = await api(`/api/admin/import-jobs/${jobId}/abandon`, { method: "POST" });
+          msg.textContent = ret.message || `任务 #${jobId} 已放弃`;
+          await loadImportJobs();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
       async function loadImportJobs() {
         const d = await api("/api/admin/import-jobs?limit=30");
         const items = d.items || [];
@@ -440,8 +463,8 @@
           <tbody>${items.map(j => {
             const all = (() => { try { return JSON.parse(j.strategy_ids_json || "[]").length; } catch (_) { return "?"; } })();
             const done = (() => { try { return JSON.parse(j.completed_strategy_ids_json || "[]").length; } catch (_) { return 0; } })();
-            const btn = j.resumable ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="resumeImportJob(${j.id})">续传</button>` : "";
-            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${done}/${all}</td><td>${esc((j.message||"").slice(0,120))}</td><td>${btn}</td></tr>`;
+            const btn = j.resumable ? resumableJobButtons("resumeImportJob", "abandonImportJob", j.id) : "";
+            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${done}/${all}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
           }).join("") || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function pollSyncJob(jobId) {
@@ -452,6 +475,7 @@
           const stg = st.stage ? ` · ${st.stage}` : "";
           msg.textContent = `#${st.id} ${st.status}${stg}${st.message ? " — " + st.message : ""}`;
           await loadSyncJobs();
+          await loadUpdateJobs();
           if (st.status !== "QUEUED" && st.status !== "RUNNING") return st;
           await sleep(2000);
         }
@@ -466,14 +490,39 @@
           await pollSyncJob(jobId);
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
+      async function abandonSyncJob(jobId) {
+        if (!confirm(`确定放弃「导入并提取」任务 #${jobId}？放弃后不可续传。`)) return;
+        const msg = document.getElementById("jobMsg");
+        try {
+          const ret = await api(`/api/admin/sync-jobs/${jobId}/abandon`, { method: "POST" });
+          msg.textContent = ret.message || `同步任务 #${jobId} 已放弃`;
+          await loadSyncJobs();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
+      async function loadUpdateJobs() {
+        const d = await api("/api/admin/update-jobs", { headers: authHeaders() });
+        const items = d.items || [];
+        document.getElementById("updateJobTb").innerHTML = `
+          <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>触发</th><th>说明</th><th>开始</th><th>结束</th></tr></thead>
+          <tbody>${items.map(j => `
+            <tr>
+              <td>${j.id}</td>
+              <td>${esc(j.job_type||"-")}</td>
+              <td>${esc(j.status)}</td>
+              <td>${esc(j.triggered_by||"")}</td>
+              <td>${jobMsgCell(j)}</td>
+              <td>${esc(j.started_at||"")}</td>
+              <td>${esc(j.finished_at||"—")}</td>
+            </tr>`).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
+      }
       async function loadSyncJobs() {
         const d = await api("/api/admin/sync-jobs?limit=20");
         const items = d.items || [];
         document.getElementById("syncJobTb").innerHTML = `
           <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>阶段</th><th>说明</th><th>操作</th></tr></thead>
           <tbody>${items.map(j => {
-            const btn = j.resumable ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="resumeSyncJob(${j.id})">续传</button>` : "";
-            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.stage||"-")}</td><td>${esc((j.message||"").slice(0,120))}</td><td>${btn}</td></tr>`;
+            const btn = j.resumable ? resumableJobButtons("resumeSyncJob", "abandonSyncJob", j.id) : "";
+            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.stage||"-")}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
           }).join("") || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function updateLatestSelected() {
@@ -501,10 +550,12 @@
               continue;
             }
             msg.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
+            await loadUpdateJobs();
             if (j.status !== "RUNNING") return;
             await sleep(2000);
           }
           msg.textContent += "（轮询超时）";
+          await loadUpdateJobs();
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       async function deleteSelected() {
@@ -560,6 +611,7 @@
       loadAdminStrategies();
       loadImportJobs();
       loadSyncJobs();
+      loadUpdateJobs();
     </script>
 {% include 'partials/site_disclaimer.html' %}
   </body>

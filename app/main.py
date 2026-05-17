@@ -64,6 +64,9 @@ from app.services import (
     get_strategy_import_job_row,
     run_strategy_import_background_task,
     strategy_import_job_is_resumable,
+    admin_sync_job_is_resumable,
+    abandon_strategy_import_job,
+    abandon_admin_sync_job,
     latest_rebalance_date_by_strategy,
 )
 from app.supplement_import import (
@@ -71,6 +74,7 @@ from app.supplement_import import (
     DataImportBatchNotFoundError,
     DataImportBatchNotResumableError,
     ImportDefinitionNotFoundError,
+    abandon_data_import_batch,
     batch_is_resumable,
     default_company_profile_xlsx_path,
     get_data_import_batch_row,
@@ -1508,23 +1512,32 @@ def _scheduled_update():
     )
 
 
+@app.get("/health/live")
+def health_live():
+    """Render/负载均衡存活探针：仅确认进程与事件循环可响应，不做 Wind/DB 探测。"""
+    return {"ok": True, "live": True}
+
+
 @app.get("/health")
-def health():
+def health(verbose: bool = False):
     wind_ok = wind_sql.use_remote_sqlserver()
-    wind_st = wind_sql.wind_status()
+    wind_st = wind_sql.wind_status() if verbose else None
     turso_url = (settings.turso_database_url or "").strip()
+    wind_configured = bool((settings.wind_sqlserver_server or "").strip())
     db_ready = is_ready()
     err = boot_error()
-    return {
-        "ok": db_ready and not err and (not wind_st.get("configured") or wind_ok),
+    out: dict[str, Any] = {
+        "ok": db_ready and not err and (not wind_configured or wind_ok),
         "db_ready": db_ready,
         "db_error": err,
         "service": "strategy-showcase-python",
         "turso_configured": bool(turso_url and (settings.turso_auth_token or "").strip()),
         "wind_data_source": "sqlserver" if wind_ok else "disabled",
         "wind_sqlserver_ready": wind_ok,
-        "wind_sqlserver": wind_st,
     }
+    if verbose:
+        out["wind_sqlserver"] = wind_st
+    return out
 
 
 @app.post("/api/auth/login")
@@ -3834,7 +3847,7 @@ def admin_list_sync_jobs(
         text(
             """
             SELECT id, status, stage, message, import_mode, triggered_by,
-                   created_at, finished_at, result_json, checkpoint_json
+                   created_at, finished_at, result_json, checkpoint_json, progress_at
             FROM admin_sync_jobs
             ORDER BY id DESC
             LIMIT :lim
@@ -3845,15 +3858,7 @@ def admin_list_sync_jobs(
     items = []
     for r in rows:
         d = dict(r)
-        try:
-            rj = d.get("result_json")
-            rj_obj = json.loads(rj) if isinstance(rj, str) and rj.strip() else {}
-            d["resumable"] = bool(
-                str(d.get("status") or "").upper() == "FAILED"
-                and (rj_obj.get("resumable") or d.get("checkpoint_json"))
-            )
-        except json.JSONDecodeError:
-            d["resumable"] = False
+        d["resumable"] = admin_sync_job_is_resumable(d)
         items.append(d)
     return {"items": items}
 
@@ -3870,7 +3875,7 @@ def admin_get_sync_job(
             """
             SELECT id, status, stage, message, import_mode, triggered_by,
                    created_at, started_at, finished_at, result_json, strategy_ids_json,
-                   checkpoint_json
+                   checkpoint_json, progress_at
             FROM admin_sync_jobs
             WHERE id=:id
             """
@@ -3880,20 +3885,7 @@ def admin_get_sync_job(
     if not row:
         raise HTTPException(status_code=404, detail="sync job not found")
     d = dict(row)
-    try:
-        rj = d.get("result_json")
-        if isinstance(rj, str) and rj.strip():
-            rj_obj = json.loads(rj)
-            d["resumable"] = bool(
-                not rj_obj.get("ok")
-                and (rj_obj.get("resumable") or d.get("checkpoint_json"))
-            )
-        else:
-            d["resumable"] = str(d.get("status") or "").upper() == "FAILED" and bool(
-                d.get("checkpoint_json")
-            )
-    except json.JSONDecodeError:
-        d["resumable"] = False
+    d["resumable"] = admin_sync_job_is_resumable(d)
     return d
 
 
@@ -3946,6 +3938,26 @@ def admin_sync_job_resume(
     }
 
 
+@app.post("/api/admin/sync-jobs/{job_id}/abandon")
+def admin_sync_job_abandon(
+    job_id: int,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    try:
+        abandon_admin_sync_job(db, job_id)
+    except ValueError as ex:
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
+    db.commit()
+    return {
+        "ok": True,
+        "abandoned": True,
+        "sync_job_id": job_id,
+        "message": f"同步任务 #{job_id} 已放弃，不可续传",
+    }
+
+
 @app.get("/api/admin/import-jobs/{job_id}")
 def admin_get_import_job(
     job_id: int,
@@ -3958,6 +3970,26 @@ def admin_get_import_job(
         raise HTTPException(status_code=404, detail="import job not found")
     job["resumable"] = strategy_import_job_is_resumable(job)
     return job
+
+
+@app.post("/api/admin/import-jobs/{job_id}/abandon")
+def admin_import_job_abandon(
+    job_id: int,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    try:
+        abandon_strategy_import_job(db, job_id)
+    except ValueError as ex:
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
+    db.commit()
+    return {
+        "ok": True,
+        "abandoned": True,
+        "import_job_id": job_id,
+        "message": f"策略导入任务 #{job_id} 已放弃，不可续传",
+    }
 
 
 @app.get("/api/admin/import-jobs")
@@ -3973,7 +4005,8 @@ def admin_list_import_jobs(
         text(
             """
             SELECT id, status, import_mode, strategy_ids_json, completed_strategy_ids_json,
-                   imported_count, failed_count, message, triggered_by, created_at, finished_at
+                   imported_count, failed_count, message, triggered_by, created_at, finished_at,
+                   progress_at
             FROM strategy_import_jobs
             ORDER BY id DESC
             LIMIT :lim
@@ -4063,7 +4096,7 @@ def update_jobs(user=Depends(require_roles("admin", "editor")), db: Session = De
     rows = db.execute(
         text(
             """
-            SELECT id, job_type, status, triggered_by, started_at, finished_at, message
+            SELECT id, job_type, status, triggered_by, started_at, finished_at, message, progress_at
             FROM strategy_update_jobs
             ORDER BY id DESC
             LIMIT 50
@@ -4530,6 +4563,28 @@ def admin_data_import_resume(
         "batch_id": batch_id,
         "resume_from_row": rr,
         "message": f"已续传批次 #{batch_id}，将从第 {rr + 1} 行继续",
+    }
+
+
+@app.post("/api/admin/data-import/batches/{batch_id}/abandon")
+def admin_data_import_abandon(
+    batch_id: int,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
+    _ = user
+    try:
+        abandon_data_import_batch(db, batch_id)
+    except DataImportBatchNotFoundError:
+        raise HTTPException(status_code=404, detail="batch not found") from None
+    except DataImportBatchNotResumableError as ex:
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
+    db.commit()
+    return {
+        "ok": True,
+        "abandoned": True,
+        "batch_id": batch_id,
+        "message": f"批次 #{batch_id} 已放弃，不可续传",
     }
 
 

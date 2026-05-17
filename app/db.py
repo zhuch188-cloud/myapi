@@ -122,6 +122,9 @@ def _apply_runtime_schema_migrations(conn) -> None:
     _sqlite_add_column_if_missing(conn, "data_import_batches", "checkpoint_json", "TEXT NULL")
     _sqlite_add_column_if_missing(conn, "data_import_batches", "progress_at", "TEXT NULL")
     _sqlite_add_column_if_missing(conn, "admin_sync_jobs", "checkpoint_json", "TEXT NULL")
+    _sqlite_add_column_if_missing(conn, "admin_sync_jobs", "progress_at", "TEXT NULL")
+    _sqlite_add_column_if_missing(conn, "strategy_update_jobs", "progress_at", "TEXT NULL")
+    _sqlite_add_column_if_missing(conn, "strategy_import_jobs", "progress_at", "TEXT NULL")
     conn.execute(
         text(
             """
@@ -185,13 +188,37 @@ def _apply_date_text_normalization(conn) -> None:
     一次性将业务表日期 TEXT 统一为 YYYY-MM-DD，并去重因格式混用产生的重复行。
     标记 site_settings.schema_dates_iso_v1=1 后不再执行。
     """
-    done = conn.execute(
+    if settings.skip_startup_date_normalization:
+        _log.info("SKIP_STARTUP_DATE_NORMALIZATION=true，跳过启动时日期格式迁移")
+        return
+
+    flag = conn.execute(
         text(
             "SELECT setting_value FROM site_settings WHERE setting_key='schema_dates_iso_v1'"
         )
     ).scalar()
-    if str(done or "").strip() == "1":
+    flag_s = str(flag or "").strip()
+    if flag_s == "1":
         return
+    if flag_s == "running":
+        _log.warning(
+            "上次日期迁移可能因 OOM 中断（schema_dates_iso_v1=running），已跳过自动重试；"
+            "请在本地执行 scripts/normalize_turso_dates.py 后重启"
+        )
+        return
+
+    conn.execute(
+        text(
+            f"""
+            INSERT INTO site_settings (setting_key, setting_value, updated_at)
+            VALUES ('schema_dates_iso_v1', 'running', {sql_now()})
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value='running',
+              updated_at={sql_now()}
+            """
+        )
+    )
+    conn.commit()
 
     rb_iso = sql_date_to_iso_expr("rebalance_date")
     td_iso = sql_date_to_iso_expr("trade_date")

@@ -422,7 +422,7 @@ def get_data_import_batch_row(db: Session, batch_id: int) -> dict[str, Any] | No
 
 def batch_is_resumable(batch: dict[str, Any]) -> bool:
     st = str(batch.get("status") or "").upper()
-    if st == "SUCCESS":
+    if st in ("SUCCESS", "ABANDONED"):
         return False
     resume_from = int(batch.get("resume_from_row") or 0)
     if resume_from <= 0:
@@ -432,6 +432,28 @@ def batch_is_resumable(batch: dict[str, Any]) -> bool:
         return False
     path = (batch.get("source_file_path") or "").strip()
     return bool(path and Path(path).is_file())
+
+
+def abandon_data_import_batch(db: Session, batch_id: int) -> None:
+    batch = get_data_import_batch_row(db, batch_id)
+    if not batch:
+        raise DataImportBatchNotFoundError()
+    if not batch_is_resumable(batch):
+        raise DataImportBatchNotResumableError(
+            f"批次 #{batch_id} 不可放弃（status={batch.get('status')})"
+        )
+    db.execute(
+        text(
+            f"""
+            UPDATE data_import_batches
+            SET status='ABANDONED',
+                checkpoint_json=NULL,
+                message=:m
+            WHERE id=:id
+            """
+        ),
+        {"m": "已放弃，不可续传", "id": batch_id},
+    )
 
 
 def resume_data_import_batch(db: Session, batch_id: int, actor_user_id: int | None) -> dict[str, Any]:
@@ -746,7 +768,7 @@ def import_company_profile_excel(
                     SET status='FAILED', rows_ok=:ok, rows_fail=:fail,
                         resume_from_row=:rr, rows_total=:rt, message=:m,
                         progress_at={sql_now()}
-                    WHERE id=:id
+                    WHERE id=:id AND status <> 'ABANDONED'
                     """
                 ),
                 {

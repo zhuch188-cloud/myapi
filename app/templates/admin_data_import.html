@@ -47,7 +47,7 @@
           支持 <strong>.xlsx / .xls / .xlsm / .csv</strong>。任务在<strong>后台</strong>执行。
           <strong>已扫行</strong> = 文件读到第几行；<strong>写入成功</strong> = 唯一键有效且已入库（≠ 库表总行数，相同键只更新）。
           纯远程 Turso 时单批写入约 0.5～2 分钟，<strong>已扫行/写入成功 暂时不变属正常</strong>，摘会出现「正在写入远程库…」。
-          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，可点<strong>续传</strong>。
+          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，可点<strong>续传</strong>；若不再继续可点<strong>放弃</strong>，该批次不可续传。
           Render 部署请配置 <code>SERVER_UPLOAD_ROOT</code>，先上传再导入（同区写 Turso）。
         </p>
         <div class="row">
@@ -240,7 +240,7 @@
         document.getElementById("uniqueCol").value = defaultUniqueColFromMeta(d);
         refreshServerFileStatus();
       }
-      const TERMINAL_BATCH = new Set(["SUCCESS", "FAILED"]);
+      const TERMINAL_BATCH = new Set(["SUCCESS", "FAILED", "ABANDONED"]);
 
       async function resumeBatch(batchId) {
         const msg = document.getElementById("runMsg");
@@ -248,6 +248,17 @@
           const ret = await api(`/api/admin/data-import/batches/${batchId}/resume`, { method: "POST" });
           msg.textContent = ret.message || `批次 #${batchId} 续传已提交`;
           await pollBatchUntilDone(batchId);
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      async function abandonBatch(batchId) {
+        if (!confirm(`确定放弃批次 #${batchId}？放弃后不可续传。`)) return;
+        const msg = document.getElementById("runMsg");
+        try {
+          const ret = await api(`/api/admin/data-import/batches/${batchId}/abandon`, { method: "POST" });
+          msg.textContent = ret.message || `批次 #${batchId} 已放弃`;
+          await loadBatches();
         } catch (e) {
           msg.textContent = formatFetchError(e);
         }
@@ -277,7 +288,8 @@
             const rr = Number(b.resume_from_row || 0);
             const scanned = rt != null ? `${rr} / ${rt}` : (rr > 0 ? String(rr) : "—");
             const resumeBtn = b.resumable
-              ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="resumeBatch(${b.id})">续传</button>`
+              ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px;margin-right:4px" onclick="resumeBatch(${b.id})">续传</button>`
+                + `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="abandonBatch(${b.id})">放弃</button>`
               : "";
             return `<tr${rowStyle}>
             <td>${b.id}</td>

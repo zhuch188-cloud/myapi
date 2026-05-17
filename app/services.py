@@ -142,15 +142,28 @@ def _strategy_nav_notional_capital() -> float:
     return v if v > 0 else 100_000_000.0
 
 
-def _job_progress(db: Session, job_id: int, message: str, do_commit: bool = True) -> None:
-    """更新任务进度（写入 message，便于前端轮询 / 人工查库）。"""
-    msg = (message or "")[:2000]
+def _job_progress(
+    db: Session,
+    job_id: int,
+    message: str,
+    do_commit: bool = True,
+    *,
+    sync_job_id: int | None = None,
+) -> None:
+    """更新数据更新任务进度（立即 commit，刷新页面可见）。"""
+    msg = (message or "")[:6000]
     db.execute(
         text(
-            "UPDATE strategy_update_jobs SET message=:m WHERE id=:id AND status='RUNNING'"
+            f"""
+            UPDATE strategy_update_jobs
+            SET message=:m, progress_at={sql_now()}
+            WHERE id=:id AND status='RUNNING'
+            """
         ),
         {"m": msg, "id": job_id},
     )
+    if sync_job_id is not None:
+        _admin_sync_job_touch(sync_job_id, "holding_update", msg)
     if do_commit:
         db.commit()
 
@@ -400,6 +413,8 @@ def _run_update_try_build_work_item(
     full_refresh: bool,
     job_id: int,
     do_commit: bool,
+    *,
+    sync_job_id: int | None = None,
 ) -> dict[str, Any] | None:
     """
     若本策略本次 run_update 应跳过或无可处理持仓，返回 None（并已写进度）；
@@ -449,6 +464,7 @@ def _run_update_try_build_work_item(
                 job_id,
                 f"{sid}：增量跳过（行情日={trade_date} 快照已含调仓至 {dh}）",
                 do_commit=do_commit,
+                sync_job_id=sync_job_id,
             )
             return None
     rb_positions, latest_rb, min_rb_date = _group_strategy_positions_by_rebalance(db, sid)
@@ -708,6 +724,7 @@ def _strategy_import_job_touch(
         params["ej"] = json.dumps(errors[:50], ensure_ascii=False)
     if not sets:
         return
+    sets.append(f"progress_at={sql_now()}")
     db.execute(
         text(f"UPDATE strategy_import_jobs SET {', '.join(sets)} WHERE id=:id"),
         params,
@@ -753,7 +770,7 @@ def get_strategy_import_job_row(db: Session, job_id: int) -> dict[str, Any] | No
                 """
                 SELECT id, status, import_mode, strategy_ids_json, completed_strategy_ids_json,
                        imported_count, failed_count, errors_json, message, triggered_by,
-                       created_at, started_at, finished_at
+                       created_at, started_at, finished_at, progress_at
                 FROM strategy_import_jobs
                 WHERE id = :id
                 LIMIT 1
@@ -769,11 +786,73 @@ def get_strategy_import_job_row(db: Session, job_id: int) -> dict[str, Any] | No
 
 def strategy_import_job_is_resumable(job: dict[str, Any]) -> bool:
     st = str(job.get("status") or "").upper()
-    if st == "SUCCESS":
+    if st in ("SUCCESS", "ABANDONED"):
         return False
     all_ids = set(_json_str_list(job.get("strategy_ids_json")))
     done = set(_json_str_list(job.get("completed_strategy_ids_json")))
     return bool(all_ids - done) and st in ("FAILED", "RUNNING", "QUEUED", "PARTIAL")
+
+
+def admin_sync_job_is_resumable(row: dict[str, Any]) -> bool:
+    st = str(row.get("status") or "").upper()
+    if st == "ABANDONED":
+        return False
+    if st != "FAILED":
+        return False
+    try:
+        rj = row.get("result_json")
+        rj_obj = json.loads(rj) if isinstance(rj, str) and rj.strip() else {}
+        return bool(rj_obj.get("resumable") or row.get("checkpoint_json"))
+    except json.JSONDecodeError:
+        return bool(row.get("checkpoint_json"))
+
+
+def abandon_strategy_import_job(db: Session, job_id: int) -> None:
+    job = get_strategy_import_job_row(db, job_id)
+    if not job:
+        raise ValueError("strategy import job not found")
+    if not strategy_import_job_is_resumable(job):
+        raise ValueError("该导入任务不可放弃")
+    db.execute(
+        text(
+            f"""
+            UPDATE strategy_import_jobs
+            SET status='ABANDONED', finished_at={sql_now()}, message=:m
+            WHERE id=:id
+            """
+        ),
+        {"m": "已放弃，不可续传", "id": job_id},
+    )
+
+
+def abandon_admin_sync_job(db: Session, job_id: int) -> None:
+    row = db.execute(
+        text(
+            """
+            SELECT id, status, result_json, checkpoint_json
+            FROM admin_sync_jobs WHERE id=:id
+            """
+        ),
+        {"id": job_id},
+    ).mappings().first()
+    if not row:
+        raise ValueError("sync job not found")
+    d = dict(row)
+    if not admin_sync_job_is_resumable(d):
+        raise ValueError("该同步任务不可放弃")
+    db.execute(
+        text(
+            f"""
+            UPDATE admin_sync_jobs
+            SET status='ABANDONED',
+                checkpoint_json=NULL,
+                finished_at={sql_now()},
+                message=:m
+            WHERE id=:id
+            """
+        ),
+        {"m": "已放弃，不可续传", "id": job_id},
+    )
 
 
 def import_strategy_files(
@@ -839,6 +918,19 @@ def import_strategy_files(
             failed += 1
             errors.append(f"{sid} ({c['file_name']}): 文件不存在: {file_path}")
             continue
+        seq = len(completed) + 1
+        start_msg = (
+            f"阶段1/3 [{seq}/{total_targets}] 正在导入 {sid}（{c.get('file_name') or ''}）…"
+        )
+        if sync_job_id is not None:
+            _admin_sync_job_touch(sync_job_id, "import", start_msg)
+        if strategy_import_job_id is not None:
+            _strategy_import_job_touch(
+                db,
+                int(strategy_import_job_id),
+                message=start_msg,
+                do_commit=do_commit,
+            )
         try:
             df = pd.read_excel(file_path, sheet_name=0)
             label_meta = _excel_meta_strategy_labels(df)
@@ -890,7 +982,12 @@ def import_strategy_files(
                 gc.collect()
             completed.add(sid)
             done_list = sorted(completed)
-            prog_msg = f"导入中… 已完成 {len(completed)}/{total_targets} 个策略（本批新增 {imported_new}）"
+            prog_msg = (
+                f"阶段1/3 [{len(completed)}/{total_targets}] 已完成 {sid}"
+                f"（本批新增 {imported_new}，失败 {failed}）"
+            )
+            if sync_job_id is not None:
+                _admin_sync_job_touch(sync_job_id, "import", prog_msg)
             if sync_job_id is not None:
                 ck_row = (
                     db.execute(
@@ -954,6 +1051,7 @@ def run_update(
     existing_job_id: int | None = None,
     *,
     skip_nav_rebuild: bool = False,
+    sync_job_id: int | None = None,
 ) -> None:
     global _job_running
     if _job_running:
@@ -981,6 +1079,10 @@ def run_update(
 
     wind = None
     wind_merged: dict[str, Any] | None = None
+
+    def prog(msg: str) -> None:
+        _job_progress(db, job_id, msg, do_commit=do_commit, sync_job_id=sync_job_id)
+
     try:
         wind = wind_sql.open_wind(db)
         mtd = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
@@ -1023,44 +1125,44 @@ def run_update(
         src = "远程SQLServer(WindDB)"
         mode_text = "全量重算当日快照" if full_refresh else "增量（默认）"
         scope_text = f"指定策略={len(selected_set)}" if selected_set else "全部启用策略"
-        _job_progress(
-            db,
-            job_id,
-            f"Wind源={src} 最新交易日={trade_date} 模式={mode_text} 范围={scope_text}，待处理策略数={len(configs)}",
-            do_commit=do_commit,
+        prog(
+            f"Wind源={src} 最新交易日={trade_date} 模式={mode_text} 范围={scope_text}，"
+            f"待处理策略数={len(configs)}"
         )
 
         work_items: list[dict[str, Any] | None] = []
         for cfg in configs:
             work_items.append(
                 _run_update_try_build_work_item(
-                    db, cfg, trade_date, full_refresh, job_id, do_commit
+                    db,
+                    cfg,
+                    trade_date,
+                    full_refresh,
+                    job_id,
+                    do_commit,
+                    sync_job_id=sync_job_id,
                 )
             )
         active = [w for w in work_items if w is not None]
+        n_active = len(active)
         if active and not _wind_low_memory_mode():
             n_union = len({c for w in active for c in w["stock_codes"]})
-            _job_progress(
-                db,
-                job_id,
-                f"合并拉取 Wind：{len(active)} 个策略、{n_union} 只不重复股票（EOD+行情+指数一次批量）…",
-                do_commit=do_commit,
+            prog(
+                f"合并拉取 Wind：{n_active} 个策略、{n_union} 只不重复股票（EOD+行情+指数一次批量）…"
             )
             wind, wind_merged = _run_update_prefetch_wind_merged(
                 db, wind, active, str(latest_trade)
             )
         elif active and _wind_low_memory_mode():
-            _job_progress(
-                db,
-                job_id,
-                f"低内存模式：按策略串行拉 Wind（共 {len(active)} 个策略）…",
-                do_commit=do_commit,
-            )
+            prog(f"低内存模式：按策略串行拉 Wind（共 {n_active} 个策略）…")
 
+        i_active = 0
         for wi in work_items:
             if wi is None:
                 continue
+            i_active += 1
             sid = wi["sid"]
+            prog(f"[{i_active}/{n_active}] 策略 {sid}：开始处理…")
             bench_code = wi["bench_code"]
             latest_rb = wi["latest_rb"]
             latest_rb_compact = wi["latest_rb_compact"]
@@ -1078,12 +1180,9 @@ def run_update(
                 full_qu = wind_merged["quote"]
                 quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
             else:
-                _job_progress(
-                    db,
-                    job_id,
-                    f"{sid}：串行拉取 A 股 EOD {len(stock_codes)} 只"
-                    f"{(' + 指数 1 只' if bench_code else '')} × 区间 {start_c}~{latest_trade} …",
-                    do_commit=do_commit,
+                prog(
+                    f"[{i_active}/{n_active}] {sid}：串行拉取 A 股 EOD {len(stock_codes)} 只"
+                    f"{(' + 指数 1 只' if bench_code else '')} × 区间 {start_c}~{latest_trade} …"
                 )
                 wind, eod_by_code = wind_bulk.load_eod_by_code(
                     wind, stock_codes, start_c, str(latest_trade), db
@@ -1095,7 +1194,7 @@ def run_update(
                     )
                 wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
 
-            _job_progress(db, job_id, f"{sid}：共 {n_rb} 个调仓期，准备写入…", do_commit=do_commit)
+            prog(f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期，准备写入…")
             eod_local = eod_by_code if wind_merged is None else None
             td_cmp = _compact_date(trade_date)
             for attempt in range(4):
@@ -1119,12 +1218,7 @@ def run_update(
                     time.sleep(0.25 * (2**attempt))
             for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
                 if not positions:
-                    _job_progress(
-                        db,
-                        job_id,
-                        f"{sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} 无仓位，跳过",
-                        do_commit=do_commit,
-                    )
+                    prog(f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} 无仓位，跳过")
                     continue
 
                 prepared_rows = []
@@ -1250,11 +1344,9 @@ def run_update(
                 # 每期单独提交：后期 Wind/网络异常时，已写入的调仓期不会随大事务回滚丢失
                 if do_commit:
                     db.commit()
-                _job_progress(
-                    db,
-                    job_id,
-                    f"{sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} 已写入 {len(prepared_rows)} 条",
-                    do_commit=do_commit,
+                prog(
+                    f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} "
+                    f"已写入 {len(prepared_rows)} 条"
                 )
 
             if not skip_nav_rebuild:
@@ -1269,11 +1361,9 @@ def run_update(
                                 "idx": wind_merged["idx"],
                                 "td": wind_merged["td"],
                             }
-                        _job_progress(
-                            db,
-                            job_id,
-                            f"{sid}：固定股数全量重算净值（名义本金 {settings.strategy_nav_initial_capital:g} 元）…",
-                            do_commit=do_commit,
+                        prog(
+                            f"[{i_active}/{n_active}] {sid}：固定股数全量重算净值"
+                            f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
                         )
                         _, wind = _rebuild_nav_for_strategy(
                             db,
@@ -1286,12 +1376,7 @@ def run_update(
                         )
                 except Exception as ex_nav:
                     _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
-                    _job_progress(
-                        db,
-                        job_id,
-                        f"{sid}：净值重算失败（已跳过）：{ex_nav}"[:2000],
-                        do_commit=do_commit,
-                    )
+                    prog(f"[{i_active}/{n_active}] {sid}：净值重算失败（已跳过）：{ex_nav}"[:6000])
             if do_commit:
                 db.commit()
             if _wind_low_memory_mode():
@@ -1311,7 +1396,11 @@ def run_update(
             text(
                 "UPDATE strategy_update_jobs SET status='SUCCESS', finished_at=:ft, message=:m WHERE id=:id"
             ),
-            {"ft": now_naive(), "m": "全部完成", "id": job_id},
+            {
+                "ft": now_naive(),
+                "m": f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}）",
+                "id": job_id,
+            },
         )
         if do_commit:
             db.commit()
@@ -1746,9 +1835,17 @@ def rebuild_nav_series(
     failed = 0
     errors: list[str] = []
     completed_nav = sorted(skip)
+    total_nav = len(sids)
     for sid in sids:
         if sid in skip:
             continue
+        nav_seq = len(completed_nav) + 1
+        if sync_job_id is not None:
+            _admin_sync_job_touch(
+                sync_job_id,
+                "nav",
+                f"阶段2/3 净值 [{nav_seq}/{total_nav}] 正在处理 {sid}…",
+            )
         per_bundle: dict[str, Any] | None = None
         try:
             # Turso 远程 Hrana 不支持 SQLAlchemy SAVEPOINT（sa_savepoint_*），勿用 begin_nested。
@@ -1799,11 +1896,22 @@ def rebuild_nav_series(
                         stage="nav",
                         do_commit=False,
                     )
+                    _admin_sync_job_touch(
+                        sync_job_id,
+                        "nav",
+                        f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] 已完成 {sid}（写入 {counted} 条净值日）",
+                    )
             if do_commit:
                 db.commit()
         except Exception as ex:
             failed += 1
             errors.append(f"{sid}: {ex}")
+            if sync_job_id is not None:
+                _admin_sync_job_touch(
+                    sync_job_id,
+                    "nav",
+                    f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] {sid} 失败：{ex}"[:6000],
+                )
             if do_commit:
                 try:
                     db.rollback()
@@ -1832,22 +1940,24 @@ def rebuild_nav_series(
     }, wind
 
 
-def _admin_sync_mark_running(job_id: int) -> None:
+def _admin_sync_mark_running(job_id: int) -> bool:
     from app.db import SessionLocalFactory
 
     db = SessionLocalFactory()
     try:
-        db.execute(
+        cur = db.execute(
             text(
                 f"""
                 UPDATE admin_sync_jobs
-                SET status='RUNNING', started_at={sql_now()}, stage='start', message=:m
-                WHERE id=:id
+                SET status='RUNNING', started_at={sql_now()}, stage='start',
+                    message=:m, progress_at={sql_now()}
+                WHERE id=:id AND status <> 'ABANDONED'
                 """
             ),
             {"m": "后台任务已启动，正在执行…", "id": job_id},
         )
         db.commit()
+        return int(getattr(cur, "rowcount", 0) or 0) > 0
     finally:
         db.close()
 
@@ -1859,9 +1969,9 @@ def _admin_sync_job_touch(job_id: int, stage: str, message: str) -> None:
     try:
         db.execute(
             text(
-                """
+                f"""
                 UPDATE admin_sync_jobs
-                SET stage=:st, message=:msg
+                SET stage=:st, message=:msg, progress_at={sql_now()}
                 WHERE id=:id AND status='RUNNING'
                 """
             ),
@@ -1895,7 +2005,7 @@ def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
                     stage=:sg,
                     message=:sm,
                     result_json=:rj
-                WHERE id=:id
+                WHERE id=:id AND status <> 'ABANDONED'
                 """
             ),
             {
@@ -2139,6 +2249,7 @@ def execute_admin_sync_pipeline(
             selected_strategy_ids=ids,
             do_commit=True,
             skip_nav_rebuild=True,
+            sync_job_id=sync_job_id,
         )
         return {
             "ok": True,
@@ -2177,7 +2288,8 @@ def run_admin_sync_background_task(
 ) -> None:
     """供 FastAPI BackgroundTasks 调用：先标 RUNNING，再跑管道并落库终态。"""
     try:
-        _admin_sync_mark_running(job_id)
+        if not _admin_sync_mark_running(job_id):
+            return
         ret = execute_admin_sync_pipeline(
             username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
         )
@@ -2210,6 +2322,8 @@ def run_strategy_import_background_task(
         job = get_strategy_import_job_row(db, job_id)
         if not job:
             return
+        if str(job.get("status") or "").upper() == "ABANDONED":
+            return
         ids = _json_str_list(job.get("strategy_ids_json"))
         import_mode = str(job.get("import_mode") or "full")
         skip = set(_json_str_list(job.get("completed_strategy_ids_json"))) if resume else set()
@@ -2217,8 +2331,8 @@ def run_strategy_import_background_task(
             text(
                 f"""
                 UPDATE strategy_import_jobs
-                SET status='RUNNING', started_at={sql_now()}, message=:m
-                WHERE id=:id
+                SET status='RUNNING', started_at={sql_now()}, message=:m, progress_at={sql_now()}
+                WHERE id=:id AND status <> 'ABANDONED'
                 """
             ),
             {
@@ -2253,7 +2367,7 @@ def run_strategy_import_background_task(
                 SET status=:st, finished_at={sql_now()}, message=:msg,
                     imported_count=:ic, failed_count=:fc, errors_json=:ej,
                     completed_strategy_ids_json=:cj
-                WHERE id=:id
+                WHERE id=:id AND status <> 'ABANDONED'
                 """
             ),
             {
@@ -2275,7 +2389,7 @@ def run_strategy_import_background_task(
                     f"""
                     UPDATE strategy_import_jobs
                     SET status='FAILED', finished_at={sql_now()}, message=:m
-                    WHERE id=:id
+                    WHERE id=:id AND status <> 'ABANDONED'
                     """
                 ),
                 {"m": f"异常：{str(ex)[:5900]}", "id": job_id},

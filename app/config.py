@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     admin_sync_wait_idle_update_seconds: int = 180
     # Render 免费档等低内存环境：按策略串行拉 Wind 算净值/快照，不合并多策略 EOD（默认开；大内存本机可设 false）
     wind_low_memory_mode: bool = True
+    # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
+    skip_startup_date_normalization: bool = False
 
 
 settings = Settings()
