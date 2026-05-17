@@ -76,6 +76,12 @@ class Settings(BaseSettings):
     admin_sync_wait_idle_update_seconds: int = 180
     # Render 免费档等低内存环境：按策略串行拉 Wind 算净值/快照，不合并多策略 EOD（默认开；大内存本机可设 false）
     wind_low_memory_mode: bool = True
+    # Wind 单次 IN 股票数（默认 80）；大策略/Render 512MB 可改为 40～50 降低峰值内存
+    wind_eod_stock_chunk: int = 0
+    # 策略 Excel 导入：持仓 UPSERT 批大小（减少逐行往返）
+    strategy_import_position_batch_size: int = 500
+    # 净值重建：每 N 个交易日落库一批，避免 nav_accum 与 day_map 同时撑满内存
+    nav_rebuild_persist_chunk: int = 400
     # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
     skip_startup_date_normalization: bool = False
 

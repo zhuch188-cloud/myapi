@@ -199,6 +199,97 @@ def _excel_meta_strategy_labels(df: pd.DataFrame) -> dict[str, str]:
     return out
 
 
+_STRATEGY_EXCEL_REQUIRED_COLS = ("调整日期", "证券代码")
+_STRATEGY_EXCEL_OPTIONAL_COLS = frozenset(
+    {"持仓权重", "行业中性权重", "分类", "策略分类", "调仓频率"}
+)
+
+_POSITION_UPSERT_SQL = text(
+    """
+    INSERT INTO strategy_positions
+    (strategy_id, rebalance_date, stock_code, holding_weight, industry_neutral_weight)
+    VALUES (:sid, :rdate, :scode, :hw, :iw)
+    ON CONFLICT(strategy_id, rebalance_date, stock_code) DO UPDATE SET
+      holding_weight=excluded.holding_weight,
+      industry_neutral_weight=excluded.industry_neutral_weight
+    """
+)
+
+
+def _read_strategy_holdings_excel(
+    file_path: str,
+) -> tuple[dict[str, str], list[tuple[date, str, float | None, float | None]]]:
+    """
+    只读持仓相关列，避免宽表/格式列撑爆内存；解析后释放 DataFrame。
+    """
+    header = pd.read_excel(file_path, sheet_name=0, nrows=0)
+    all_cols = [str(c).strip() for c in header.columns]
+    pick = [
+        c
+        for c in all_cols
+        if c in _STRATEGY_EXCEL_REQUIRED_COLS or c in _STRATEGY_EXCEL_OPTIONAL_COLS
+    ]
+    for need in _STRATEGY_EXCEL_REQUIRED_COLS:
+        if need not in all_cols:
+            raise ValueError(f"缺少列: {need}")
+    read_kw: dict[str, Any] = {"sheet_name": 0, "dtype": object}
+    if pick and len(pick) < len(all_cols):
+        read_kw["usecols"] = pick
+    try:
+        df = pd.read_excel(file_path, engine="calamine", **read_kw)
+    except Exception:
+        df = pd.read_excel(file_path, **read_kw)
+    label_meta = _excel_meta_strategy_labels(df)
+    dt = pd.to_datetime(df["调整日期"], errors="coerce").ffill().bfill()
+    valid = dt.notna() & df["证券代码"].notna()
+    if not bool(valid.any()):
+        raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
+    sub = df.loc[valid]
+    rows: list[tuple[date, str, float | None, float | None]] = []
+    has_hw = "持仓权重" in sub.columns
+    has_iw = "行业中性权重" in sub.columns
+    for idx in sub.index:
+        ts = dt.loc[idx]
+        rebalance = ts.date() if hasattr(ts, "date") else pd.Timestamp(ts).date()
+        code = normalize_code(sub.at[idx, "证券代码"])
+        holding = None
+        if has_hw:
+            v = sub.at[idx, "持仓权重"]
+            if pd.notna(v):
+                holding = float(v)
+        industry_w = None
+        if has_iw:
+            v = sub.at[idx, "行业中性权重"]
+            if pd.notna(v):
+                industry_w = float(v)
+        rows.append((rebalance, code, holding, industry_w))
+    del df, sub, dt, valid, header
+    return label_meta, rows
+
+
+def _import_positions_batch(
+    db: Session,
+    sid: str,
+    write_rows: list[tuple[date, str, float | None, float | None]],
+) -> None:
+    batch = max(50, int(getattr(settings, "strategy_import_position_batch_size", 500)))
+    for i in range(0, len(write_rows), batch):
+        chunk = write_rows[i : i + batch]
+        db.execute(
+            _POSITION_UPSERT_SQL,
+            [
+                {
+                    "sid": sid,
+                    "rdate": rebalance,
+                    "scode": code,
+                    "hw": holding,
+                    "iw": industry_w,
+                }
+                for rebalance, code, holding, industry_w in chunk
+            ],
+        )
+
+
 def _turso_stream_busy(exc: BaseException) -> bool:
     s = str(exc).lower()
     return "stream already in use" in s or "hrana" in s and "400" in s
@@ -595,20 +686,7 @@ def _import_write_positions_one_strategy(
         ).mappings().first()
         max_rb = _row_sql_date(max_row["d"]) if max_row else None
         write_rows = [x for x in rows_to_write if (max_rb is None or x[0] > max_rb)]
-    for rebalance, code, holding, industry_w in write_rows:
-        db.execute(
-            text(
-                """
-                INSERT INTO strategy_positions
-                (strategy_id, rebalance_date, stock_code, holding_weight, industry_neutral_weight)
-                VALUES (:sid, :rdate, :scode, :hw, :iw)
-                ON CONFLICT(strategy_id, rebalance_date, stock_code) DO UPDATE SET
-                  holding_weight=excluded.holding_weight,
-                  industry_neutral_weight=excluded.industry_neutral_weight
-                """
-            ),
-            {"sid": sid, "rdate": rebalance, "scode": code, "hw": holding, "iw": industry_w},
-        )
+    _import_positions_batch(db, sid, write_rows)
     if label_meta:
         keys = list(label_meta.keys())
         sets = ", ".join(f"{k}=:{k}" for k in keys)
@@ -975,32 +1053,7 @@ def import_strategy_files(
                 do_commit=do_commit,
             )
         try:
-            df = pd.read_excel(file_path, sheet_name=0)
-            label_meta = _excel_meta_strategy_labels(df)
-            for col in ("调整日期", "证券代码"):
-                if col not in df.columns:
-                    raise ValueError(f"缺少列: {col}")
-            dt = pd.to_datetime(df["调整日期"], errors="coerce")
-            dt = dt.ffill().bfill()
-            df = df.assign(_rebalance_dt=dt)
-            df = df.loc[df["_rebalance_dt"].notna() & df["证券代码"].notna()].copy()
-            if df.empty:
-                raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
-
-            rows_to_write: list[tuple[date, str, float | None, float | None]] = []
-            for _, row in df.iterrows():
-                ts = row["_rebalance_dt"]
-                rebalance = ts.date() if hasattr(ts, "date") else pd.Timestamp(ts).date()
-                code = normalize_code(row["证券代码"])
-                holding = (
-                    float(row["持仓权重"]) if "持仓权重" in df.columns and pd.notna(row["持仓权重"]) else None
-                )
-                industry_w = (
-                    float(row["行业中性权重"])
-                    if "行业中性权重" in df.columns and pd.notna(row["行业中性权重"])
-                    else None
-                )
-                rows_to_write.append((rebalance, code, holding, industry_w))
+            label_meta, rows_to_write = _read_strategy_holdings_excel(file_path)
 
             for attempt in range(4):
                 try:
@@ -1694,8 +1747,14 @@ def _rebuild_nav_for_strategy(
             pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
             bench_day_map[_compact_date(d)] = (clv, pcv)
 
+    eod_by_code.clear()
+    index_eod_by_code.clear()
+    if _wind_low_memory_mode():
+        gc.collect()
+
     bench_nav_acc: float | None = None
     nav_accum: list[dict[str, Any]] = []
+    nav_persist_chunk = max(100, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
     for attempt in range(4):
         try:
             db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid})
@@ -1799,7 +1858,12 @@ def _rebuild_nav_for_strategy(
                 "rb": current_rb,
             }
         )
-    _flush_strategy_nav_daily_batch(db, nav_accum)
+        if len(nav_accum) >= nav_persist_chunk:
+            _flush_strategy_nav_daily_batch(db, nav_accum)
+            nav_accum.clear()
+    if nav_accum:
+        _flush_strategy_nav_daily_batch(db, nav_accum)
+        nav_accum.clear()
     if _wind_low_memory_mode():
         day_map.clear()
         bench_day_map.clear()

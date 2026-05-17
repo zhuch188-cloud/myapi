@@ -10,11 +10,17 @@ from typing import Any
 from sqlalchemy import text
 
 from app import wind_sql
+from app.config import settings
 
 _log = logging.getLogger(__name__)
 
 # 单次 IN 的股票数；过大时 SQL Server 易在拉取大量日 K 行时断连(10054/SQLGetData)
 EOD_STOCK_CHUNK = 80
+
+
+def eod_stock_chunk_size() -> int:
+    n = int(getattr(settings, "wind_eod_stock_chunk", 0) or 0)
+    return max(20, n) if n > 0 else EOD_STOCK_CHUNK
 _EOD_WIND_MAX_ATTEMPTS = 5
 
 # 单根 K：(TRADE_DT compact, 后复权收盘 S_DQ_ADJCLOSE, 上一交易日后复权收盘作昨收, 不复权收盘 S_DQ_CLOSE)
@@ -136,8 +142,9 @@ def load_eod_by_code(
         segs = [(st_s, td_s)]
     w = wind
     for seg_st, seg_ed in segs:
-        for i in range(0, len(codes), EOD_STOCK_CHUNK):
-            part = codes[i : i + EOD_STOCK_CHUNK]
+        chunk_sz = eod_stock_chunk_size()
+        for i in range(0, len(codes), chunk_sz):
+            part = codes[i : i + chunk_sz]
             quoted = ",".join("'" + str(c).replace("'", "''") + "'" for c in part)
             for attempt in range(_EOD_WIND_MAX_ATTEMPTS):
                 try:
@@ -160,7 +167,7 @@ def load_eod_by_code(
                         seg_st,
                         seg_ed,
                         i,
-                        min(i + EOD_STOCK_CHUNK, len(codes)),
+                        min(i + chunk_sz, len(codes)),
                         attempt + 1,
                         ex,
                     )
@@ -222,8 +229,9 @@ def load_index_eod_by_code(
         segs = [(st_s, td_s)]
     w = wind
     for seg_st, seg_ed in segs:
-        for i in range(0, len(codes), EOD_STOCK_CHUNK):
-            part = codes[i : i + EOD_STOCK_CHUNK]
+        chunk_sz = eod_stock_chunk_size()
+        for i in range(0, len(codes), chunk_sz):
+            part = codes[i : i + chunk_sz]
             quoted = ",".join("'" + str(c).replace("'", "''") + "'" for c in part)
             for attempt in range(_EOD_WIND_MAX_ATTEMPTS):
                 try:
