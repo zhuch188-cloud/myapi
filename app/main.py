@@ -57,6 +57,7 @@ from app.services import (
     get_strategy_import_job_row,
     run_strategy_import_background_task,
     strategy_import_job_is_resumable,
+    latest_rebalance_date_by_strategy,
 )
 from app.supplement_import import (
     CODE_COMPANY_PROFILE_EXCEL,
@@ -3320,13 +3321,16 @@ def list_admin_strategies(user=Depends(require_roles("admin", "editor")), db: Se
     ).mappings().all()
     from app.server_files import strategy_excel_file_status
 
+    latest_rb_map = latest_rebalance_date_by_strategy(db)
     items: list[dict] = []
     for r in rows:
         d = dict(r)
+        sid = str(d.get("strategy_id") or "").strip()
         st = strategy_excel_file_status(d.get("file_dir"), d.get("file_name"))
         d["file_exists"] = bool(st.get("file_exists"))
         d["file_mtime"] = st.get("file_mtime")
         d["file_resolved_path"] = st.get("file_path") or ""
+        d["latest_rebalance_date"] = latest_rb_map.get(sid) or ""
         items.append(d)
     return {"items": items}
 

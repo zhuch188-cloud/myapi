@@ -83,6 +83,34 @@ def _row_sql_date(v: object) -> date | None:
         return None
 
 
+def format_sql_date_display(v: object) -> str:
+    """库内日期 → YYYY-MM-DD 展示；无效则返回空串。"""
+    d = _row_sql_date(v)
+    return d.isoformat() if d else ""
+
+
+def latest_rebalance_date_by_strategy(db: Session) -> dict[str, str]:
+    """各策略在 strategy_positions 中已导入的最大调仓日（最新一期）。"""
+    rows = db.execute(
+        text(
+            """
+            SELECT strategy_id, MAX(rebalance_date) AS latest_rb
+            FROM strategy_positions
+            GROUP BY strategy_id
+            """
+        )
+    ).mappings().all()
+    out: dict[str, str] = {}
+    for r in rows:
+        sid = str(r.get("strategy_id") or "").strip()
+        if not sid:
+            continue
+        disp = format_sql_date_display(r.get("latest_rb"))
+        if disp:
+            out[sid] = disp
+    return out
+
+
 def _adj_close_td_ff(
     day_map: dict[str, dict[str, tuple[float | None, float | None]]],
     sc: str,

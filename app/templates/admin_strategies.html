@@ -147,7 +147,7 @@
         selectedSidSet = new Set();
         strategyMap = new Map(items.map((x) => [String(x.strategy_id || ""), x]));
         document.getElementById("adminCfgTable").innerHTML = `
-          <thead><tr><th>勾选</th><th>可见</th><th>策略ID</th><th>显示名</th><th>分类</th><th>调仓频率</th><th>文件目录</th><th>文件名</th><th>文件存在</th><th>基准代码</th><th>基准名称</th><th>状态</th><th>来源</th><th>备注</th><th>文件时间</th></tr></thead>
+          <thead><tr><th>勾选</th><th>可见</th><th>策略ID</th><th>显示名</th><th>分类</th><th>调仓频率</th><th>文件目录</th><th>文件名</th><th>文件存在</th><th>库内最新调仓日</th><th>基准代码</th><th>基准名称</th><th>状态</th><th>来源</th><th>备注</th><th>文件时间</th></tr></thead>
           <tbody>${items.map(i => {
             const fileOk = !!i.file_exists;
             return `<tr>
@@ -160,6 +160,7 @@
               <td>${esc(i.file_dir||"")}</td>
               <td>${esc(i.file_name||"-")}</td>
               <td style="color:${fileOk ? "#0a7a2f" : "#c62828"}">${fileOk ? "是" : "否"}</td>
+              <td>${esc(i.latest_rebalance_date || "—")}</td>
               <td>${esc(i.benchmark_code||"-")}</td>
               <td>${esc(i.benchmark_name||"-")}</td>
               <td>${esc(i.status||"-")}</td>
