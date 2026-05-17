@@ -5052,9 +5052,16 @@ def admin_list_client_messages(
     k = (kind or "").strip().lower()
     if k and k not in ("contact", "feedback"):
         raise HTTPException(status_code=400, detail="kind must be contact or feedback")
-    items, total = list_client_submissions(
-        db, kind=k or None, limit=limit, offset=offset
-    )
+    try:
+        items, total = list_client_submissions(
+            db, kind=k or None, limit=limit, offset=offset
+        )
+    except Exception as exc:
+        _log.warning("client-messages list failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="留言表尚未初始化，请在仪表盘执行「上线环境初始化」后重试",
+        ) from exc
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
