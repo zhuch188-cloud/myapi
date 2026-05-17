@@ -163,7 +163,9 @@ def _job_progress(
         {"m": msg, "id": job_id},
     )
     if sync_job_id is not None:
-        _admin_sync_job_touch(sync_job_id, "holding_update", msg)
+        _admin_sync_job_touch(
+            sync_job_id, "holding_update", msg, db=db, do_commit=False
+        )
     if do_commit:
         db.commit()
 
@@ -197,6 +199,11 @@ def _excel_meta_strategy_labels(df: pd.DataFrame) -> dict[str, str]:
     return out
 
 
+def _turso_stream_busy(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return "stream already in use" in s or "hrana" in s and "400" in s
+
+
 def _mysql_lock_contention(exc: BaseException) -> bool:
     """库锁等待 / 死锁（MySQL InnoDB 或 SQLite database is locked），可短重试。"""
     if isinstance(exc, OperationalError):
@@ -215,6 +222,7 @@ def _mysql_lock_contention(exc: BaseException) -> bool:
         or "lock wait timeout" in s
         or "deadlock" in s
         or "database is locked" in s
+        or _turso_stream_busy(exc)
     )
 
 
@@ -956,7 +964,9 @@ def import_strategy_files(
             f"阶段1/3 [{seq}/{total_targets}] 正在导入 {sid}（{c.get('file_name') or ''}）…"
         )
         if sync_job_id is not None:
-            _admin_sync_job_touch(sync_job_id, "import", start_msg)
+            _admin_sync_job_touch(
+                sync_job_id, "import", start_msg, db=db, do_commit=do_commit
+            )
         if strategy_import_job_id is not None:
             _strategy_import_job_touch(
                 db,
@@ -1020,7 +1030,9 @@ def import_strategy_files(
                 f"（本批新增 {imported_new}，失败 {failed}）"
             )
             if sync_job_id is not None:
-                _admin_sync_job_touch(sync_job_id, "import", prog_msg)
+                _admin_sync_job_touch(
+                    sync_job_id, "import", prog_msg, db=db, do_commit=False
+                )
             if sync_job_id is not None:
                 ck_row = (
                     db.execute(
@@ -1878,6 +1890,8 @@ def rebuild_nav_series(
                 sync_job_id,
                 "nav",
                 f"阶段2/3 净值 [{nav_seq}/{total_nav}] 正在处理 {sid}…",
+                db=db,
+                do_commit=False,
             )
         per_bundle: dict[str, Any] | None = None
         try:
@@ -1933,6 +1947,8 @@ def rebuild_nav_series(
                         sync_job_id,
                         "nav",
                         f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] 已完成 {sid}（写入 {counted} 条净值日）",
+                        db=db,
+                        do_commit=False,
                     )
             if do_commit:
                 db.commit()
@@ -1944,6 +1960,8 @@ def rebuild_nav_series(
                     sync_job_id,
                     "nav",
                     f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] {sid} 失败：{ex}"[:6000],
+                    db=db,
+                    do_commit=False,
                 )
             if do_commit:
                 try:
@@ -1995,12 +2013,19 @@ def _admin_sync_mark_running(job_id: int) -> bool:
         db.close()
 
 
-def _admin_sync_job_touch(job_id: int, stage: str, message: str) -> None:
-    from app.db import SessionLocalFactory
+def _admin_sync_job_touch(
+    job_id: int,
+    stage: str,
+    message: str,
+    *,
+    db: Session | None = None,
+    do_commit: bool = True,
+) -> None:
+    """更新 admin_sync_jobs 进度。传入 db 时与导入/净值同事务，避免 Turso 双流冲突。"""
+    from app.db import SessionLocalFactory, turso_stream_lock
 
-    db = SessionLocalFactory()
-    try:
-        db.execute(
+    def _run(sess: Session) -> None:
+        sess.execute(
             text(
                 f"""
                 UPDATE admin_sync_jobs
@@ -2010,9 +2035,18 @@ def _admin_sync_job_touch(job_id: int, stage: str, message: str) -> None:
             ),
             {"st": (stage or "")[:64], "msg": (message or "")[:6000], "id": job_id},
         )
-        db.commit()
-    finally:
-        db.close()
+        if do_commit:
+            sess.commit()
+
+    if db is not None:
+        _run(db)
+        return
+    with turso_stream_lock():
+        own = SessionLocalFactory()
+        try:
+            _run(own)
+        finally:
+            own.close()
 
 
 def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
@@ -2070,14 +2104,15 @@ def execute_admin_sync_pipeline(
     if not ids:
         return {"ok": False, "stage": "validate", "failed": 0, "errors": ["strategy_ids 为空"]}
 
-    def p(stage: str, msg: str) -> None:
-        if sync_job_id is not None:
-            _admin_sync_job_touch(sync_job_id, stage, msg)
-
     from app.db import SessionLocalFactory
 
-    p("precheck", "检查僵尸 RUNNING、数据更新任务互斥…")
     db = SessionLocalFactory()
+
+    def p(stage: str, msg: str) -> None:
+        if sync_job_id is not None:
+            _admin_sync_job_touch(sync_job_id, stage, msg, db=db, do_commit=True)
+
+    p("precheck", "检查僵尸 RUNNING、数据更新任务互斥…")
     wind = None
     imp: dict | None = None
     nav_ret: dict | None = None
@@ -2320,27 +2355,30 @@ def run_admin_sync_background_task(
     resume: bool = False,
 ) -> None:
     """供 FastAPI BackgroundTasks 调用：先标 RUNNING，再跑管道并落库终态。"""
-    try:
-        if not _admin_sync_mark_running(job_id):
-            return
-        ret = execute_admin_sync_pipeline(
-            username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
-        )
-        _finalize_admin_sync_job(job_id, ret)
-    except Exception as ex:
-        _log.exception("admin_sync job %s failed", job_id)
-        _finalize_admin_sync_job(
-            job_id,
-            {
-                "ok": False,
-                "stage": "exception",
-                "resumable": True,
-                "imported": 0,
-                "nav_rebuilt": 0,
-                "failed": len(selected_ids),
-                "errors": [str(ex)],
-            },
-        )
+    from app.db import turso_stream_lock
+
+    with turso_stream_lock():
+        try:
+            if not _admin_sync_mark_running(job_id):
+                return
+            ret = execute_admin_sync_pipeline(
+                username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
+            )
+            _finalize_admin_sync_job(job_id, ret)
+        except Exception as ex:
+            _log.exception("admin_sync job %s failed", job_id)
+            _finalize_admin_sync_job(
+                job_id,
+                {
+                    "ok": False,
+                    "stage": "exception",
+                    "resumable": True,
+                    "imported": 0,
+                    "nav_rebuilt": 0,
+                    "failed": len(selected_ids),
+                    "errors": [str(ex)],
+                },
+            )
 
 
 def run_strategy_import_background_task(
@@ -2348,87 +2386,88 @@ def run_strategy_import_background_task(
     *,
     resume: bool = False,
 ) -> None:
-    from app.db import SessionLocalFactory
+    from app.db import SessionLocalFactory, turso_stream_lock
 
-    db = SessionLocalFactory()
-    try:
-        job = get_strategy_import_job_row(db, job_id)
-        if not job:
-            return
-        if str(job.get("status") or "").upper() == "ABANDONED":
-            return
-        ids = _json_str_list(job.get("strategy_ids_json"))
-        import_mode = str(job.get("import_mode") or "full")
-        skip = set(_json_str_list(job.get("completed_strategy_ids_json"))) if resume else set()
-        db.execute(
-            text(
-                f"""
-                UPDATE strategy_import_jobs
-                SET status='RUNNING', started_at={sql_now()}, message=:m, progress_at={sql_now()}
-                WHERE id=:id AND status <> 'ABANDONED'
-                """
-            ),
-            {
-                "m": "续传执行中…" if resume else "后台导入执行中…",
-                "id": job_id,
-            },
-        )
-        db.commit()
-        ret = import_strategy_files(
-            db,
-            selected_strategy_ids=ids,
-            import_mode=import_mode,
-            do_commit=True,
-            skip_strategy_ids=skip,
-            strategy_import_job_id=job_id,
-        )
-        all_ids = set(ids)
-        done = set(ret.get("completed_strategy_ids") or [])
-        ok = all_ids <= done and int(ret.get("failed") or 0) == 0
-        st = "SUCCESS" if ok else "FAILED"
-        if not ok and ret.get("resumable"):
-            st = "FAILED"
-        msg = (
-            f"完成：成功 {len(done)}/{len(all_ids)} 个策略"
-            if ok
-            else f"部分完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」"
-        )
-        db.execute(
-            text(
-                f"""
-                UPDATE strategy_import_jobs
-                SET status=:st, finished_at={sql_now()}, message=:msg,
-                    imported_count=:ic, failed_count=:fc, errors_json=:ej,
-                    completed_strategy_ids_json=:cj
-                WHERE id=:id AND status <> 'ABANDONED'
-                """
-            ),
-            {
-                "st": st,
-                "msg": msg[:6000],
-                "ic": len(done),
-                "fc": int(ret.get("failed") or 0),
-                "ej": json.dumps(ret.get("errors") or [], ensure_ascii=False),
-                "cj": json.dumps(sorted(done), ensure_ascii=False),
-                "id": job_id,
-            },
-        )
-        db.commit()
-    except Exception as ex:
-        _log.exception("strategy_import job %s failed", job_id)
+    with turso_stream_lock():
+        db = SessionLocalFactory()
         try:
+            job = get_strategy_import_job_row(db, job_id)
+            if not job:
+                return
+            if str(job.get("status") or "").upper() == "ABANDONED":
+                return
+            ids = _json_str_list(job.get("strategy_ids_json"))
+            import_mode = str(job.get("import_mode") or "full")
+            skip = set(_json_str_list(job.get("completed_strategy_ids_json"))) if resume else set()
             db.execute(
                 text(
                     f"""
                     UPDATE strategy_import_jobs
-                    SET status='FAILED', finished_at={sql_now()}, message=:m
+                    SET status='RUNNING', started_at={sql_now()}, message=:m, progress_at={sql_now()}
                     WHERE id=:id AND status <> 'ABANDONED'
                     """
                 ),
-                {"m": f"异常：{str(ex)[:5900]}", "id": job_id},
+                {
+                    "m": "续传执行中…" if resume else "后台导入执行中…",
+                    "id": job_id,
+                },
             )
             db.commit()
-        except Exception:
-            db.rollback()
-    finally:
-        db.close()
+            ret = import_strategy_files(
+                db,
+                selected_strategy_ids=ids,
+                import_mode=import_mode,
+                do_commit=True,
+                skip_strategy_ids=skip,
+                strategy_import_job_id=job_id,
+            )
+            all_ids = set(ids)
+            done = set(ret.get("completed_strategy_ids") or [])
+            ok = all_ids <= done and int(ret.get("failed") or 0) == 0
+            st = "SUCCESS" if ok else "FAILED"
+            if not ok and ret.get("resumable"):
+                st = "FAILED"
+            msg = (
+                f"完成：成功 {len(done)}/{len(all_ids)} 个策略"
+                if ok
+                else f"部分完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」"
+            )
+            db.execute(
+                text(
+                    f"""
+                    UPDATE strategy_import_jobs
+                    SET status=:st, finished_at={sql_now()}, message=:msg,
+                        imported_count=:ic, failed_count=:fc, errors_json=:ej,
+                        completed_strategy_ids_json=:cj
+                    WHERE id=:id AND status <> 'ABANDONED'
+                    """
+                ),
+                {
+                    "st": st,
+                    "msg": msg[:6000],
+                    "ic": len(done),
+                    "fc": int(ret.get("failed") or 0),
+                    "ej": json.dumps(ret.get("errors") or [], ensure_ascii=False),
+                    "cj": json.dumps(sorted(done), ensure_ascii=False),
+                    "id": job_id,
+                },
+            )
+            db.commit()
+        except Exception as ex:
+            _log.exception("strategy_import job %s failed", job_id)
+            try:
+                db.execute(
+                    text(
+                        f"""
+                        UPDATE strategy_import_jobs
+                        SET status='FAILED', finished_at={sql_now()}, message=:m
+                        WHERE id=:id AND status <> 'ABANDONED'
+                        """
+                    ),
+                    {"m": f"异常：{str(ex)[:5900]}", "id": job_id},
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+        finally:
+            db.close()

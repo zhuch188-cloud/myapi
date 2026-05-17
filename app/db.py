@@ -1,5 +1,7 @@
 import json
 import logging
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import libsql
@@ -13,6 +15,25 @@ from app.sql_dialect import coerce_bind_parameters, sql_date_to_iso_expr, sql_no
 _log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Turso 远程 Hrana：StaticPool 仅一条 libsql 流，禁止多 Session 并发写
+_turso_stream_lock = threading.RLock()
+
+
+def uses_remote_turso_only() -> bool:
+    return bool((settings.turso_database_url or "").strip()) and not bool(
+        (settings.turso_local_replica or "").strip()
+    )
+
+
+@contextmanager
+def turso_stream_lock():
+    """纯远程 Turso 时串行化 libsql 访问，避免 Stream already in use。"""
+    if uses_remote_turso_only():
+        with _turso_stream_lock:
+            yield
+    else:
+        yield
 
 
 class _LibsqlCursor:
@@ -719,8 +740,9 @@ def get_session():
         if not is_ready():
             raise DatabaseNotReadyError("数据库正在初始化，请约 1～2 分钟后重试")
         raise DatabaseNotReadyError("Database not initialized")
-    db = SessionLocalFactory()
-    try:
-        yield db
-    finally:
-        db.close()
+    with turso_stream_lock():
+        db = SessionLocalFactory()
+        try:
+            yield db
+        finally:
+            db.close()
