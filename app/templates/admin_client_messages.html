@@ -29,18 +29,7 @@
   </head>
   <body>
     <div class="container">
-      <div class="card row nav">
-        <strong>????</strong>
-        <a href="/admin">?????</a>
-        <a href="/admin/strategies">????</a>
-        <a href="/admin/holdings">?????</a>
-        <a href="/admin/nav-check">??</a>
-        <a href="/admin/data-import">????</a>
-        <a href="/admin/users">????</a>
-        <a href="/admin/client-messages">????</a>
-        <button type="button" class="logout-soft" onclick="logout()">??</button>
-        <span id="profile" class="muted"></span>
-      </div>
+      {% include 'partials/admin_nav.html' %}
       <div class="card">
         <h4 style="margin:0 0 10px;">&#21069;&#21488;&#30041;&#35328;&#65288;&#32852;&#31995;&#25105;&#20204; / &#24847;&#35265;&#24314;&#35758;&#65289;</h4>
         <div class="row">
