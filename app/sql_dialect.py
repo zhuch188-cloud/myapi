@@ -40,6 +40,11 @@ def sql_timestampdiff_hours(col: str) -> str:
     return f"(julianday({_NOW_BJ}) - julianday({col})) * 24"
 
 
+def sql_year(col: str) -> str:
+    """从日期/时间列提取四位年份（SQLite/Turso strftime）。"""
+    return f"strftime('%Y', {col})"
+
+
 def quote_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 

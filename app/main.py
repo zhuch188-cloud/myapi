@@ -42,6 +42,7 @@ from app.sql_dialect import (
     sql_minutes_ago,
     sql_now,
     sql_timestampdiff_hours,
+    sql_year,
 )
 from app.mail import send_contact_us_message, send_password_reset_email, smtp_send_test
 from app.client_messages import insert_client_submission, list_client_submissions
@@ -3301,12 +3302,15 @@ def strategy_nav_years(
     db: Session = Depends(get_session),
 ):
     _ = user
+    y_expr = sql_year("trade_date")
     rows = db.execute(
         text(
-            """
-            SELECT DISTINCT YEAR(trade_date) AS y
+            f"""
+            SELECT DISTINCT {y_expr} AS y
             FROM strategy_nav_daily
             WHERE strategy_id=:sid
+              AND trade_date IS NOT NULL
+              AND {y_expr} IS NOT NULL
             ORDER BY y ASC
             """
         ),
@@ -3427,7 +3431,7 @@ def list_admin_strategies(user=Depends(require_roles("admin", "editor")), db: Se
               weight_display_mode, benchmark_code, benchmark_name,
               strategy_intro, strategy_category, rebalance_frequency, status, updated_at
             FROM strategy_configs
-            ORDER BY updated_at DESC, strategy_id ASC
+            ORDER BY strategy_id ASC
             """
         )
     ).mappings().all()

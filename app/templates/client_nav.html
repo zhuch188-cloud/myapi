@@ -597,14 +597,20 @@
         if (sd) q.set("start_date", sd);
         if (ed) q.set("end_date", ed);
         const data = await api(`/api/strategies/${sid}/nav?${q.toString()}`);
+        renderYearButtons(sid);
         const mQ = new URLSearchParams();
         if (sd) mQ.set("start_date", sd);
         if (ed) mQ.set("end_date", ed);
-        const metricsResp = await api(`/api/strategies/${sid}/nav-metrics?${mQ.toString()}`);
-        renderMetrics(metricsResp.metrics || {});
+        let metrics = {};
+        try {
+          const metricsResp = await api(`/api/strategies/${sid}/nav-metrics?${mQ.toString()}`);
+          metrics = metricsResp.metrics || {};
+        } catch (e) {
+          console.warn("nav-metrics failed", e);
+        }
+        renderMetrics(metrics);
         const items = data.items || [];
         let series = Array.isArray(data.chart_series) && data.chart_series.length ? data.chart_series : items;
-        renderYearButtons(sid);
         lastChartSeries = series;
         lastChartMeta = data.meta || {};
         const total = data.total != null ? data.total : items.length;
