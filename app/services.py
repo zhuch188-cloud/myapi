@@ -855,6 +855,39 @@ def abandon_admin_sync_job(db: Session, job_id: int) -> None:
     )
 
 
+def reconcile_stale_admin_sync_jobs(db: Session, *, do_commit: bool = True) -> None:
+    """将长时间无进度更新的 RUNNING/超时 QUEUED 标为 FAILED，便于续传或重新发起。"""
+    stale_mins = max(5, int(getattr(settings, "admin_sync_stale_progress_minutes", 30)))
+    db.execute(
+        text(
+            f"""
+            UPDATE admin_sync_jobs
+            SET status='FAILED', finished_at={sql_now()},
+                message=COALESCE(message, '') || '（超过 ' || CAST(:mins AS TEXT)
+                    || ' 分钟无进度更新，已标失败；可点续传）'
+            WHERE status='RUNNING'
+              AND COALESCE(progress_at, started_at, created_at)
+                  < {sql_minutes_ago(':mins')}
+            """
+        ),
+        {"mins": stale_mins},
+    )
+    db.execute(
+        text(
+            f"""
+            UPDATE admin_sync_jobs
+            SET status='FAILED', finished_at={sql_now()},
+                message='排队超时（未在 2 分钟内启动），请重试或续传'
+            WHERE status='QUEUED'
+              AND created_at < {sql_minutes_ago(':qmins')}
+            """
+        ),
+        {"qmins": 2},
+    )
+    if do_commit:
+        db.commit()
+
+
 def import_strategy_files(
     db: Session,
     selected_strategy_ids: list[str] | None = None,

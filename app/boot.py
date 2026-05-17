@@ -67,6 +67,26 @@ def _clear_stale_jobs() -> None:
                 """
             )
         )
+        db.execute(
+            text(
+                f"""
+                UPDATE admin_sync_jobs
+                SET status='FAILED', finished_at={sql_now()},
+                    message=COALESCE(message, '') || '（服务重启：同步中断，已标失败；有断点可点续传）'
+                WHERE status IN ('RUNNING', 'QUEUED')
+                """
+            )
+        )
+        db.execute(
+            text(
+                f"""
+                UPDATE strategy_import_jobs
+                SET status='FAILED', finished_at={sql_now()},
+                    message=COALESCE(message, '') || '（服务重启：导入中断，已标失败；可点续传）'
+                WHERE status IN ('RUNNING', 'QUEUED')
+                """
+            )
+        )
         db.commit()
     finally:
         db.close()

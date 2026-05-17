@@ -67,6 +67,7 @@ from app.services import (
     admin_sync_job_is_resumable,
     abandon_strategy_import_job,
     abandon_admin_sync_job,
+    reconcile_stale_admin_sync_jobs,
     latest_rebalance_date_by_strategy,
 )
 from app.supplement_import import (
@@ -3759,29 +3760,21 @@ def admin_sync(
     if want_sync:
         return execute_admin_sync_pipeline(username, ids, import_mode, sync_job_id=None)
 
-    # 清理僵尸：长时间仍为 RUNNING 的同步任务（进程崩溃等）
+    # 清理僵尸：无进度更新或排队超时（进程崩溃、Render 重启等）
+    reconcile_stale_admin_sync_jobs(db, do_commit=False)
     db.execute(
         text(
-            """
+            f"""
             UPDATE admin_sync_jobs
             SET status='FAILED', finished_at=datetime('now', '+8 hours'),
-                message=COALESCE(message, '') || '（僵尸RUNNING：后台未正常结束，已自动标记失败）'
+                message=COALESCE(message, '') || '（僵尸RUNNING：started_at 超过 '
+                    || CAST(:mins AS TEXT) || ' 分钟，已自动标记失败）'
             WHERE status='RUNNING'
               AND started_at IS NOT NULL
-              AND started_at < datetime('now', printf('-%d minutes', :mins))
+              AND started_at < {sql_minutes_ago(':mins')}
             """
         ),
         {"mins": sync_stale_mins},
-    )
-    # 排队过久仍未被 worker 接起的任务
-    db.execute(
-        text(
-            """
-            UPDATE admin_sync_jobs
-            SET status='FAILED', finished_at=datetime('now', '+8 hours'), message='排队超时（未在 2 分钟内启动），请重试'
-            WHERE status='QUEUED' AND created_at < datetime('now', '-2 minutes')
-            """
-        )
     )
     db.commit()
 
@@ -3843,6 +3836,7 @@ def admin_list_sync_jobs(
     _ = user
     if limit < 1 or limit > 100:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
+    reconcile_stale_admin_sync_jobs(db)
     rows = db.execute(
         text(
             """
@@ -3870,6 +3864,7 @@ def admin_get_sync_job(
     db: Session = Depends(get_session),
 ):
     _ = user
+    reconcile_stale_admin_sync_jobs(db)
     row = db.execute(
         text(
             """
