@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -478,13 +479,48 @@ def _run_update_try_build_work_item(
     }
 
 
+def _wind_low_memory_mode() -> bool:
+    return bool(getattr(settings, "wind_low_memory_mode", True))
+
+
+def _release_wind_memory(*bundles: dict[str, Any] | None) -> None:
+    for wb in bundles:
+        if not wb:
+            continue
+        for key in ("eod", "idx", "quote"):
+            part = wb.get(key)
+            if isinstance(part, dict):
+                part.clear()
+        wb.clear()
+    gc.collect()
+
+
+def _load_wind_bundle_for_nav_plan(
+    wind: Any,
+    db: Session,
+    plan: dict[str, Any],
+    latest_trade_c: str,
+) -> tuple[Any, dict[str, Any]]:
+    """单策略净值：仅拉本策略股票+基准+交易日历（低内存串行）。"""
+    codes = sorted(plan["code_set"])
+    start_c = str(plan["start_c"])
+    bench = str(plan.get("bench_code") or "").strip().upper()
+    lt = str(latest_trade_c).strip()
+    wind, eod = wind_bulk.load_eod_by_code(wind, codes, start_c, lt, db)
+    idx: dict[str, list] = {}
+    if bench:
+        wind, idx = wind_bulk.load_index_eod_by_code(wind, [bench], start_c, lt, db)
+    wind, td = wind_bulk.fetch_trade_date_compacts(wind, db, start_c, lt)
+    return wind, {"eod": eod, "idx": idx, "td": td}
+
+
 def _run_update_prefetch_wind_merged(
     db: Session,
     wind: Any,
     work_items: list[dict[str, Any]],
     latest_trade_compact: str,
 ) -> tuple[Any, dict[str, Any] | None]:
-    """对本轮待处理策略合并拉取 Wind EOD / 指数 / 行情，减少 SQL Server 往返。"""
+    """对本轮待处理策略合并拉取 Wind EOD / 指数 / 行情，减少 SQL Server 往返（低内存模式不调用）。"""
     union_codes: set[str] = set()
     union_bench: set[str] = set()
     global_st: str | None = None
@@ -849,6 +885,9 @@ def import_strategy_files(
                     time.sleep(0.25 * (2**attempt))
 
             imported_new += 1
+            del df, rows_to_write
+            if _wind_low_memory_mode():
+                gc.collect()
             completed.add(sid)
             done_list = sorted(completed)
             prog_msg = f"导入中… 已完成 {len(completed)}/{total_targets} 个策略（本批新增 {imported_new}）"
@@ -913,6 +952,8 @@ def run_update(
     selected_strategy_ids: list[str] | None = None,
     do_commit: bool = True,
     existing_job_id: int | None = None,
+    *,
+    skip_nav_rebuild: bool = False,
 ) -> None:
     global _job_running
     if _job_running:
@@ -939,6 +980,7 @@ def run_update(
             db.commit()
 
     wind = None
+    wind_merged: dict[str, Any] | None = None
     try:
         wind = wind_sql.open_wind(db)
         mtd = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
@@ -996,8 +1038,7 @@ def run_update(
                 )
             )
         active = [w for w in work_items if w is not None]
-        wind_merged: dict[str, Any] | None = None
-        if active:
+        if active and not _wind_low_memory_mode():
             n_union = len({c for w in active for c in w["stock_codes"]})
             _job_progress(
                 db,
@@ -1007,6 +1048,13 @@ def run_update(
             )
             wind, wind_merged = _run_update_prefetch_wind_merged(
                 db, wind, active, str(latest_trade)
+            )
+        elif active and _wind_low_memory_mode():
+            _job_progress(
+                db,
+                job_id,
+                f"低内存模式：按策略串行拉 Wind（共 {len(active)} 个策略）…",
+                do_commit=do_commit,
             )
 
         for wi in work_items:
@@ -1033,7 +1081,7 @@ def run_update(
                 _job_progress(
                     db,
                     job_id,
-                    f"{sid}：批量拉取 A 股 EOD {len(stock_codes)} 只"
+                    f"{sid}：串行拉取 A 股 EOD {len(stock_codes)} 只"
                     f"{(' + 指数 1 只' if bench_code else '')} × 区间 {start_c}~{latest_trade} …",
                     do_commit=do_commit,
                 )
@@ -1048,6 +1096,7 @@ def run_update(
                 wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
 
             _job_progress(db, job_id, f"{sid}：共 {n_rb} 个调仓期，准备写入…", do_commit=do_commit)
+            eod_local = eod_by_code if wind_merged is None else None
             td_cmp = _compact_date(trade_date)
             for attempt in range(4):
                 try:
@@ -1208,42 +1257,55 @@ def run_update(
                     do_commit=do_commit,
                 )
 
-            try:
-                plans1 = _batch_nav_mysql_plans(db, [sid], "full")
-                pl1 = plans1.get(sid)
-                if pl1:
-                    wb = None
-                    if wind_merged is not None and wind_merged.get("td"):
-                        wb = {
-                            "eod": wind_merged["eod"],
-                            "idx": wind_merged["idx"],
-                            "td": wind_merged["td"],
-                        }
+            if not skip_nav_rebuild:
+                try:
+                    plans1 = _batch_nav_mysql_plans(db, [sid], "full")
+                    pl1 = plans1.get(sid)
+                    if pl1:
+                        wb = None
+                        if wind_merged is not None and wind_merged.get("td"):
+                            wb = {
+                                "eod": wind_merged["eod"],
+                                "idx": wind_merged["idx"],
+                                "td": wind_merged["td"],
+                            }
+                        _job_progress(
+                            db,
+                            job_id,
+                            f"{sid}：固定股数全量重算净值（名义本金 {settings.strategy_nav_initial_capital:g} 元）…",
+                            do_commit=do_commit,
+                        )
+                        _, wind = _rebuild_nav_for_strategy(
+                            db,
+                            wind,
+                            sid,
+                            "full",
+                            latest_trade_c_cached=str(latest_trade),
+                            mysql_plan=pl1,
+                            wind_bundle=wb,
+                        )
+                except Exception as ex_nav:
+                    _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
                     _job_progress(
                         db,
                         job_id,
-                        f"{sid}：固定股数全量重算净值（名义本金 {settings.strategy_nav_initial_capital:g} 元）…",
+                        f"{sid}：净值重算失败（已跳过）：{ex_nav}"[:2000],
                         do_commit=do_commit,
                     )
-                    _, wind = _rebuild_nav_for_strategy(
-                        db,
-                        wind,
-                        sid,
-                        "full",
-                        latest_trade_c_cached=str(latest_trade),
-                        mysql_plan=pl1,
-                        wind_bundle=wb,
-                    )
-            except Exception as ex_nav:
-                _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
-                _job_progress(
-                    db,
-                    job_id,
-                    f"{sid}：净值重算失败（已跳过）：{ex_nav}"[:2000],
-                    do_commit=do_commit,
-                )
             if do_commit:
                 db.commit()
+            if _wind_low_memory_mode():
+                if eod_local is not None:
+                    eod_local.clear()
+                if isinstance(index_eod_by_code, dict):
+                    index_eod_by_code.clear()
+                if isinstance(quote_map, dict):
+                    quote_map.clear()
+                gc.collect()
+
+        if wind_merged is not None:
+            _release_wind_memory(wind_merged)
+            wind_merged = None
 
         db.execute(
             text(
@@ -1262,6 +1324,8 @@ def run_update(
         _mark_update_job_failed(db, job_id, _format_update_job_failure_message(ex), do_commit)
         raise
     finally:
+        if wind_merged is not None:
+            _release_wind_memory(wind_merged)
         if wind is not None:
             wind_sql.close_wind(wind, db)
         _job_running = False
@@ -1602,6 +1666,13 @@ def _rebuild_nav_for_strategy(
             }
         )
     _flush_strategy_nav_daily_batch(db, nav_accum)
+    if _wind_low_memory_mode():
+        day_map.clear()
+        bench_day_map.clear()
+        nav_accum.clear()
+        shares.clear()
+        last_close_fill.clear()
+        gc.collect()
     return True, wind
 
 
@@ -1618,8 +1689,8 @@ def rebuild_nav_series(
     """
     导入后同步重建净值：固定股数、收盘调仓，按交易日生成 strategy_nav_daily。返回 (结果字典, 当前 Wind 连接)。
 
-    优化：① 全区间只查一次 Wind 最新交易日；② MySQL 持仓/配置按策略批量预取；③ 合并所有策略涉及的股票与指数，
-    一次性拉 EOD / 交易日历（减少 SQL Server 往返）；④ 净值日序列对 MySQL 使用 executemany 批量写入。
+    低内存模式（wind_low_memory_mode）：按策略串行拉 Wind EOD/指数/日历，算完即释放，适合 Render 免费档。
+    否则合并多策略一次性拉 EOD（本机大内存、减少 SQL Server 往返）。
     mode 为 incremental/full 时均对涉及策略全量重写净值（名义本金见 settings.strategy_nav_initial_capital）。
     """
     mode_l = str(mode or "incremental").strip().lower()
@@ -1642,32 +1713,33 @@ def rebuild_nav_series(
         latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
     plans = _batch_nav_mysql_plans(db, sids, mode_l)
-    union_codes: set[str] = set()
-    union_bench: set[str] = set()
-    global_st: str | None = None
-    for _sid, pl in plans.items():
-        for c in pl["code_set"]:
-            union_codes.add(c)
-        bc = str(pl.get("bench_code") or "").strip().upper()
-        if bc:
-            union_bench.add(bc)
-        st = pl["start_c"]
-        if global_st is None or st < global_st:
-            global_st = st
-
+    low_mem = _wind_low_memory_mode()
     wind_bundle: dict[str, Any] | None = None
-    if global_st and union_codes:
-        wind, eod_all = wind_bulk.load_eod_by_code(
-            wind, sorted(union_codes), global_st, latest_trade_c, db
-        )
-        if union_bench:
-            wind, idx_all = wind_bulk.load_index_eod_by_code(
-                wind, sorted(union_bench), global_st, latest_trade_c, db
+    if not low_mem:
+        union_codes: set[str] = set()
+        union_bench: set[str] = set()
+        global_st: str | None = None
+        for _sid, pl in plans.items():
+            for c in pl["code_set"]:
+                union_codes.add(c)
+            bc = str(pl.get("bench_code") or "").strip().upper()
+            if bc:
+                union_bench.add(bc)
+            st = pl["start_c"]
+            if global_st is None or st < global_st:
+                global_st = st
+        if global_st and union_codes:
+            wind, eod_all = wind_bulk.load_eod_by_code(
+                wind, sorted(union_codes), global_st, latest_trade_c, db
             )
-        else:
-            idx_all = {}
-        wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, latest_trade_c)
-        wind_bundle = {"eod": eod_all, "idx": idx_all, "td": td_all}
+            if union_bench:
+                wind, idx_all = wind_bulk.load_index_eod_by_code(
+                    wind, sorted(union_bench), global_st, latest_trade_c, db
+                )
+            else:
+                idx_all = {}
+            wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, latest_trade_c)
+            wind_bundle = {"eod": eod_all, "idx": idx_all, "td": td_all}
 
     skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
     done = len(skip)
@@ -1677,10 +1749,22 @@ def rebuild_nav_series(
     for sid in sids:
         if sid in skip:
             continue
+        per_bundle: dict[str, Any] | None = None
         try:
             # Turso 远程 Hrana 不支持 SQLAlchemy SAVEPOINT（sa_savepoint_*），勿用 begin_nested。
             pl = plans.get(sid)
-            if pl:
+            if pl and low_mem:
+                wind, per_bundle = _load_wind_bundle_for_nav_plan(wind, db, pl, latest_trade_c)
+                counted, wind = _rebuild_nav_for_strategy(
+                    db,
+                    wind,
+                    sid,
+                    mode_l,
+                    latest_trade_c_cached=latest_trade_c,
+                    mysql_plan=pl,
+                    wind_bundle=per_bundle,
+                )
+            elif pl:
                 counted, wind = _rebuild_nav_for_strategy(
                     db,
                     wind,
@@ -1734,6 +1818,9 @@ def rebuild_nav_series(
                     wind = wind_sql.open_wind(db)
                 except Exception:
                     pass
+        finally:
+            _release_wind_memory(per_bundle)
+    _release_wind_memory(wind_bundle)
     if do_commit:
         db.commit()
     return {
@@ -1993,6 +2080,7 @@ def execute_admin_sync_pipeline(
         if wind is not None:
             wind_sql.close_wind(wind, db)
             wind = None
+        gc.collect()
     except Exception as ex:
         try:
             db.rollback()
@@ -2050,6 +2138,7 @@ def execute_admin_sync_pipeline(
             full_refresh=True,
             selected_strategy_ids=ids,
             do_commit=True,
+            skip_nav_rebuild=True,
         )
         return {
             "ok": True,

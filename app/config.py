@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     stale_running_update_job_minutes: int = 240
     # 同步最后一步 run_update 前，若 _job_running 为真则轮询等待的最大秒数（定时/其它请求可能正占用）；0=不等待直接失败
     admin_sync_wait_idle_update_seconds: int = 180
+    # Render 免费档等低内存环境：按策略串行拉 Wind 算净值/快照，不合并多策略 EOD（默认开；大内存本机可设 false）
+    wind_low_memory_mode: bool = True
 
 
 settings = Settings()
