@@ -328,7 +328,7 @@ def _run_update_try_build_work_item(
         ),
         {"sid": sid},
     ).mappings().first()
-    last_td = last_row["d"] if last_row else None
+    last_td = _row_sql_date(last_row["d"]) if last_row else None
     if (not full_refresh) and last_td is not None and last_td >= trade_date:
         rb_pos_row = db.execute(
             text("SELECT MAX(rebalance_date) AS m FROM strategy_positions WHERE strategy_id=:sid"),
@@ -470,7 +470,7 @@ def _import_write_positions_one_strategy(
             ),
             {"sid": sid},
         ).mappings().first()
-        max_rb = max_row["d"] if max_row else None
+        max_rb = _row_sql_date(max_row["d"]) if max_row else None
         write_rows = [x for x in rows_to_write if (max_rb is None or x[0] > max_rb)]
     for rebalance, code, holding, industry_w in write_rows:
         db.execute(
