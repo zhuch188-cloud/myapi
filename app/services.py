@@ -327,8 +327,61 @@ _HOLDING_INSERT_SQL = text(
       :period_weight, :latest_weight, :latest_price, :last_1d_pct, :period_return,
       :ret_5d, :ret_20d, :ret_60d, :ret_ytd, :market_cap, :industry_name, :pe, :pb
     )
+    ON CONFLICT(strategy_id, trade_date, rebalance_date, stock_code) DO UPDATE SET
+      stock_name=excluded.stock_name,
+      period_weight=excluded.period_weight,
+      latest_weight=excluded.latest_weight,
+      latest_price=excluded.latest_price,
+      last_1d_pct=excluded.last_1d_pct,
+      period_return=excluded.period_return,
+      ret_5d=excluded.ret_5d,
+      ret_20d=excluded.ret_20d,
+      ret_60d=excluded.ret_60d,
+      ret_ytd=excluded.ret_ytd,
+      market_cap=excluded.market_cap,
+      industry_name=excluded.industry_name,
+      pe=excluded.pe,
+      pb=excluded.pb
     """
 )
+
+
+def _group_strategy_positions_by_rebalance(
+    db: Session, sid: str
+) -> tuple[list[tuple[date, list[dict[str, Any]]]], date | None, date | None]:
+    """
+    按日历调仓日合并 strategy_positions（避免 TEXT 格式混用导致 DISTINCT 重复、写入 UNIQUE 冲突）。
+    返回 (rb_positions 升序, 最新调仓日, 最早调仓日)。
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT rebalance_date, stock_code, holding_weight, industry_neutral_weight
+            FROM strategy_positions
+            WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": sid},
+    ).mappings().all()
+    by_rd: dict[date, dict[str, dict[str, Any]]] = {}
+    for r in rows:
+        rd = _row_sql_date(r["rebalance_date"])
+        if rd is None:
+            continue
+        sc = str(r.get("stock_code") or "").strip()
+        if not sc:
+            continue
+        wk = _wind_code_key(sc)
+        by_rd.setdefault(rd, {})[wk] = {
+            "stock_code": sc,
+            "holding_weight": r.get("holding_weight"),
+            "industry_neutral_weight": r.get("industry_neutral_weight"),
+        }
+    if not by_rd:
+        return [], None, None
+    rb_sorted = sorted(by_rd.keys())
+    rb_positions = [(rd, list(by_rd[rd].values())) for rd in rb_sorted]
+    return rb_positions, rb_sorted[-1], rb_sorted[0]
 
 
 def _flush_strategy_holding_daily_batch(db: Session, rows: list[dict[str, Any]]) -> None:
@@ -373,15 +426,17 @@ def _run_update_try_build_work_item(
             ),
             {"sid": sid},
         ).mappings().first()
+        td_cmp = _compact_date(trade_date)
         rb_hold_row = db.execute(
             text(
                 f"""
                 SELECT {sql_max_date_expr("rebalance_date")} AS m
                 FROM strategy_holding_daily
-                WHERE strategy_id=:sid AND trade_date=:td
+                WHERE strategy_id=:sid
+                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
                 """
             ),
-            {"sid": sid, "td": trade_date},
+            {"sid": sid, "td_cmp": td_cmp},
         ).mappings().first()
         mx_pos = rb_pos_row.get("m") if rb_pos_row else None
         mx_hold = rb_hold_row.get("m") if rb_hold_row else None
@@ -395,48 +450,17 @@ def _run_update_try_build_work_item(
                 do_commit=do_commit,
             )
             return None
-    rebalance_rows = db.execute(
-        text(
-            f"""
-            SELECT DISTINCT rebalance_date
-            FROM strategy_positions
-            WHERE strategy_id=:sid
-            ORDER BY {sql_order_date_desc("rebalance_date")}
-            """
-        ),
-        {"sid": sid},
-    ).mappings().all()
-    if not rebalance_rows:
-        return None
-    latest_rb = _row_sql_date(rebalance_rows[0]["rebalance_date"])
-    if latest_rb is None:
+    rb_positions, latest_rb, min_rb_date = _group_strategy_positions_by_rebalance(db, sid)
+    if not rb_positions or latest_rb is None or min_rb_date is None:
         return None
     latest_rb_compact = _compact_date(latest_rb)
-    rb_positions: list = []
     code_keys: set[str] = set()
-    min_rb_date: date | None = None
-    for rb in rebalance_rows:
-        rebalance = _row_sql_date(rb["rebalance_date"])
-        if rebalance is None:
-            continue
-        if min_rb_date is None or rebalance < min_rb_date:
-            min_rb_date = rebalance
-        positions = db.execute(
-            text(
-                """
-                SELECT stock_code, holding_weight, industry_neutral_weight
-                FROM strategy_positions
-                WHERE strategy_id=:sid AND rebalance_date=:rd
-                """
-            ),
-            {"sid": sid, "rd": rebalance},
-        ).mappings().all()
-        rb_positions.append((rebalance, positions))
+    for _, positions in rb_positions:
         for p in positions:
             if p.get("stock_code"):
                 code_keys.add(_wind_code_key(p["stock_code"]))
     stock_codes = sorted(code_keys)
-    if not stock_codes or min_rb_date is None:
+    if not stock_codes:
         return None
     start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
     return {
@@ -446,7 +470,7 @@ def _run_update_try_build_work_item(
         "trade_date": trade_date,
         "latest_rb": latest_rb,
         "latest_rb_compact": latest_rb_compact,
-        "n_rb": len(rebalance_rows),
+        "n_rb": len(rb_positions),
         "rb_positions": rb_positions,
         "stock_codes": stock_codes,
         "min_rb_date": min_rb_date,
@@ -1024,16 +1048,18 @@ def run_update(
                 wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
 
             _job_progress(db, job_id, f"{sid}：共 {n_rb} 个调仓期，准备写入…", do_commit=do_commit)
+            td_cmp = _compact_date(trade_date)
             for attempt in range(4):
                 try:
                     db.execute(
                         text(
-                            """
+                            f"""
                             DELETE FROM strategy_holding_daily
-                            WHERE strategy_id = :sid AND trade_date = :td
+                            WHERE strategy_id = :sid
+                              AND {sql_date_compact_expr("trade_date")} = :td_cmp
                             """
                         ),
-                        {"sid": sid, "td": trade_date},
+                        {"sid": sid, "td_cmp": td_cmp},
                     )
                     break
                 except OperationalError as oe:
@@ -1166,7 +1192,12 @@ def run_update(
                             1.0 + (row["period_return"] if row["period_return"] is not None else 0.0)
                         )
                         row["latest_weight"] = drift / base
-                _flush_strategy_holding_daily_batch(db, [dict(r) for r in prepared_rows])
+                deduped: dict[str, dict[str, Any]] = {}
+                for row in prepared_rows:
+                    sc = str(row.get("stock_code") or "").strip()
+                    if sc:
+                        deduped[_wind_code_key(sc)] = dict(row)
+                _flush_strategy_holding_daily_batch(db, list(deduped.values()))
                 # 每期单独提交：后期 Wind/网络异常时，已写入的调仓期不会随大事务回滚丢失
                 if do_commit:
                     db.commit()

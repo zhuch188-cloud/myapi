@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 import libsql
@@ -7,7 +8,9 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.config import settings
-from app.sql_dialect import coerce_bind_parameters, sql_now
+from app.sql_dialect import coerce_bind_parameters, sql_date_to_iso_expr, sql_now
+
+_log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -174,6 +177,104 @@ def _apply_runtime_schema_migrations(conn) -> None:
             "ON client_feedback_submissions (kind, created_at)"
         )
     )
+    _apply_date_text_normalization(conn)
+
+
+def _apply_date_text_normalization(conn) -> None:
+    """
+    一次性将业务表日期 TEXT 统一为 YYYY-MM-DD，并去重因格式混用产生的重复行。
+    标记 site_settings.schema_dates_iso_v1=1 后不再执行。
+    """
+    done = conn.execute(
+        text(
+            "SELECT setting_value FROM site_settings WHERE setting_key='schema_dates_iso_v1'"
+        )
+    ).scalar()
+    if str(done or "").strip() == "1":
+        return
+
+    rb_iso = sql_date_to_iso_expr("rebalance_date")
+    td_iso = sql_date_to_iso_expr("trade_date")
+
+    conn.execute(
+        text(f"UPDATE strategy_positions SET rebalance_date = {rb_iso} WHERE rebalance_date IS NOT NULL")
+    )
+    conn.execute(
+        text(
+            """
+            DELETE FROM strategy_positions
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM strategy_positions
+                GROUP BY strategy_id, rebalance_date, stock_code
+            )
+            """
+        )
+    )
+
+    conn.execute(
+        text(
+            f"""
+            UPDATE strategy_holding_daily
+            SET trade_date = {td_iso},
+                rebalance_date = {rb_iso}
+            WHERE trade_date IS NOT NULL AND rebalance_date IS NOT NULL
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            DELETE FROM strategy_holding_daily
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM strategy_holding_daily
+                GROUP BY strategy_id, trade_date, rebalance_date, stock_code
+            )
+            """
+        )
+    )
+
+    conn.execute(
+        text(
+            f"""
+            UPDATE strategy_nav_daily
+            SET trade_date = {td_iso},
+                rebalance_date = CASE
+                    WHEN rebalance_date IS NULL OR TRIM(rebalance_date) = '' THEN rebalance_date
+                    ELSE {rb_iso}
+                END
+            WHERE trade_date IS NOT NULL
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            DELETE FROM strategy_nav_daily
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM strategy_nav_daily
+                GROUP BY strategy_id, trade_date
+            )
+            """
+        )
+    )
+
+    usage_iso = sql_date_to_iso_expr("usage_date")
+    conn.execute(
+        text(f"UPDATE user_usage_daily SET usage_date = {usage_iso} WHERE usage_date IS NOT NULL")
+    )
+
+    conn.execute(
+        text(
+            f"""
+            INSERT INTO site_settings (setting_key, setting_value, updated_at)
+            VALUES ('schema_dates_iso_v1', '1', {sql_now()})
+            ON CONFLICT(setting_key) DO UPDATE SET
+              setting_value='1',
+              updated_at={sql_now()}
+            """
+        )
+    )
+    _log.info("Turso date columns normalized to YYYY-MM-DD (schema_dates_iso_v1)")
 
 
 def init_database() -> None:
