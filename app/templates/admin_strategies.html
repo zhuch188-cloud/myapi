@@ -49,7 +49,7 @@
       <div class="card">
         <h4>新增/更新策略配置</h4>
         <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.45;">
-          单条：填写 <code>strategy_id</code>，或<strong>仅勾选 1 个策略</strong>后上传。批量：文件名与 CSV 中 <code>file_name</code> 一致即可自动匹配。成功后 <code>file_dir</code> 为 <code>strategies/策略ID</code>。
+          单条上传：若策略列表中已有相同 <code>file_name</code>（或与文件名主干一致的 <code>strategy_id</code>），无需填写 strategy_id；否则须先填写 strategy_id。也可<strong>仅勾选 1 个策略</strong>后上传。批量：按配置表 <code>file_name</code> 自动匹配。
         </p>
         <div class="row">
           <input id="strategyDataUploadFile" type="file" accept=".xlsx,.xls,.xlsm" style="display:none" />
@@ -336,12 +336,49 @@
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-      function resolveUploadStrategyId() {
+      function uploadFilenameStem(name) {
+        const base = String(name || "").trim().replace(/\\/g, "/").split("/").pop() || "";
+        const dot = base.lastIndexOf(".");
+        return dot > 0 ? base.slice(0, dot) : base;
+      }
+      /** 与后端 batch 上传一致：先匹配配置 file_name，再匹配文件名主干=strategy_id */
+      function matchStrategyIdForUploadFilename(filename) {
+        const fn = String(filename || "").trim().replace(/\\/g, "/").split("/").pop() || "";
+        if (!fn) return "";
+        const items = Array.from(strategyMap.values());
+        const byName = new Map();
+        const byNameLower = new Map();
+        for (const c of items) {
+          const k = String(c.file_name || "").trim();
+          const sid = String(c.strategy_id || "").trim();
+          if (!k || !sid) continue;
+          byName.set(k, sid);
+          byNameLower.set(k.toLowerCase(), sid);
+        }
+        if (byName.has(fn)) return byName.get(fn);
+        const sidLower = byNameLower.get(fn.toLowerCase());
+        if (sidLower) return sidLower;
+        const stem = uploadFilenameStem(fn);
+        if (stem && strategyMap.has(stem)) return stem;
+        return "";
+      }
+      function resolveUploadStrategyId(uploadFilename) {
         let sid = (document.getElementById("strategy_id").value || "").trim();
         if (sid) return sid;
         const ids = selectedStrategyIds();
         if (ids.length === 1) return ids[0];
+        if (uploadFilename) return matchStrategyIdForUploadFilename(uploadFilename);
         return "";
+      }
+      function applyMatchedStrategyToForm(sid, uploadFilename) {
+        if (!sid) return;
+        const idEl = document.getElementById("strategy_id");
+        if (!(idEl.value || "").trim()) idEl.value = sid;
+        const it = strategyMap.get(sid);
+        const fnEl = document.getElementById("file_name");
+        if (!(fnEl.value || "").trim()) {
+          fnEl.value = (it && it.file_name) ? String(it.file_name) : (uploadFilename || "");
+        }
       }
       async function normalizeUploadPaths() {
         const msg = document.getElementById("msg");
@@ -375,14 +412,19 @@
       }
       async function uploadStrategyDataFile() {
         const msg = document.getElementById("msg");
-        const sid = resolveUploadStrategyId();
         const f = document.getElementById("strategyDataUploadFile").files && document.getElementById("strategyDataUploadFile").files[0];
-        if (!sid) { msg.textContent = "请填写 strategy_id，或在列表中仅勾选 1 个策略"; return; }
         if (!f) { msg.textContent = "请先选择 Excel 文件"; return; }
+        const sid = resolveUploadStrategyId(f.name);
+        if (!sid) {
+          msg.textContent = `未在策略列表中匹配到「${f.name}」，请填写 strategy_id 后再上传`;
+          document.getElementById("strategy_id").focus();
+          return;
+        }
+        applyMatchedStrategyToForm(sid, f.name);
         const fd = new FormData();
         fd.append("file", f);
         try {
-          msg.textContent = "上传中…";
+          msg.textContent = `上传中…（策略 ${sid}）`;
           const res = await fetch("/api/admin/strategies/" + encodeURIComponent(sid) + "/upload-data-file", {
             method: "POST",
             headers: authHeaders({}),
