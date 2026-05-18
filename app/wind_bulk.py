@@ -21,9 +21,9 @@ EOD_STOCK_CHUNK = 80
 def eod_stock_chunk_size() -> int:
     n = int(getattr(settings, "wind_eod_stock_chunk", 0) or 0)
     if n > 0:
-        return max(20, n)
+        return max(4, min(n, EOD_STOCK_CHUNK))
     if bool(getattr(settings, "wind_low_memory_mode", True)):
-        return 10
+        return 8
     return EOD_STOCK_CHUNK
 _EOD_WIND_MAX_ATTEMPTS = 5
 
@@ -420,6 +420,32 @@ def close_n_trading_days_ago(desc_closes_newest_first: list[float], n: int) -> f
     if v <= 0:
         return None
     return v
+
+
+def last_close_on_or_before(
+    series_asc: list[WindEodQuad], end_compact: str
+) -> float | None:
+    """升序序列中，TRADE_DT <= end_compact 的最后一个有效复权收盘价（含调仓/段末日当日）。"""
+    ec = str(end_compact).replace("-", "")[:8].zfill(8)
+    last: float | None = None
+    for d, cl, _, _ in series_asc:
+        if _dt_compact(d) > ec:
+            continue
+        if isinstance(cl, float) and cl != cl:
+            continue
+        v = float(cl)
+        if v <= 0:
+            continue
+        last = v
+    return last
+
+
+def series_on_or_before(
+    series_asc: list[WindEodQuad], end_compact: str
+) -> list[WindEodQuad]:
+    """保留 TRADE_DT <= end_compact 的 K 线（持有段内序列，含段末日）。"""
+    ec = str(end_compact).replace("-", "")[:8].zfill(8)
+    return [row for row in series_asc if _dt_compact(row[0]) <= ec]
 
 
 def last_close_before_calendar_date(

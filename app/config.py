@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     wind_low_memory_mode: bool = True
     # Wind 单次 IN 股票数（默认 80）；Render 512MB 建议 10～15（低内存未设时默认 15）
     wind_eod_stock_chunk: int = 0
-    # 低内存：数据更新按「调仓期 × 股票小批」拉 EOD，避免千只股票全历史一次进内存
+    # 低内存：数据更新按「每个调仓期 × 该期成分股小批」拉 EOD 并立即落库（峰值≈单期持仓，Wind 重复读可接受）
     update_eod_per_rebalance_chunk: bool = True
     # 策略 Excel 导入：持仓 UPSERT 批大小（减少逐行往返）
     strategy_import_position_batch_size: int = 500

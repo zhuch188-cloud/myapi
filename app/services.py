@@ -684,6 +684,19 @@ def _flush_strategy_holding_daily_batch(db: Session, rows: list[dict[str, Any]])
         db.execute(_HOLDING_INSERT_SQL, chunk)
 
 
+def _holding_period_end_compact(
+    next_rebalance: date | None,
+    latest_trade: str | date,
+) -> str | None:
+    """
+    本期持有段末日（含）：有下一调仓日用其日历日（按该日收盘价换仓），否则 None 表示截至 latest_trade。
+    收益与短周期指标取 [本期调仓日, 段末日] 闭区间内的后复权价。
+    """
+    if next_rebalance is not None:
+        return _compact_date(next_rebalance)
+    return None
+
+
 def _build_holding_daily_row_from_wind(
     *,
     sid: str,
@@ -693,6 +706,7 @@ def _build_holding_daily_row_from_wind(
     quote_map: dict[str, Any],
     eod_series: list,
     latest_trade: str,
+    period_end_compact: str | None = None,
 ) -> dict[str, Any]:
     """由 Wind 行情 + 单股 EOD 序列生成 strategy_holding_daily 一行（不含 latest_weight）。"""
     scode = p["stock_code"]
@@ -722,19 +736,44 @@ def _build_holding_daily_row_from_wind(
     latest_price = float(quote["latest_price"] or 0.0)
     prev_close = float(quote["prev_close"] or 0.0)
     lt_compact = str(latest_trade).strip().replace("-", "")[:8]
-    day_ret = wind_bulk.day_return_adj_for_asof(eod_series, lt_compact)
-    if day_ret is None:
-        day_ret = _safe_return(latest_price, prev_close)
-    desc_closes = wind_bulk.closes_desc_from_asc(eod_series, 280)
-    latest_adj = desc_closes[0] if desc_closes else None
+    rb_compact_this = _compact_date(rebalance)
+    period_start_close = wind_bulk.first_close_on_or_after(eod_series, rb_compact_this)
+
+    if period_end_compact:
+        asof_c = period_end_compact
+        seg = wind_bulk.series_on_or_before(eod_series, asof_c)
+        period_end_px = wind_bulk.last_close_on_or_before(eod_series, asof_c)
+        period_ret = _safe_return(period_end_px, period_start_close)
+        day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
+        desc_closes = wind_bulk.closes_desc_from_asc(seg, 280)
+        px = (
+            period_end_px
+            if period_end_px is not None and period_end_px > 0
+            else (desc_closes[0] if desc_closes else None)
+        )
+        end_year = int(asof_c[:4])
+        ytd_close = wind_bulk.last_close_before_calendar_date(
+            seg, f"{end_year}0101"
+        )
+        row_price = px
+    else:
+        asof_c = lt_compact
+        day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
+        if day_ret is None:
+            day_ret = _safe_return(latest_price, prev_close)
+        desc_closes = wind_bulk.closes_desc_from_asc(eod_series, 280)
+        latest_adj = desc_closes[0] if desc_closes else None
+        px = latest_adj if (latest_adj is not None and latest_adj > 0) else latest_price
+        period_ret = _safe_return(px, period_start_close)
+        ytd_close = wind_bulk.last_close_before_calendar_date(
+            eod_series, f"{trade_date.year}0101"
+        )
+        row_price = latest_price if latest_price > 0 else px
+
     close_5 = wind_bulk.close_n_trading_days_ago(desc_closes, 5)
     close_20 = wind_bulk.close_n_trading_days_ago(desc_closes, 20)
     close_60 = wind_bulk.close_n_trading_days_ago(desc_closes, 60)
-    ytd_close = wind_bulk.last_close_before_calendar_date(eod_series, f"{trade_date.year}0101")
-    rb_compact_this = _compact_date(rebalance)
-    period_start_close = wind_bulk.first_close_on_or_after(eod_series, rb_compact_this)
-    px = latest_adj if (latest_adj is not None and latest_adj > 0) else latest_price
-    period_ret = _safe_return(px, period_start_close)
+
     return {
         "strategy_id": sid,
         "trade_date": trade_date,
@@ -742,7 +781,7 @@ def _build_holding_daily_row_from_wind(
         "stock_code": scode,
         "stock_name": quote["stock_name"],
         "period_weight": period_weight,
-        "latest_price": latest_price if latest_price > 0 else None,
+        "latest_price": row_price if row_price and float(row_price) > 0 else None,
         "last_1d_pct": day_ret,
         "period_return": period_ret,
         "ret_5d": _safe_return(px, close_5),
@@ -1139,9 +1178,9 @@ def _sync_mark_update_rb_done(sync_job_id: int, rb_compact: str) -> None:
 def _effective_eod_chunk_size(n_stocks: int) -> int:
     base = wind_bulk.eod_stock_chunk_size()
     if n_stocks > 800:
-        return min(base, 10)
+        return min(base, 8)
     if n_stocks > 400:
-        return min(base, 12)
+        return min(base, 10)
     return base
 
 
@@ -1662,11 +1701,9 @@ def run_update(
                 full_qu = wind_merged["quote"]
                 quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
             elif rb_chunked_eod:
-                chunk_n = _effective_eod_chunk_size(len(stock_codes))
                 prog(
-                    f"[{i_active}/{n_active}] {sid}：低内存按股票分批 EOD"
-                    f"（约 {max(1, (len(stock_codes) + chunk_n - 1) // chunk_n)} 批 × "
-                    f"{n_rb} 个调仓期，共 {len(stock_codes)} 只成分）…"
+                    f"[{i_active}/{n_active}] {sid}：低内存按调仓期串行 EOD"
+                    f"（{n_rb} 期 × 每期成分小批；全策略 {len(stock_codes)} 只去重）…"
                 )
             else:
                 prog(
@@ -1731,9 +1768,14 @@ def run_update(
                     _sync_mark_update_rb_done(sync_job_id, rb_compact)
 
             if rb_chunked_eod:
-                # 按股票分批只拉一次 EOD，再扫全部调仓期（避免 125 期 × 16 批重复拉同一股票）
-                active_rb: list[tuple[int, Any, list, str, float]] = []
+                # 按调仓期：只拉该期成分股 EOD，凑齐一期即算权重并落库（峰值内存≈单期行数+一小批 K 线）
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                    next_rebalance = (
+                        rb_positions[i_rb][0] if i_rb < len(rb_positions) else None
+                    )
+                    period_end_c = _holding_period_end_compact(
+                        next_rebalance, latest_trade
+                    )
                     if not positions:
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
@@ -1747,55 +1789,66 @@ def run_update(
                             f"已跳过（断点已完成）"
                         )
                         continue
-                    tw = sum(max(float(p["holding_weight"] or 0.0), 0.0) for p in positions)
-                    active_rb.append((i_rb, rebalance, positions, rb_compact, tw))
-
-                chunk_sz = _effective_eod_chunk_size(len(stock_codes))
-                n_chunks = max(1, (len(stock_codes) + chunk_sz - 1) // chunk_sz)
-                prog(
-                    f"[{i_active}/{n_active}] {sid}：EOD {n_chunks} 批 × "
-                    f"{len(active_rb)} 个调仓期（{len(stock_codes)} 只股票，{start_c}~{latest_trade}）…"
-                )
-                rows_by_rb: dict[int, list[dict[str, Any]]] = {t[0]: [] for t in active_rb}
-                for ci in range(0, len(stock_codes), chunk_sz):
-                    part = stock_codes[ci : ci + chunk_sz]
-                    part_set = set(part)
-                    cno = ci // chunk_sz + 1
-                    prog(
-                        f"[{i_active}/{n_active}] {sid}：EOD 批次 {cno}/{n_chunks}（{len(part)} 只）…"
+                    total_weight = sum(
+                        max(float(p["holding_weight"] or 0.0), 0.0) for p in positions
                     )
+                    period_codes = sorted(
+                        {
+                            _wind_code_key(p["stock_code"])
+                            for p in positions
+                            if p.get("stock_code")
+                        }
+                    )
+                    if not period_codes:
+                        prog(
+                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
+                            f"调仓日 {rebalance} 无有效代码，跳过"
+                        )
+                        continue
+                    # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
+                    period_start_c = wind_bulk.bulk_eod_start_compact(trade_date, rebalance)
+                    eod_load_end_c = period_end_c or str(latest_trade)
+                    prog(
+                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} "
+                        f"拉 EOD+行情 {len(period_codes)} 只（{period_start_c}~{eod_load_end_c}）…"
+                    )
+                    if sync_job_id is not None:
+                        _admin_sync_job_touch(
+                            sync_job_id,
+                            "update",
+                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
+                            f"调仓 {rebalance} EOD {len(period_codes)} 只…",
+                            do_commit=True,
+                        )
+                    prepared_rows: list[dict[str, Any]] = []
                     wind, quote_part = _fetch_wind_quote_map_batched(
-                        db, wind, part, latest_trade
+                        db, wind, period_codes, latest_trade
                     )
                     wind, eod_part = wind_bulk.load_eod_by_code(
-                        wind, part, start_c, str(latest_trade), db
+                        wind, period_codes, period_start_c, eod_load_end_c, db
                     )
-                    for i_rb, rebalance, positions, _rb_c, _tw in active_rb:
-                        for p in positions:
-                            wk = _wind_code_key(p["stock_code"])
-                            if wk not in part_set:
-                                continue
-                            rows_by_rb[i_rb].append(
-                                _build_holding_daily_row_from_wind(
-                                    sid=sid,
-                                    trade_date=trade_date,
-                                    rebalance=rebalance,
-                                    p=p,
-                                    quote_map=quote_part,
-                                    eod_series=eod_part.get(wk, []),
-                                    latest_trade=str(latest_trade),
-                                )
+                    for p in positions:
+                        wk = _wind_code_key(p["stock_code"])
+                        prepared_rows.append(
+                            _build_holding_daily_row_from_wind(
+                                sid=sid,
+                                trade_date=trade_date,
+                                rebalance=rebalance,
+                                p=p,
+                                quote_map=quote_part,
+                                eod_series=eod_part.get(wk, []),
+                                latest_trade=str(latest_trade),
+                                period_end_compact=period_end_c,
                             )
+                        )
                     quote_part.clear()
                     eod_part.clear()
                     del eod_part
                     gc.collect()
-
-                for i_rb, rebalance, _positions, rb_compact, total_weight in active_rb:
                     _flush_one_rebalance(
-                        i_rb, rebalance, rows_by_rb[i_rb], total_weight, rb_compact
+                        i_rb, rebalance, prepared_rows, total_weight, rb_compact
                     )
-                    rows_by_rb[i_rb] = []
+                    prepared_rows.clear()
             else:
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
                     if not positions:
@@ -1811,6 +1864,12 @@ def run_update(
                             f"已跳过（断点已完成）"
                         )
                         continue
+                    next_rebalance = (
+                        rb_positions[i_rb][0] if i_rb < len(rb_positions) else None
+                    )
+                    period_end_c = _holding_period_end_compact(
+                        next_rebalance, latest_trade
+                    )
 
                     prepared_rows = []
                     total_weight = 0.0
@@ -1826,6 +1885,7 @@ def run_update(
                                 quote_map=quote_map,
                                 eod_series=eod_by_code.get(wk, []),
                                 latest_trade=str(latest_trade),
+                                period_end_compact=period_end_c,
                             )
                         )
                     _flush_one_rebalance(
