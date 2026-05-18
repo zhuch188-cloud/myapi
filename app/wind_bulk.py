@@ -20,7 +20,11 @@ EOD_STOCK_CHUNK = 80
 
 def eod_stock_chunk_size() -> int:
     n = int(getattr(settings, "wind_eod_stock_chunk", 0) or 0)
-    return max(20, n) if n > 0 else EOD_STOCK_CHUNK
+    if n > 0:
+        return max(20, n)
+    if bool(getattr(settings, "wind_low_memory_mode", True)):
+        return 30
+    return EOD_STOCK_CHUNK
 _EOD_WIND_MAX_ATTEMPTS = 5
 
 # 单根 K：(TRADE_DT compact, 后复权收盘 S_DQ_ADJCLOSE, 上一交易日后复权收盘作昨收, 不复权收盘 S_DQ_CLOSE)
@@ -104,6 +108,37 @@ def _year_compact_segments(st_compact: str, td_compact: str) -> list[tuple[str, 
         seg_ed = min(td, f"{y4}1231")
         if seg_st <= seg_ed:
             out.append((seg_st, seg_ed))
+    return out if out else [(st, td)]
+
+
+def month_compact_segments(
+    st_compact: str, td_compact: str, *, step_months: int = 3
+) -> list[tuple[str, str]]:
+    """将 [st,td] 按 N 个自然月拆段，用于净值重建降低 day_map 峰值（Render 低内存）。"""
+    st = str(st_compact).strip()[:8]
+    td = str(td_compact).strip()[:8]
+    step = max(1, int(step_months))
+    if len(st) < 8 or len(td) < 8:
+        return [(st, td)]
+    if st > td:
+        return []
+    cur = datetime.strptime(st, "%Y%m%d").date()
+    end = datetime.strptime(td, "%Y%m%d").date()
+    out: list[tuple[str, str]] = []
+    while cur <= end:
+        y, m = cur.year, cur.month
+        em = m + step - 1
+        ey = y
+        while em > 12:
+            em -= 12
+            ey += 1
+        if em == 12:
+            seg_end_d = date(ey, 12, 31)
+        else:
+            seg_end_d = date(ey, em + 1, 1) - timedelta(days=1)
+        seg_end_d = min(seg_end_d, end)
+        out.append((cur.strftime("%Y%m%d"), seg_end_d.strftime("%Y%m%d")))
+        cur = seg_end_d + timedelta(days=1)
     return out if out else [(st, td)]
 
 

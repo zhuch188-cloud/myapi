@@ -1810,6 +1810,72 @@ def _eod_dict_to_day_map(
     return day_map
 
 
+def _nav_eod_time_segments(start_c: str, latest_trade_c: str) -> list[tuple[str, str]]:
+    months = int(getattr(settings, "nav_rebuild_eod_months", 3) or 0)
+    if months > 0:
+        return wind_bulk.month_compact_segments(start_c, latest_trade_c, step_months=months)
+    return wind_bulk._year_compact_segments(start_c, latest_trade_c)
+
+
+def _codes_for_nav_segment(
+    rb_map: dict[date, list[tuple[str, float]]],
+    shares: dict[str, float],
+    seg_ed_compact: str,
+) -> list[str]:
+    """仅拉截至本段末日已出现过的成分股 + 当前持仓股，避免全历史成分一次性进 day_map。"""
+    end_d = datetime.strptime(str(seg_ed_compact).strip()[:8], "%Y%m%d").date()
+    codes: set[str] = {c for c in shares if c}
+    for rb_d, holdings in rb_map.items():
+        if rb_d <= end_d:
+            for c, _w in holdings:
+                if c:
+                    codes.add(c)
+    return sorted(codes)
+
+
+def _merge_eod_into_day_map(
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    eod_part: dict[str, list],
+) -> None:
+    for c, series in eod_part.items():
+        dct: dict[str, tuple[float | None, float | None]] = {}
+        for d, cl, pc, _raw in series:
+            clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
+            pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
+            dct[_compact_date(d)] = (clv, pcv)
+        day_map[c] = dct
+
+
+def _load_segment_wind_maps(
+    wind: Any,
+    db: Session,
+    codes: list[str],
+    seg_st: str,
+    seg_ed: str,
+    bench_code: str,
+) -> tuple[Any, dict[str, dict[str, tuple[float | None, float | None]]], dict[str, tuple[float | None, float | None]]]:
+    """按股票小批拉 EOD 并入 day_map，避免一次 load 全成分。"""
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]] = {}
+    chunk_sz = wind_bulk.eod_stock_chunk_size()
+    for i in range(0, len(codes), chunk_sz):
+        part = codes[i : i + chunk_sz]
+        if not part:
+            continue
+        wind, eod_part = wind_bulk.load_eod_by_code(wind, part, seg_st, seg_ed, db)
+        _merge_eod_into_day_map(day_map, eod_part)
+        eod_part.clear()
+        if _wind_low_memory_mode():
+            gc.collect()
+    bench_day_map: dict[str, tuple[float | None, float | None]] = {}
+    if bench_code:
+        wind, index_eod_by_code = wind_bulk.load_index_eod_by_code(
+            wind, [bench_code], seg_st, seg_ed, db
+        )
+        bench_day_map = _index_eod_to_bench_day_map(index_eod_by_code, bench_code)
+        index_eod_by_code.clear()
+    return wind, day_map, bench_day_map
+
+
 def _index_eod_to_bench_day_map(
     index_eod_by_code: dict[str, list], bench_code: str
 ) -> dict[str, tuple[float | None, float | None]]:
@@ -1832,17 +1898,17 @@ def _rebuild_nav_for_strategy_yearly(
     start_c: str,
     latest_trade_c: str,
     ic0: float,
+    *,
+    sync_job_id: int | None = None,
 ) -> tuple[bool, Any]:
-    """低内存：按自然年分段拉 EOD，避免全区间 day_map 一次占满内存。"""
-    codes_for_eod = sorted({c for holdings in rb_map.values() for c, _ in holdings if c})
-    if not codes_for_eod:
-        return False, wind
+    """低内存：按时间分段 + 股票小批拉 EOD，避免全历史成分 day_map 一次占满内存。"""
     wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, start_c, latest_trade_c)
     trade_days_all = [d for d in td_all if d >= start_c]
     if not trade_days_all:
         return False, wind
 
-    nav_persist_chunk = max(100, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
+    nav_persist_chunk = max(50, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
+    time_segs = _nav_eod_time_segments(start_c, latest_trade_c)
     for attempt in range(4):
         try:
             db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid})
@@ -1862,25 +1928,37 @@ def _rebuild_nav_for_strategy_yearly(
     bench_nav_acc: float | None = 1.0 if bench_code else None
     nav_accum: list[dict[str, Any]] = []
     first_trade_day = True
+    td_i = 0
 
-    for seg_st, seg_ed in wind_bulk._year_compact_segments(start_c, latest_trade_c):
+    for seg_i, (seg_st, seg_ed) in enumerate(time_segs, start=1):
         seg_days = [d for d in trade_days_all if seg_st <= d <= seg_ed]
         if not seg_days:
             continue
-        wind, eod_by_code = wind_bulk.load_eod_by_code(
-            wind, codes_for_eod, seg_st, seg_ed, db
-        )
-        index_eod_by_code: dict[str, list] = {}
-        if bench_code:
-            wind, index_eod_by_code = wind_bulk.load_index_eod_by_code(
-                wind, [bench_code], seg_st, seg_ed, db
+        seg_codes = _codes_for_nav_segment(rb_map, shares, seg_ed)
+        if not seg_codes:
+            continue
+        if sync_job_id is not None:
+            _admin_sync_job_touch(
+                sync_job_id,
+                "nav",
+                f"阶段2/3 {sid}：行情段 {seg_i}/{len(time_segs)}（{seg_st}~{seg_ed}，{len(seg_codes)} 只股票）…",
+                db=db,
+                do_commit=True,
             )
-        day_map = _eod_dict_to_day_map(eod_by_code)
-        bench_day_map = _index_eod_to_bench_day_map(index_eod_by_code, bench_code)
-        eod_by_code.clear()
-        index_eod_by_code.clear()
+        wind, day_map, bench_day_map = _load_segment_wind_maps(
+            wind, db, seg_codes, seg_st, seg_ed, bench_code
+        )
 
         for td in seg_days:
+            td_i += 1
+            if sync_job_id is not None and td_i % 40 == 0:
+                _admin_sync_job_touch(
+                    sync_job_id,
+                    "nav",
+                    f"阶段2/3 {sid}：净值计算中 {td}（段 {seg_i}/{len(time_segs)}）…",
+                    db=db,
+                    do_commit=True,
+                )
             rb_idx_at_start = rb_idx
             td_date = datetime.strptime(td, "%Y%m%d").date()
             while rb_idx + 1 < len(rb_sorted) and rb_sorted[rb_idx + 1] <= td_date:
@@ -1989,6 +2067,7 @@ def _rebuild_nav_for_strategy(
     latest_trade_c_cached: str | None = None,
     mysql_plan: dict[str, Any] | None = None,
     wind_bundle: dict[str, Any] | None = None,
+    sync_job_id: int | None = None,
 ) -> tuple[bool, Any]:
     """
     单策略净值重建。固定股数、调仓日按收盘复权价满仓再平衡。
@@ -2081,7 +2160,15 @@ def _rebuild_nav_for_strategy(
         and bool(getattr(settings, "nav_rebuild_year_segments", True))
     ):
         return _rebuild_nav_for_strategy_yearly(
-            db, wind, sid, rb_map, bench_code, start_c, latest_trade_c, ic0
+            db,
+            wind,
+            sid,
+            rb_map,
+            bench_code,
+            start_c,
+            latest_trade_c,
+            ic0,
+            sync_job_id=sync_job_id,
         )
 
     codes_for_eod = sorted(code_set)
@@ -2335,6 +2422,7 @@ def rebuild_nav_series(
                     latest_trade_c_cached=latest_trade_c,
                     mysql_plan=pl,
                     wind_bundle=None,
+                    sync_job_id=sync_job_id,
                 )
             elif pl:
                 counted, wind = _rebuild_nav_for_strategy(
@@ -2345,10 +2433,16 @@ def rebuild_nav_series(
                     latest_trade_c_cached=latest_trade_c,
                     mysql_plan=pl,
                     wind_bundle=wind_bundle,
+                    sync_job_id=sync_job_id,
                 )
             else:
                 counted, wind = _rebuild_nav_for_strategy(
-                    db, wind, sid, mode_l, latest_trade_c_cached=latest_trade_c
+                    db,
+                    wind,
+                    sid,
+                    mode_l,
+                    latest_trade_c_cached=latest_trade_c,
+                    sync_job_id=sync_job_id,
                 )
             if counted:
                 done += 1
