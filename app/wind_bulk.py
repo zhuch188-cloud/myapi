@@ -92,12 +92,21 @@ def _wind_transient_disconnect(exc: BaseException) -> bool:
     return "connection" in s and ("forcibly closed" in s or "broken pipe" in s)
 
 
-def eod_range_segments(st_compact: str, td_compact: str) -> list[tuple[str, str]]:
-    """低内存 + nav_rebuild_eod_months>0 时按月分段，否则按自然年。"""
+def eod_range_segments(
+    st_compact: str,
+    td_compact: str,
+    *,
+    step_months: int | None = None,
+) -> list[tuple[str, str]]:
+    """低内存净值重建：step_months>0 时按月分段；否则读配置；再否则按自然年。"""
     st = str(st_compact).strip()[:8]
     td = str(td_compact).strip()[:8]
-    months = int(getattr(settings, "nav_rebuild_eod_months", 0) or 0)
+    months = int(step_months) if step_months is not None else 0
+    if months <= 0:
+        months = int(getattr(settings, "nav_rebuild_eod_months", 0) or 0)
     if months > 0 and bool(getattr(settings, "wind_low_memory_mode", True)):
+        return month_compact_segments(st, td, step_months=months)
+    if months > 0:
         return month_compact_segments(st, td, step_months=months)
     return _year_compact_segments(st, td)
 

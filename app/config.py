@@ -91,8 +91,12 @@ class Settings(BaseSettings):
     nav_rebuild_persist_chunk: int = 400
     # 低内存下分段拉 Wind EOD 算净值（避免全区间 day_map 一次驻留）
     nav_rebuild_year_segments: bool = True
-    # 净值 EOD 时间分段：>0 时按 N 个自然月一段（Render 512MB 建议 1）；0 则按自然年
-    nav_rebuild_eod_months: int = 1
+    # 净值 EOD 动态分段：最新一期成分股数 × 每段月数 <= budget（阶段2 开算前按 CL1 最新期成分重算）
+    nav_rebuild_stock_month_budget: int = 300
+    # 动态月数上限（0=不设顶，仅受 budget 约束）；对应环境变量 NAV_REBUILD_EOD_MONTHS_MAX
+    nav_rebuild_eod_months_max: int = 0
+    # 兼容旧配置：>0 且未设 MAX 时作为动态月数上限；不再固定为每段 1 个月
+    nav_rebuild_eod_months: int = 0
     # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
     skip_startup_date_normalization: bool = False
     # 管理端 API 等待 Turso 流锁的最长时间（秒）；全量同步跑净值时其它接口可能排队

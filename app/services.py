@@ -2071,8 +2071,39 @@ def _eod_dict_to_day_map(
     return day_map
 
 
-def _nav_eod_time_segments(start_c: str, latest_trade_c: str) -> list[tuple[str, str]]:
-    return wind_bulk.eod_range_segments(start_c, latest_trade_c)
+def _latest_rebalance_stock_count(rb_map: dict[date, list[tuple[str, float]]]) -> int:
+    """最新调仓期成分股数（去重），用于动态净值 EOD 分段月数。"""
+    if not rb_map:
+        return 1
+    latest_rb = max(rb_map.keys())
+    return len({str(c).strip().upper() for c, _ in rb_map.get(latest_rb, ()) if c})
+
+
+def resolve_nav_rebuild_eod_months(latest_period_stock_count: int) -> int:
+    """
+    开算净值前动态月数：latest_n * months <= nav_rebuild_stock_month_budget（至少 1 个月）。
+    可选 nav_rebuild_eod_months_max / 旧 nav_rebuild_eod_months>0 作为上限。
+    """
+    budget = max(1, int(getattr(settings, "nav_rebuild_stock_month_budget", 300) or 300))
+    n = max(1, int(latest_period_stock_count or 1))
+    months = max(1, budget // n)
+    cap = int(getattr(settings, "nav_rebuild_eod_months_max", 0) or 0)
+    if cap <= 0:
+        legacy = int(getattr(settings, "nav_rebuild_eod_months", 0) or 0)
+        if legacy > 0:
+            cap = legacy
+    if cap > 0:
+        months = min(months, cap)
+    return months
+
+
+def _nav_eod_time_segments(
+    start_c: str,
+    latest_trade_c: str,
+    *,
+    step_months: int | None = None,
+) -> list[tuple[str, str]]:
+    return wind_bulk.eod_range_segments(start_c, latest_trade_c, step_months=step_months)
 
 
 def _codes_for_nav_segment(
@@ -2234,7 +2265,34 @@ def _rebuild_nav_for_strategy_yearly(
         return False, wind
 
     nav_persist_chunk = max(50, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
-    time_segs = _nav_eod_time_segments(start_c, latest_trade_c)
+    latest_n = _latest_rebalance_stock_count(rb_map)
+    eod_step_months = resolve_nav_rebuild_eod_months(latest_n)
+    budget = int(getattr(settings, "nav_rebuild_stock_month_budget", 300) or 300)
+    time_segs = _nav_eod_time_segments(
+        start_c, latest_trade_c, step_months=eod_step_months
+    )
+    n_codes_union = len({c for lst in rb_map.values() for c, _ in lst if c})
+    _log.info(
+        "nav rebuild %s: latest_period_stocks=%s eod_step_months=%s "
+        "(budget=%s, product<=%s) segments=%s",
+        sid,
+        latest_n,
+        eod_step_months,
+        budget,
+        latest_n * eod_step_months,
+        len(time_segs),
+    )
+    if sync_job_id is not None:
+        _admin_sync_job_touch(
+            sync_job_id,
+            "nav",
+            f"阶段2/3 {sid}：动态分段 {eod_step_months} 月/段"
+            f"（最新期 {latest_n} 只×{eod_step_months}≤{budget}），"
+            f"共 {len(time_segs)} 段、历史成分约 {n_codes_union} 只"
+            f"（{start_c}~{latest_trade_c}）…",
+            db=None if turso_remote else db,
+            do_commit=True,
+        )
     for attempt in range(4):
         try:
 
@@ -2531,11 +2589,18 @@ def _rebuild_nav_for_strategy(
         if len(latest_trade_c) < 8:
             latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
-    if (
-        wind_bundle is None
-        and _wind_low_memory_mode()
-        and bool(getattr(settings, "nav_rebuild_year_segments", True))
+    n_codes = len(code_set)
+    force_seg = n_codes > 250
+    use_nav_segments = bool(getattr(settings, "nav_rebuild_year_segments", True))
+    if wind_bundle is None and use_nav_segments and (
+        _wind_low_memory_mode() or force_seg
     ):
+        if force_seg and not _wind_low_memory_mode():
+            _log.warning(
+                "nav rebuild %s: %s codes, forcing segmented rebuild (set WIND_LOW_MEMORY_MODE=true)",
+                sid,
+                n_codes,
+            )
         return _rebuild_nav_for_strategy_yearly(
             db,
             wind,
@@ -2730,6 +2795,14 @@ def rebuild_nav_series(
             db.commit()
         return {"rebuilt": 0, "failed": 0, "errors": []}, wind
 
+    if sync_job_id is not None:
+        _admin_sync_job_touch(
+            sync_job_id,
+            "nav",
+            "阶段2/3：查询 Wind 最新交易日…",
+            db=None if turso_remote else db,
+            do_commit=True,
+        )
     mtd_nav = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
     latest_trade = mtd_nav["d"] if mtd_nav else None
     if not latest_trade:
@@ -3228,6 +3301,7 @@ def execute_admin_sync_pipeline(
     if t1 > 0:
         p("import", f"导入完成，休眠 {t1}s 后进入净值…", detached=True)
         time.sleep(t1)
+    gc.collect()
 
     try:
         if ids_set <= completed_nav:
@@ -3245,6 +3319,7 @@ def execute_admin_sync_pipeline(
                 f"{f'，续传跳过 {len(completed_nav)} 个' if completed_nav else ''}）…",
                 detached=True,
             )
+            p("nav", "阶段2/3：连接 Wind SQL Server…", detached=True)
             wind = wind_sql.open_wind(None)
             nav_ret, wind = rebuild_nav_series(
                 None,
