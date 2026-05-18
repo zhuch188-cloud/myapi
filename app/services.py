@@ -2596,16 +2596,17 @@ def rebuild_nav_series(
                 )
 
             if turso_remote:
-                with turso_stream_lock():
-                    sdb = SessionLocalFactory()
-                    try:
-                        if wind is None:
-                            wind = wind_sql.open_wind(sdb)
-                        counted, wind = _rebuild_one(sdb)
-                        if counted:
-                            done += 1
-                            completed_nav.append(sid)
-                            if sync_job_id is not None:
+                # 勿整段持锁：净值重建内 _locked_db_op 已按 SQL 批次加锁，Wind 在锁外执行
+                sdb = SessionLocalFactory()
+                try:
+                    if wind is None:
+                        wind = wind_sql.open_wind(sdb)
+                    counted, wind = _rebuild_one(sdb)
+                    if counted:
+                        done += 1
+                        completed_nav.append(sid)
+                        if sync_job_id is not None:
+                            with turso_stream_lock():
                                 ck_row = (
                                     sdb.execute(
                                         text(
@@ -2634,16 +2635,17 @@ def rebuild_nav_series(
                                     db=sdb,
                                     do_commit=False,
                                 )
-                        if do_commit:
+                    if do_commit:
+                        with turso_stream_lock():
                             sdb.commit()
-                    finally:
-                        if low_mem:
-                            try:
-                                wind_sql.close_wind(wind, sdb)
-                            except Exception:
-                                pass
-                            wind = None
-                        sdb.close()
+                finally:
+                    if low_mem:
+                        try:
+                            wind_sql.close_wind(wind, sdb)
+                        except Exception:
+                            pass
+                        wind = None
+                    sdb.close()
             else:
                 counted, wind = _rebuild_one(db)
                 if counted:

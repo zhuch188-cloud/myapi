@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import threading
@@ -15,8 +16,15 @@ _log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Turso 远程 Hrana：StaticPool 仅一条 libsql 流，禁止多 Session 并发写
-_turso_stream_lock = threading.RLock()
+# Turso 远程 Hrana：StaticPool 仅一条 libsql 流，所有 SQL 必须串行化。
+# 使用 Semaphore（可从非获取线程 release），避免 FastAPI 依赖清理跨线程时 RLock 泄漏。
+_stream_sem = threading.Semaphore(1)
+_depth_guard = threading.Lock()
+_depth_by_thread: dict[int, int] = {}
+_API_LOCK_TIMEOUT_UNSET = object()
+_api_lock_timeout_var: contextvars.ContextVar[float | None | object] = contextvars.ContextVar(
+    "turso_api_lock_timeout", default=_API_LOCK_TIMEOUT_UNSET
+)
 
 
 def uses_remote_turso_only() -> bool:
@@ -25,50 +33,137 @@ def uses_remote_turso_only() -> bool:
     )
 
 
+def _thread_depth(tid: int | None = None) -> int:
+    t = tid if tid is not None else threading.get_ident()
+    with _depth_guard:
+        return int(_depth_by_thread.get(t, 0))
+
+
+def _bump_thread_depth(tid: int, delta: int) -> int:
+    with _depth_guard:
+        cur = int(_depth_by_thread.get(tid, 0))
+        nxt = cur + delta
+        if nxt <= 0:
+            _depth_by_thread.pop(tid, None)
+        else:
+            _depth_by_thread[tid] = nxt
+        return nxt
+
+
+def _default_api_lock_timeout() -> float:
+    return float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
+
+
+def _resolve_lock_wait(timeout: float | None) -> float:
+    if timeout is None:
+        return -1.0
+    return float(timeout)
+
+
+def _acquire_stream_sem(*, timeout: float | None, owner_tid: int | None = None) -> int:
+    """返回实际持有信号量的线程 id（用于跨线程释放）。"""
+    tid = owner_tid if owner_tid is not None else threading.get_ident()
+    if _thread_depth(tid) > 0:
+        _bump_thread_depth(tid, 1)
+        return tid
+    wait = _resolve_lock_wait(timeout)
+    ok = _stream_sem.acquire(timeout=wait if wait >= 0 else None)
+    if not ok:
+        secs = int(wait) if wait > 0 else 0
+        raise TursoStreamBusyError(
+            "数据库连接繁忙，请稍后重试"
+            + (f"（排队已超过 {secs} 秒）" if secs > 0 else "")
+        )
+    _bump_thread_depth(tid, 1)
+    return tid
+
+
+def _release_stream_sem(*, owner_tid: int | None = None, from_tid: int | None = None) -> None:
+    tid = owner_tid if owner_tid is not None else threading.get_ident()
+    cur = _thread_depth(tid)
+    if cur <= 0:
+        return
+    if cur > 1:
+        _bump_thread_depth(tid, -1)
+        return
+    _bump_thread_depth(tid, -1)
+    try:
+        _stream_sem.release()
+    except ValueError:
+        _log.exception(
+            "turso_stream_lock: release failed (owner=%s, from=%s)",
+            tid,
+            from_tid if from_tid is not None else threading.get_ident(),
+        )
+
+
+def _statement_lock_acquire(conn) -> None:
+    if not uses_remote_turso_only():
+        return
+    if _thread_depth() > 0:
+        return
+    raw = _api_lock_timeout_var.get()
+    if raw is _API_LOCK_TIMEOUT_UNSET:
+        timeout = _default_api_lock_timeout()
+    else:
+        timeout = None if raw is None else float(raw)
+    wait = _resolve_lock_wait(timeout)
+    ok = _stream_sem.acquire(timeout=wait if wait >= 0 else None)
+    if not ok:
+        secs = int(wait) if wait > 0 else 0
+        raise TursoStreamBusyError(
+            "数据库连接繁忙，请稍后重试"
+            + (f"（排队已超过 {secs} 秒）" if secs > 0 else "")
+        )
+    conn.info["turso_stmt_lock"] = True
+
+
+def _statement_lock_release(conn) -> None:
+    if not conn.info.pop("turso_stmt_lock", False):
+        return
+    try:
+        _stream_sem.release()
+    except ValueError:
+        _log.exception("turso_stream_lock: statement release failed")
+
+
 class TursoStreamLockContext:
     """
-    类式上下文管理器（不用 @contextmanager 生成器），避免 FastAPI 在线程池里
-    gen.throw 清理时与内层 finally 叠加，导致 cannot release un-acquired lock。
+    显式持锁区（多语句事务/后台写库）。API 普通读写在 get_session 内按单条 SQL 加锁，
+    请求之间可交错，避免整次 HTTP 占用锁导致多标签浏览排队 90 秒。
     """
 
-    __slots__ = ("_timeout", "_acquired", "_owner_thread", "_noop")
+    __slots__ = ("_timeout", "_acquired", "_owner_tid", "_noop")
 
     def __init__(self, *, timeout: float | None = None) -> None:
         self._timeout = timeout
         self._acquired = False
-        self._owner_thread: int | None = None
+        self._owner_tid: int | None = None
         self._noop = not uses_remote_turso_only()
 
     def __enter__(self) -> "TursoStreamLockContext":
         if self._noop:
             return self
-        wait = -1 if self._timeout is None else float(self._timeout)
-        if not _turso_stream_lock.acquire(timeout=wait):
-            secs = int(wait) if wait > 0 else 0
-            raise TursoStreamBusyError(
-                f"数据库正忙于全量同步或净值重建，请稍后重试（已等待 {secs} 秒）"
-            )
+        self._owner_tid = _acquire_stream_sem(timeout=self._timeout)
         self._acquired = True
-        self._owner_thread = threading.get_ident()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         if self._noop or not self._acquired:
             return False
         self._acquired = False
-        owner = self._owner_thread
-        self._owner_thread = None
-        if owner is not None and owner != threading.get_ident():
+        owner = self._owner_tid
+        self._owner_tid = None
+        cur = threading.get_ident()
+        if owner is not None and owner != cur:
             _log.warning(
-                "turso_stream_lock: skip release (acquired on thread %s, exit on %s)",
+                "turso_stream_lock: cross-thread release (owner=%s, exit=%s)",
                 owner,
-                threading.get_ident(),
+                cur,
             )
-            return False
-        try:
-            _turso_stream_lock.release()
-        except RuntimeError:
-            _log.exception("turso_stream_lock: release failed")
+            _release_stream_sem(owner_tid=owner, from_tid=cur)
+        else:
+            _release_stream_sem(owner_tid=owner)
         return False
 
 
@@ -159,10 +254,19 @@ def create_app_engine():
         cursor.close()
 
     @event.listens_for(eng, "before_cursor_execute", retval=True)
-    def _coerce_cursor_params(_conn, _cursor, statement, parameters, _context, _executemany):
+    def _coerce_cursor_params(conn, _cursor, statement, parameters, _context, _executemany):
+        _statement_lock_acquire(conn)
         if parameters is not None:
             return statement, coerce_bind_parameters(parameters)
         return statement, parameters
+
+    @event.listens_for(eng, "after_cursor_execute")
+    def _release_after_cursor(conn, *_args, **_kwargs):
+        _statement_lock_release(conn)
+
+    @event.listens_for(eng, "handle_error")
+    def _release_on_cursor_error(conn, *_args, **_kwargs):
+        _statement_lock_release(conn)
 
     return eng
 
@@ -773,7 +877,7 @@ class DatabaseNotReadyError(Exception):
 
 
 class TursoStreamBusyError(Exception):
-    """远程 Turso 正被全量同步/净值任务占用 libsql 流，API 等待锁超时。"""
+    """远程 Turso libsql 流排队超时（浏览并发或后台写库占线）。"""
 
 
 def get_session():
@@ -786,9 +890,10 @@ def get_session():
             raise DatabaseNotReadyError("数据库正在初始化，请约 1～2 分钟后重试")
         raise DatabaseNotReadyError("Database not initialized")
     api_timeout = float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
-    with turso_stream_lock(timeout=api_timeout if api_timeout > 0 else None):
-        db = SessionLocalFactory()
-        try:
-            yield db
-        finally:
-            db.close()
+    tok = _api_lock_timeout_var.set(api_timeout if api_timeout > 0 else None)
+    db = SessionLocalFactory()
+    try:
+        yield db
+    finally:
+        db.close()
+        _api_lock_timeout_var.reset(tok)
