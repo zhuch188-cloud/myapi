@@ -131,8 +131,16 @@ def _boot_worker(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None
             _log.warning("Wind 初始化异常（已忽略）: %s", e)
         _clear_stale_jobs()
         import app.services as _svc
+        from app.db import SessionLocalFactory, turso_stream_lock
+        from app.site_settings_cache import reload_from_session
 
         _svc._job_running = False
+        with turso_stream_lock():
+            db = SessionLocalFactory()
+            try:
+                reload_from_session(db)
+            finally:
+                db.close()
         _start_scheduler(scheduler, scheduled_fn)
         _state["ready"] = True
         _log.info("后台启动：数据库与调度器已就绪")

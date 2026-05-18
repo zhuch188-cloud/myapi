@@ -798,6 +798,12 @@ def _site_setting_upsert(db: Session, key: str, value: str) -> None:
         ),
         {"k": key[:64], "v": str(value)[:255]},
     )
+    try:
+        from app.site_settings_cache import patch_key
+
+        patch_key(key, value)
+    except Exception:
+        pass
 
 
 def _risk_summary_from_login_counts(*, fail24h: int, success24h: int, fail7d: int) -> dict:
@@ -1771,13 +1777,21 @@ def client_bootstrap(request: Request, device_token: str | None = Form(None), db
 
 
 @app.get("/api/public/client-access-mode")
-def public_client_access_mode(db: Session = Depends(get_session)):
-    """未鉴权：前台访客是否须先登录、是否开放自助注册。"""
+def public_client_access_mode():
+    """未鉴权：前台访客是否须先登录、是否开放自助注册（读内存快照，不占 Turso 流锁）。"""
+    from app.site_settings_cache import client_access_mode_payload
+
+    cached = client_access_mode_payload()
+    if cached is not None:
+        return cached
+    if not is_ready():
+        raise DatabaseNotReadyError("数据库正在初始化，请约 1～2 分钟后重试")
+    # 与 db 种子 site_settings 默认一致
     return {
-        "require_login": _client_require_login_enabled(db),
-        "allow_register": _client_register_allowed(db),
-        "contact_enabled": _client_contact_enabled(db),
-        "feedback_enabled": _client_feedback_enabled(db),
+        "require_login": True,
+        "allow_register": True,
+        "contact_enabled": True,
+        "feedback_enabled": False,
     }
 
 

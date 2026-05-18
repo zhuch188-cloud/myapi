@@ -1893,11 +1893,52 @@ def _index_eod_to_bench_day_map(
     bench_day_map: dict[str, tuple[float | None, float | None]] = {}
     if not bench_code:
         return bench_day_map
-    for d, cl, pc, _raw in index_eod_by_code.get(bench_code, []):
+    for d, cl, pc, _raw in index_eod_by_code.get(_wind_code_key(bench_code), []):
         clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
         pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
         bench_day_map[_compact_date(d)] = (clv, pcv)
     return bench_day_map
+
+
+def _bench_quads_for_code(index_eod_by_code: dict[str, list], bench_code: str) -> list:
+    if not bench_code:
+        return []
+    return list(index_eod_by_code.get(_wind_code_key(bench_code), ()))
+
+
+def _bench_return_on_trade_day(
+    td: str,
+    *,
+    bench_quads: list | None = None,
+    bench_day_map: dict[str, tuple[float | None, float | None]] | None = None,
+) -> float | None:
+    """用全区间指数序列算日收益（分段拉行情时也能拿到段首日的真实昨收）。"""
+    if bench_quads:
+        clv, pcv = wind_bulk.index_close_preclose_for_compact_day(bench_quads, td)
+        return _safe_return(clv, pcv)
+    if bench_day_map:
+        bp = bench_day_map.get(td)
+        if bp:
+            return _safe_return(bp[0], bp[1])
+    return None
+
+
+def _step_benchmark_nav_acc(
+    bench_nav_acc: float | None,
+    br: float | None,
+    *,
+    allow_flat: bool,
+) -> tuple[float | None, float | None, float | None]:
+    """返回 (新累计, benchmark_ret, benchmark_nav)。allow_flat：Wind 有指数但当日算不出收益时按 0 延续。"""
+    if bench_nav_acc is None:
+        return None, None, None
+    if br is not None:
+        acc = float(bench_nav_acc) * (1.0 + float(br))
+        return acc, float(br), acc
+    if allow_flat:
+        acc = float(bench_nav_acc)
+        return acc, 0.0, acc
+    return float(bench_nav_acc), None, None
 
 
 def _rebuild_nav_for_strategy_yearly(
@@ -1961,8 +2002,26 @@ def _rebuild_nav_for_strategy_yearly(
     prev_mv: float | None = None
     bench_nav_acc: float | None = 1.0 if bench_code else None
     nav_accum: list[dict[str, Any]] = []
-    first_trade_day = True
     td_i = 0
+    bench_quads: list = []
+    if bench_code:
+
+        def _load_bench_quads(sess: Session):
+            nonlocal wind
+            w, idx_all = wind_bulk.load_index_eod_by_code(
+                wind, [bench_code], start_c, latest_trade_c, sess
+            )
+            return w, _bench_quads_for_code(idx_all, bench_code)
+
+        if turso_remote:
+            with turso_stream_lock():
+                bdb = SessionLocalFactory()
+                try:
+                    wind, bench_quads = _load_bench_quads(bdb)
+                finally:
+                    bdb.close()
+        else:
+            wind, bench_quads = _load_bench_quads(db)
 
     for seg_i, (seg_st, seg_ed) in enumerate(time_segs, start=1):
         seg_days = [d for d in trade_days_all if seg_st <= d <= seg_ed]
@@ -1981,17 +2040,17 @@ def _rebuild_nav_for_strategy_yearly(
             )
 
         def _load_maps(sess: Session):
-            return _load_segment_wind_maps(wind, sess, seg_codes, seg_st, seg_ed, bench_code)
+            return _load_segment_wind_maps(wind, sess, seg_codes, seg_st, seg_ed, "")
 
         if turso_remote:
             with turso_stream_lock():
                 seg_db = SessionLocalFactory()
                 try:
-                    wind, day_map, bench_day_map = _load_maps(seg_db)
+                    wind, day_map, _ = _load_maps(seg_db)
                 finally:
                     seg_db.close()
         else:
-            wind, day_map, bench_day_map = _load_maps(db)
+            wind, day_map, _ = _load_maps(db)
 
         for td in seg_days:
             td_i += 1
@@ -2064,16 +2123,10 @@ def _rebuild_nav_for_strategy_yearly(
             bench_ret_ins = None
             bench_nav_ins = None
             if bench_code and bench_nav_acc is not None:
-                bp = bench_day_map.get(td) if bench_day_map else None
-                br = _safe_return(bp[0], bp[1]) if bp else None
-                if br is not None:
-                    bench_ret_ins = float(br)
-                    bench_nav_acc *= 1.0 + bench_ret_ins
-                    bench_nav_ins = bench_nav_acc
-                elif first_trade_day:
-                    bench_ret_ins = 0.0
-                    bench_nav_ins = float(bench_nav_acc)
-            first_trade_day = False
+                br = _bench_return_on_trade_day(td, bench_quads=bench_quads)
+                bench_nav_acc, bench_ret_ins, bench_nav_ins = _step_benchmark_nav_acc(
+                    bench_nav_acc, br, allow_flat=True
+                )
             nav_accum.append(
                 {
                     "sid": sid,
@@ -2096,7 +2149,6 @@ def _rebuild_nav_for_strategy_yearly(
                 nav_accum.clear()
 
         day_map.clear()
-        bench_day_map.clear()
         if _wind_low_memory_mode():
 
             def _reopen_wind(sess: Session):
@@ -2264,6 +2316,7 @@ def _rebuild_nav_for_strategy(
         return False, wind
 
     day_map = _eod_dict_to_day_map(eod_by_code)
+    bench_quads = _bench_quads_for_code(index_eod_by_code, bench_code)
     bench_day_map = _index_eod_to_bench_day_map(index_eod_by_code, bench_code)
 
     eod_by_code.clear()
@@ -2356,16 +2409,12 @@ def _rebuild_nav_for_strategy(
         bench_ret_ins = None
         bench_nav_ins = None
         if bench_code and bench_nav_acc is not None:
-            bp = bench_day_map.get(td) if bench_day_map else None
-            br = _safe_return(bp[0], bp[1]) if bp else None
-            if br is not None:
-                bench_ret_ins = float(br)
-                bench_nav_acc *= 1.0 + bench_ret_ins
-                bench_nav_ins = bench_nav_acc
-            elif i_td == 0:
-                # 全量起点常遇指数首日无 EOD：与策略单位净值起点 1 对齐，基准净值 1、日收益 0，便于超额与指标口径统一
-                bench_ret_ins = 0.0
-                bench_nav_ins = float(bench_nav_acc)
+            br = _bench_return_on_trade_day(
+                td, bench_quads=bench_quads, bench_day_map=bench_day_map
+            )
+            bench_nav_acc, bench_ret_ins, bench_nav_ins = _step_benchmark_nav_acc(
+                bench_nav_acc, br, allow_flat=True
+            )
         nav_accum.append(
             {
                 "sid": sid,

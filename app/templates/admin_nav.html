@@ -108,6 +108,7 @@
       let token = localStorage.getItem("token") || "";
       let navPage = 1;
       let navTotalPages = 1;
+      let navLoadGen = 0;
       /** 最近一次用于绑图的完整序列（与分页无关），避免 chart_series 为空数组时误判 */
       let lastChartSeries = [];
       /** 与 chart 同次的 meta（含 excess_anchor_*），作图收益率与后端超额累计对齐 */
@@ -530,8 +531,14 @@
       async function loadNav() {
         const sid = document.getElementById("strategySel").value;
         if (!sid) return;
+        const myGen = ++navLoadGen;
+        const infoEl = document.getElementById("navInfo");
+        if (infoEl) infoEl.textContent = "加载中…";
+        try {
         await loadAllYears(sid);
+        if (myGen !== navLoadGen) return;
         await loadLatestRebalanceDate(sid);
+        if (myGen !== navLoadGen) return;
         const ps = Number(document.getElementById("pageSizeSel").value || 20);
         const q = new URLSearchParams({
           page: String(navPage),
@@ -543,6 +550,7 @@
         if (sd) q.set("start_date", sd);
         if (ed) q.set("end_date", ed);
         const data = await api(`/api/strategies/${sid}/nav?${q.toString()}`);
+        if (myGen !== navLoadGen) return;
         renderYearButtons(sid);
         const mQ = new URLSearchParams();
         if (sd) mQ.set("start_date", sd);
@@ -566,7 +574,11 @@
         const benchLbl = bn ? `${bn}（${bc}）` : `${bc}`;
         const totalPages = Math.max(1, Math.ceil(total / ps));
         navTotalPages = totalPages;
-        if (navPage > totalPages) { navPage = totalPages; return loadNav(); }
+        if (navPage > totalPages) {
+          navPage = totalPages;
+          if (myGen === navLoadGen) return loadNav();
+          return;
+        }
         document.getElementById("navInfo").textContent =
           `${sid}：基准：${benchLbl}`;
         document.getElementById("navPager").textContent =
@@ -592,6 +604,11 @@
             <td>${pctSigned(i.excess_cumulative)}</td>
             <td>${i.rebalance_date||"-"}</td>
           </tr>`).join("")}</tbody>`;
+        } catch (e) {
+          if (myGen !== navLoadGen) return;
+          console.error("loadNav failed", e);
+          if (infoEl) infoEl.textContent = "加载失败：" + formatFetchError(e);
+        }
       }
       ensureAuth();
       const pf = JSON.parse(localStorage.getItem("profile") || "{}");
