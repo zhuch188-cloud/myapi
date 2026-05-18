@@ -416,6 +416,13 @@
         if (uploadFilename) return matchStrategyIdForUploadFilename(uploadFilename);
         return "";
       }
+      /** 单条 Excel 上传/导入完成后清空，避免下次仍沿用旧 strategy_id 误传 */
+      function clearSingleUploadFormFields() {
+        const idEl = document.getElementById("strategy_id");
+        if (idEl) idEl.value = "";
+        const fileEl = document.getElementById("strategyDataUploadFile");
+        if (fileEl) fileEl.value = "";
+      }
       function applyMatchedStrategyToForm(sid, uploadFilename) {
         if (!sid) return;
         const idEl = document.getElementById("strategy_id");
@@ -481,6 +488,7 @@
           document.getElementById("file_dir").value = body.file_dir || "";
           document.getElementById("file_name").value = body.file_name || "";
           msg.textContent = `已上传：${body.path || ""}`;
+          clearSingleUploadFormFields();
           await refreshStrategyListAfterJob();
         } catch (e) {
           msg.textContent = formatFetchError(e);
@@ -500,6 +508,11 @@
             await maybeRefreshStrategyListDuringPoll();
           }
           if (j.status !== "QUEUED" && j.status !== "RUNNING") {
+            let jobSidCount = 0;
+            try {
+              jobSidCount = JSON.parse(j.strategy_ids_json || "[]").length;
+            } catch (_) {}
+            if (jobSidCount <= 1) clearSingleUploadFormFields();
             await refreshStrategyListAfterJob();
             return j;
           }

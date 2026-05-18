@@ -4243,41 +4243,57 @@ async def admin_strategy_upload_data_file(
     request: Request,
     file: UploadFile = File(...),
     user=Depends(require_roles("admin", "editor")),
-    db: Session = Depends(get_session),
 ):
     """上传策略 Excel 到服务器（有则覆盖），并更新 strategy_configs 的 file_dir/file_name。"""
+    from app.db import SessionLocalFactory, turso_stream_lock
     from app.server_files import upload_strategy_data_file
 
     sid = (strategy_id or "").strip()
-    row = db.execute(
-        text("SELECT strategy_id FROM strategy_configs WHERE strategy_id=:sid LIMIT 1"),
-        {"sid": sid},
-    ).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="strategy not found")
+    api_timeout = float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
+    lock_kw = {"timeout": api_timeout if api_timeout > 0 else None}
+
+    with turso_stream_lock(**lock_kw):
+        db = SessionLocalFactory()
+        try:
+            row = db.execute(
+                text("SELECT strategy_id FROM strategy_configs WHERE strategy_id=:sid LIMIT 1"),
+                {"sid": sid},
+            ).first()
+            if not row:
+                raise HTTPException(status_code=404, detail="strategy not found")
+        finally:
+            db.close()
+
+    # 写盘可能较久，勿占用 Turso 流锁，避免其它 API 500 / 锁误释放
     ret = await upload_strategy_data_file(sid, file)
-    db.execute(
-        text(
-            """
-            UPDATE strategy_configs
-            SET file_dir=:fd, file_name=:fn, updated_at=datetime('now', '+8 hours')
-            WHERE strategy_id=:sid
-            """
-        ),
-        {
-            "fd": ret["file_dir"],
-            "fn": ret["file_name"],
-            "sid": sid,
-        },
-    )
-    _audit_log(
-        db,
-        action="admin_strategy_upload_data_file",
-        actor_user_id=user.get("id"),
-        detail={"strategy_id": sid, "path": ret.get("path")},
-        request=request,
-    )
-    db.commit()
+
+    with turso_stream_lock(**lock_kw):
+        db = SessionLocalFactory()
+        try:
+            db.execute(
+                text(
+                    """
+                    UPDATE strategy_configs
+                    SET file_dir=:fd, file_name=:fn, updated_at=datetime('now', '+8 hours')
+                    WHERE strategy_id=:sid
+                    """
+                ),
+                {
+                    "fd": ret["file_dir"],
+                    "fn": ret["file_name"],
+                    "sid": sid,
+                },
+            )
+            _audit_log(
+                db,
+                action="admin_strategy_upload_data_file",
+                actor_user_id=user.get("id"),
+                detail={"strategy_id": sid, "path": ret.get("path")},
+                request=request,
+            )
+            db.commit()
+        finally:
+            db.close()
     return ret
 
 
@@ -4286,51 +4302,66 @@ async def admin_batch_strategy_upload_data_files(
     request: Request,
     files: list[UploadFile] = File(...),
     user=Depends(require_roles("admin", "editor")),
-    db: Session = Depends(get_session),
 ):
     """
     批量上传策略 Excel：按配置表 file_name 匹配 strategy_id（或文件名主干等于 strategy_id）。
     """
+    from app.db import SessionLocalFactory, turso_stream_lock
     from app.server_files import batch_upload_strategy_data_files
 
     _ = user
     if not files:
         raise HTTPException(status_code=400, detail="no files")
-    configs = [
-        dict(r)
-        for r in db.execute(
-            text("SELECT strategy_id, file_name FROM strategy_configs")
-        ).mappings().all()
-    ]
+    api_timeout = float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
+    lock_kw = {"timeout": api_timeout if api_timeout > 0 else None}
+
+    with turso_stream_lock(**lock_kw):
+        db = SessionLocalFactory()
+        try:
+            configs = [
+                dict(r)
+                for r in db.execute(
+                    text("SELECT strategy_id, file_name FROM strategy_configs")
+                ).mappings().all()
+            ]
+        finally:
+            db.close()
+
     ret = await batch_upload_strategy_data_files(files, configs)
-    for item in ret.get("results") or []:
-        if not item.get("ok"):
-            continue
-        sid = str(item.get("strategy_id") or "").strip()
-        if not sid:
-            continue
-        db.execute(
-            text(
-                """
-                UPDATE strategy_configs
-                SET file_dir=:fd, file_name=:fn, updated_at=datetime('now', '+8 hours')
-                WHERE strategy_id=:sid
-                """
-            ),
-            {
-                "fd": item.get("file_dir") or _normalize_strategy_file_dir(sid, ""),
-                "fn": item.get("file_name") or "",
-                "sid": sid,
-            },
-        )
-    _audit_log(
-        db,
-        action="admin_strategy_batch_upload_data_files",
-        actor_user_id=user.get("id"),
-        detail={"uploaded": ret.get("uploaded"), "failed": ret.get("failed")},
-        request=request,
-    )
-    db.commit()
+
+    with turso_stream_lock(**lock_kw):
+        db = SessionLocalFactory()
+        try:
+            for item in ret.get("results") or []:
+                if not item.get("ok"):
+                    continue
+                sid = str(item.get("strategy_id") or "").strip()
+                if not sid:
+                    continue
+                db.execute(
+                    text(
+                        """
+                        UPDATE strategy_configs
+                        SET file_dir=:fd, file_name=:fn, updated_at=datetime('now', '+8 hours')
+                        WHERE strategy_id=:sid
+                        """
+                    ),
+                    {
+                        "fd": item.get("file_dir") or _normalize_strategy_file_dir(sid, ""),
+                        "fn": item.get("file_name") or "",
+                        "sid": sid,
+                    },
+                )
+            _audit_log(
+                db,
+                action="admin_strategy_batch_upload_data_files",
+                actor_user_id=user.get("id"),
+                detail={"uploaded": ret.get("uploaded"), "failed": ret.get("failed")},
+                request=request,
+            )
+            db.commit()
+        finally:
+            db.close()
     return ret
 
 

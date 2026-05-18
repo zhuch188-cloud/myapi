@@ -31,22 +31,24 @@ def turso_stream_lock(*, timeout: float | None = None):
     """
     纯远程 Turso 时串行化 libsql 访问，避免 Stream already in use。
     timeout=None：后台长任务无限等待；>0：API 等锁超时后抛 TursoStreamBusyError。
-    显式 acquire/release，避免请求取消时在未获锁情况下 release 导致 RuntimeError。
+    acquire 与 release 须在同一 try/finally 内，且仅 release 一次，避免超时/取消时误释放。
     """
     if not uses_remote_turso_only():
         yield
         return
     wait = -1 if timeout is None else float(timeout)
-    acquired = _turso_stream_lock.acquire(timeout=wait)
-    if not acquired:
-        secs = int(wait) if wait > 0 else 0
-        raise TursoStreamBusyError(
-            f"数据库正忙于全量同步或净值重建，请稍后重试（已等待 {secs} 秒）"
-        )
+    acquired = False
     try:
+        acquired = _turso_stream_lock.acquire(timeout=wait)
+        if not acquired:
+            secs = int(wait) if wait > 0 else 0
+            raise TursoStreamBusyError(
+                f"数据库正忙于全量同步或净值重建，请稍后重试（已等待 {secs} 秒）"
+            )
         yield
     finally:
-        _turso_stream_lock.release()
+        if acquired:
+            _turso_stream_lock.release()
 
 
 class _LibsqlCursor:
