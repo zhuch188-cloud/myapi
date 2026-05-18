@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 
 from fastapi import BackgroundTasks, Body, FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -4237,22 +4238,28 @@ async def admin_data_import_upload(
     return ret
 
 
-@app.post("/api/admin/strategies/{strategy_id}/upload-data-file")
-async def admin_strategy_upload_data_file(
-    strategy_id: str,
-    request: Request,
-    file: UploadFile = File(...),
-    user=Depends(require_roles("admin", "editor")),
-):
-    """上传策略 Excel 到服务器（有则覆盖），并更新 strategy_configs 的 file_dir/file_name。"""
-    from app.db import SessionLocalFactory, turso_stream_lock
-    from app.server_files import upload_strategy_data_file
+def _require_db_ready() -> None:
+    if boot_error():
+        raise DatabaseNotReadyError(f"数据库启动失败: {boot_error()}")
+    if not is_ready():
+        raise DatabaseNotReadyError("数据库正在初始化，请约 1～2 分钟后重试")
 
-    sid = (strategy_id or "").strip()
+
+def _turso_api_lock_kwargs() -> dict[str, float | None]:
     api_timeout = float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
-    lock_kw = {"timeout": api_timeout if api_timeout > 0 else None}
+    return {"timeout": api_timeout if api_timeout > 0 else None}
 
-    with turso_stream_lock(**lock_kw):
+
+def _commit_strategy_upload_db(
+    sid: str,
+    ret: dict[str, Any],
+    actor_user_id: int | None,
+    request: Request,
+) -> dict[str, Any]:
+    """在线程池中执行，避免 async 路由里同步等 Turso 锁阻塞事件循环（Render 健康检查超时→重启）。"""
+    from app.db import SessionLocalFactory, turso_stream_lock
+
+    with turso_stream_lock(**_turso_api_lock_kwargs()):
         db = SessionLocalFactory()
         try:
             row = db.execute(
@@ -4261,15 +4268,6 @@ async def admin_strategy_upload_data_file(
             ).first()
             if not row:
                 raise HTTPException(status_code=404, detail="strategy not found")
-        finally:
-            db.close()
-
-    # 写盘可能较久，勿占用 Turso 流锁，避免其它 API 500 / 锁误释放
-    ret = await upload_strategy_data_file(sid, file)
-
-    with turso_stream_lock(**lock_kw):
-        db = SessionLocalFactory()
-        try:
             db.execute(
                 text(
                     """
@@ -4287,7 +4285,7 @@ async def admin_strategy_upload_data_file(
             _audit_log(
                 db,
                 action="admin_strategy_upload_data_file",
-                actor_user_id=user.get("id"),
+                actor_user_id=actor_user_id,
                 detail={"strategy_id": sid, "path": ret.get("path")},
                 request=request,
             )
@@ -4297,28 +4295,13 @@ async def admin_strategy_upload_data_file(
     return ret
 
 
-@app.post("/api/admin/strategies/batch-upload-data-files")
-async def admin_batch_strategy_upload_data_files(
-    request: Request,
-    files: list[UploadFile] = File(...),
-    user=Depends(require_roles("admin", "editor")),
-):
-    """
-    批量上传策略 Excel：按配置表 file_name 匹配 strategy_id（或文件名主干等于 strategy_id）。
-    """
+def _load_strategy_configs_for_batch() -> list[dict[str, Any]]:
     from app.db import SessionLocalFactory, turso_stream_lock
-    from app.server_files import batch_upload_strategy_data_files
 
-    _ = user
-    if not files:
-        raise HTTPException(status_code=400, detail="no files")
-    api_timeout = float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
-    lock_kw = {"timeout": api_timeout if api_timeout > 0 else None}
-
-    with turso_stream_lock(**lock_kw):
+    with turso_stream_lock(**_turso_api_lock_kwargs()):
         db = SessionLocalFactory()
         try:
-            configs = [
+            return [
                 dict(r)
                 for r in db.execute(
                     text("SELECT strategy_id, file_name FROM strategy_configs")
@@ -4327,9 +4310,15 @@ async def admin_batch_strategy_upload_data_files(
         finally:
             db.close()
 
-    ret = await batch_upload_strategy_data_files(files, configs)
 
-    with turso_stream_lock(**lock_kw):
+def _commit_batch_strategy_upload_db(
+    ret: dict[str, Any],
+    actor_user_id: int | None,
+    request: Request,
+) -> dict[str, Any]:
+    from app.db import SessionLocalFactory, turso_stream_lock
+
+    with turso_stream_lock(**_turso_api_lock_kwargs()):
         db = SessionLocalFactory()
         try:
             for item in ret.get("results") or []:
@@ -4355,7 +4344,7 @@ async def admin_batch_strategy_upload_data_files(
             _audit_log(
                 db,
                 action="admin_strategy_batch_upload_data_files",
-                actor_user_id=user.get("id"),
+                actor_user_id=actor_user_id,
                 detail={"uploaded": ret.get("uploaded"), "failed": ret.get("failed")},
                 request=request,
             )
@@ -4363,6 +4352,52 @@ async def admin_batch_strategy_upload_data_files(
         finally:
             db.close()
     return ret
+
+
+@app.post("/api/admin/strategies/{strategy_id}/upload-data-file")
+async def admin_strategy_upload_data_file(
+    strategy_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    user=Depends(require_roles("admin", "editor")),
+):
+    """上传策略 Excel 到服务器（有则覆盖），并更新 strategy_configs 的 file_dir/file_name。"""
+    from app.server_files import upload_strategy_data_file
+
+    _require_db_ready()
+    sid = (strategy_id or "").strip()
+    ret = await upload_strategy_data_file(sid, file)
+    return await run_in_threadpool(
+        _commit_strategy_upload_db,
+        sid,
+        ret,
+        user.get("id"),
+        request,
+    )
+
+
+@app.post("/api/admin/strategies/batch-upload-data-files")
+async def admin_batch_strategy_upload_data_files(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    user=Depends(require_roles("admin", "editor")),
+):
+    """
+    批量上传策略 Excel：按配置表 file_name 匹配 strategy_id（或文件名主干等于 strategy_id）。
+    """
+    from app.server_files import batch_upload_strategy_data_files
+
+    _require_db_ready()
+    if not files:
+        raise HTTPException(status_code=400, detail="no files")
+    configs = await run_in_threadpool(_load_strategy_configs_for_batch)
+    ret = await batch_upload_strategy_data_files(files, configs)
+    return await run_in_threadpool(
+        _commit_batch_strategy_upload_db,
+        ret,
+        user.get("id"),
+        request,
+    )
 
 
 @app.get("/api/admin/data-import/batches")

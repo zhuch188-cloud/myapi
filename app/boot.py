@@ -31,11 +31,19 @@ def boot_error() -> str | None:
 
 
 def _clear_stale_jobs() -> None:
-    from app.db import SessionLocalFactory
+    from app.db import SessionLocalFactory, turso_stream_lock
 
     if SessionLocalFactory is None:
         return
-    db = SessionLocalFactory()
+    with turso_stream_lock():
+        db = SessionLocalFactory()
+        try:
+            _clear_stale_jobs_on_session(db)
+        finally:
+            db.close()
+
+
+def _clear_stale_jobs_on_session(db) -> None:
     try:
         db.execute(
             text(
@@ -88,8 +96,9 @@ def _clear_stale_jobs() -> None:
             )
         )
         db.commit()
-    finally:
-        db.close()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _start_scheduler(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None]) -> None:
