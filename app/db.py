@@ -1,7 +1,6 @@
 import json
 import logging
 import threading
-from contextlib import contextmanager
 from pathlib import Path
 
 import libsql
@@ -26,29 +25,56 @@ def uses_remote_turso_only() -> bool:
     )
 
 
-@contextmanager
-def turso_stream_lock(*, timeout: float | None = None):
+class TursoStreamLockContext:
     """
-    纯远程 Turso 时串行化 libsql 访问，避免 Stream already in use。
-    timeout=None：后台长任务无限等待；>0：API 等锁超时后抛 TursoStreamBusyError。
-    acquire 与 release 须在同一 try/finally 内，且仅 release 一次，避免超时/取消时误释放。
+    类式上下文管理器（不用 @contextmanager 生成器），避免 FastAPI 在线程池里
+    gen.throw 清理时与内层 finally 叠加，导致 cannot release un-acquired lock。
     """
-    if not uses_remote_turso_only():
-        yield
-        return
-    wait = -1 if timeout is None else float(timeout)
-    acquired = False
-    try:
-        acquired = _turso_stream_lock.acquire(timeout=wait)
-        if not acquired:
+
+    __slots__ = ("_timeout", "_acquired", "_owner_thread", "_noop")
+
+    def __init__(self, *, timeout: float | None = None) -> None:
+        self._timeout = timeout
+        self._acquired = False
+        self._owner_thread: int | None = None
+        self._noop = not uses_remote_turso_only()
+
+    def __enter__(self) -> "TursoStreamLockContext":
+        if self._noop:
+            return self
+        wait = -1 if self._timeout is None else float(self._timeout)
+        if not _turso_stream_lock.acquire(timeout=wait):
             secs = int(wait) if wait > 0 else 0
             raise TursoStreamBusyError(
                 f"数据库正忙于全量同步或净值重建，请稍后重试（已等待 {secs} 秒）"
             )
-        yield
-    finally:
-        if acquired:
+        self._acquired = True
+        self._owner_thread = threading.get_ident()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self._noop or not self._acquired:
+            return False
+        self._acquired = False
+        owner = self._owner_thread
+        self._owner_thread = None
+        if owner is not None and owner != threading.get_ident():
+            _log.warning(
+                "turso_stream_lock: skip release (acquired on thread %s, exit on %s)",
+                owner,
+                threading.get_ident(),
+            )
+            return False
+        try:
             _turso_stream_lock.release()
+        except RuntimeError:
+            _log.exception("turso_stream_lock: release failed")
+        return False
+
+
+def turso_stream_lock(*, timeout: float | None = None) -> TursoStreamLockContext:
+    """纯远程 Turso 时串行化 libsql 访问。timeout=None 为后台任务无限等待。"""
+    return TursoStreamLockContext(timeout=timeout)
 
 
 class _LibsqlCursor:
