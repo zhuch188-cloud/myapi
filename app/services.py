@@ -1046,18 +1046,34 @@ def _json_str_list(raw: Any) -> list[str]:
 
 def _sync_load_checkpoint(raw: Any) -> dict[str, Any]:
     if not raw:
-        return {"completed_import": [], "completed_nav": [], "stage": "import"}
+        return {
+            "completed_import": [],
+            "completed_nav": [],
+            "completed_update_rb": [],
+            "stage": "import",
+        }
     try:
         ck = json.loads(str(raw)) if not isinstance(raw, dict) else raw
         if not isinstance(ck, dict):
-            return {"completed_import": [], "completed_nav": [], "stage": "import"}
+            return {
+                "completed_import": [],
+                "completed_nav": [],
+                "completed_update_rb": [],
+                "stage": "import",
+            }
         return {
             "completed_import": _json_str_list(ck.get("completed_import")),
             "completed_nav": _json_str_list(ck.get("completed_nav")),
+            "completed_update_rb": _json_str_list(ck.get("completed_update_rb")),
             "stage": str(ck.get("stage") or "import"),
         }
     except json.JSONDecodeError:
-        return {"completed_import": [], "completed_nav": [], "stage": "import"}
+        return {
+            "completed_import": [],
+            "completed_nav": [],
+            "completed_update_rb": [],
+            "stage": "import",
+        }
 
 
 def _sync_save_checkpoint(
@@ -1067,22 +1083,66 @@ def _sync_save_checkpoint(
     completed_import: list[str],
     completed_nav: list[str],
     stage: str,
+    completed_update_rb: list[str] | None = None,
     do_commit: bool = True,
 ) -> None:
-    body = json.dumps(
-        {
-            "completed_import": completed_import,
-            "completed_nav": completed_nav,
-            "stage": stage,
-        },
-        ensure_ascii=False,
-    )
+    payload: dict[str, Any] = {
+        "completed_import": completed_import,
+        "completed_nav": completed_nav,
+        "stage": stage,
+    }
+    if completed_update_rb is not None:
+        payload["completed_update_rb"] = completed_update_rb
+    body = json.dumps(payload, ensure_ascii=False)
     db.execute(
         text("UPDATE admin_sync_jobs SET checkpoint_json=:c WHERE id=:id"),
         {"c": body, "id": sync_job_id},
     )
     if do_commit:
         db.commit()
+
+
+def _sync_mark_update_rb_done(sync_job_id: int, rb_compact: str) -> None:
+    """阶段3 每写完一个调仓期，落库断点，避免 OOM/重启后从第一期重拉 EOD。"""
+    from app.db import SessionLocalFactory, turso_stream_lock
+
+    rb_key = str(rb_compact or "").strip().replace("-", "")[:8]
+    if not rb_key:
+        return
+    with turso_stream_lock():
+        db = SessionLocalFactory()
+        try:
+            row = (
+                db.execute(
+                    text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                    {"id": sync_job_id},
+                )
+                .mappings()
+                .first()
+            )
+            cp = _sync_load_checkpoint(row.get("checkpoint_json") if row else None)
+            done = set(cp.get("completed_update_rb") or [])
+            done.add(rb_key)
+            _sync_save_checkpoint(
+                db,
+                sync_job_id,
+                completed_import=list(cp.get("completed_import") or []),
+                completed_nav=list(cp.get("completed_nav") or []),
+                completed_update_rb=sorted(done),
+                stage="update",
+                do_commit=True,
+            )
+        finally:
+            db.close()
+
+
+def _effective_eod_chunk_size(n_stocks: int) -> int:
+    base = wind_bulk.eod_stock_chunk_size()
+    if n_stocks > 800:
+        return min(base, 10)
+    if n_stocks > 400:
+        return min(base, 12)
+    return base
 
 
 def _strategy_import_job_touch(
@@ -1415,6 +1475,7 @@ def import_strategy_files(
                     sync_job_id,
                     completed_import=done_list,
                     completed_nav=cp.get("completed_nav") or [],
+                    completed_update_rb=cp.get("completed_update_rb") or [],
                     stage="import",
                     do_commit=do_commit,
                 )
@@ -1464,6 +1525,7 @@ def run_update(
     *,
     skip_nav_rebuild: bool = False,
     sync_job_id: int | None = None,
+    skip_update_rebalance_dates: set[str] | None = None,
 ) -> None:
     global _job_running
     if _job_running:
@@ -1600,12 +1662,11 @@ def run_update(
                 full_qu = wind_merged["quote"]
                 quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
             elif rb_chunked_eod:
-                chunk_n = wind_bulk.eod_stock_chunk_size()
+                chunk_n = _effective_eod_chunk_size(len(stock_codes))
                 prog(
                     f"[{i_active}/{n_active}] {sid}：低内存按调仓期分批 EOD"
-                    f"（每期最多 {chunk_n} 只/批 × 区间 {start_c}~{latest_trade}，共 {len(stock_codes)} 只成分）…"
+                    f"（每期最多 {chunk_n} 只/批，按各调仓日缩短区间，共 {len(stock_codes)} 只成分）…"
                 )
-                wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
             else:
                 prog(
                     f"[{i_active}/{n_active}] {sid}：串行拉取 A 股 EOD {len(stock_codes)} 只"
@@ -1642,9 +1703,17 @@ def run_update(
                     if do_commit:
                         db.rollback()
                     time.sleep(0.25 * (2**attempt))
+            skip_rb = skip_update_rebalance_dates or set()
             for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
                 if not positions:
                     prog(f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} 无仓位，跳过")
+                    continue
+                rb_compact = _compact_date(rebalance)
+                if rb_compact and rb_compact in skip_rb:
+                    prog(
+                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance} "
+                        f"已跳过（断点已完成）"
+                    )
                     continue
 
                 prepared_rows: list[dict[str, Any]] = []
@@ -1653,6 +1722,7 @@ def run_update(
                     total_weight += max(float(p["holding_weight"] or 0.0), 0.0)
 
                 if rb_chunked_eod:
+                    start_c_rb = wind_bulk.bulk_eod_start_compact(trade_date, rebalance)
                     stocks_rb = sorted(
                         {
                             _wind_code_key(p["stock_code"])
@@ -1660,17 +1730,20 @@ def run_update(
                             if p.get("stock_code")
                         }
                     )
-                    chunk_sz = wind_bulk.eod_stock_chunk_size()
+                    chunk_sz = _effective_eod_chunk_size(len(stock_codes))
                     n_chunks = max(1, (len(stocks_rb) + chunk_sz - 1) // chunk_sz)
                     for ci in range(0, len(stocks_rb), chunk_sz):
                         part = stocks_rb[ci : ci + chunk_sz]
                         cno = ci // chunk_sz + 1
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance}："
-                            f"EOD 批次 {cno}/{n_chunks}（{len(part)} 只）…"
+                            f"EOD {cno}/{n_chunks}（{len(part)} 只，{start_c_rb}~{latest_trade}）…"
+                        )
+                        wind, quote_part = _fetch_wind_quote_map_batched(
+                            db, wind, part, latest_trade
                         )
                         wind, eod_part = wind_bulk.load_eod_by_code(
-                            wind, part, start_c, str(latest_trade), db
+                            wind, part, start_c_rb, str(latest_trade), db
                         )
                         for p in positions:
                             wk = _wind_code_key(p["stock_code"])
@@ -1682,11 +1755,12 @@ def run_update(
                                     trade_date=trade_date,
                                     rebalance=rebalance,
                                     p=p,
-                                    quote_map=quote_map,
+                                    quote_map=quote_part,
                                     eod_series=eod_part.get(wk, []),
                                     latest_trade=str(latest_trade),
                                 )
                             )
+                        quote_part.clear()
                         eod_part.clear()
                         del eod_part
                         gc.collect()
@@ -1719,6 +1793,8 @@ def run_update(
                     f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} "
                     f"已写入 {n_written} 条"
                 )
+                if sync_job_id is not None and rb_compact:
+                    _sync_mark_update_rb_done(sync_job_id, rb_compact)
 
             if not skip_nav_rebuild:
                 try:
@@ -2711,6 +2787,7 @@ def rebuild_nav_series(
                                     sync_job_id,
                                     completed_import=cp.get("completed_import") or [],
                                     completed_nav=sorted(set(completed_nav)),
+                                    completed_update_rb=cp.get("completed_update_rb") or [],
                                     stage="nav",
                                     do_commit=False,
                                 )
@@ -2752,6 +2829,7 @@ def rebuild_nav_series(
                             sync_job_id,
                             completed_import=cp.get("completed_import") or [],
                             completed_nav=sorted(set(completed_nav)),
+                            completed_update_rb=cp.get("completed_update_rb") or [],
                             stage="nav",
                             do_commit=False,
                         )
@@ -2936,6 +3014,7 @@ def execute_admin_sync_pipeline(
     nav_ret: dict | None = None
     completed_import: set[str] = set()
     completed_nav: set[str] = set()
+    completed_update_rb: set[str] = set()
 
     with turso_stream_lock():
         db = SessionLocalFactory()
@@ -2953,10 +3032,16 @@ def execute_admin_sync_pipeline(
                 cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
                 completed_import = set(cp.get("completed_import") or [])
                 completed_nav = set(cp.get("completed_nav") or [])
+                completed_update_rb = {
+                    str(x).strip().replace("-", "")[:8]
+                    for x in (cp.get("completed_update_rb") or [])
+                    if str(x).strip()
+                }
                 if completed_import:
                     p(
                         "resume",
-                        f"续传：导入阶段已完成 {len(completed_import)} 个策略，净值已完成 {len(completed_nav)} 个",
+                        f"续传：导入 {len(completed_import)} 策略，净值 {len(completed_nav)}，"
+                        f"持仓快照调仓期 {len(completed_update_rb)} 个已完成",
                     )
             stale_mins = max(1, int(getattr(settings, "stale_running_update_job_minutes", 240)))
             db.execute(
@@ -3094,6 +3179,7 @@ def execute_admin_sync_pipeline(
                         sync_job_id,
                         completed_import=sorted(completed_import),
                         completed_nav=sorted(completed_nav),
+                        completed_update_rb=sorted(completed_update_rb),
                         stage="update",
                         do_commit=True,
                     )
@@ -3151,18 +3237,18 @@ def execute_admin_sync_pipeline(
     p("holding_update", "阶段3/3：写入最新交易日持仓快照（可能较久）…", detached=True)
     db2: Session | None = None
     try:
-        with turso_stream_lock():
-            db2 = SessionLocalFactory()
-            run_update(
-                db2,
-                "MANUAL",
-                username,
-                full_refresh=True,
-                selected_strategy_ids=ids,
-                do_commit=True,
-                skip_nav_rebuild=True,
-                sync_job_id=sync_job_id,
-            )
+        db2 = SessionLocalFactory()
+        run_update(
+            db2,
+            "MANUAL",
+            username,
+            full_refresh=True,
+            selected_strategy_ids=ids,
+            do_commit=True,
+            skip_nav_rebuild=True,
+            sync_job_id=sync_job_id,
+            skip_update_rebalance_dates=completed_update_rb,
+        )
         return {
             "ok": True,
             "stage": "all_success",

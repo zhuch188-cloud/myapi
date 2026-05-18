@@ -3851,7 +3851,14 @@ def admin_sync(
         raise HTTPException(status_code=500, detail="创建同步任务失败")
     db.commit()
 
-    background_tasks.add_task(run_admin_sync_background_task, job_id, username, ids, import_mode)
+    spawn_daemon(
+        f"admin-sync-{job_id}",
+        run_admin_sync_background_task,
+        job_id,
+        username,
+        ids,
+        import_mode,
+    )
     return {
         "ok": True,
         "queued": True,
@@ -3966,8 +3973,14 @@ def admin_sync_job_resume(
         {"id": job_id, "m": f"续传已入队（{resume_ts}）"},
     )
     db.commit()
-    background_tasks.add_task(
-        run_admin_sync_background_task, job_id, username, ids, import_mode, resume=True
+    spawn_daemon(
+        f"admin-sync-resume-{job_id}",
+        run_admin_sync_background_task,
+        job_id,
+        username,
+        ids,
+        import_mode,
+        resume=True,
     )
     return {
         "ok": True,

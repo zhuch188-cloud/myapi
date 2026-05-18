@@ -23,7 +23,7 @@ def eod_stock_chunk_size() -> int:
     if n > 0:
         return max(20, n)
     if bool(getattr(settings, "wind_low_memory_mode", True)):
-        return 15
+        return 10
     return EOD_STOCK_CHUNK
 _EOD_WIND_MAX_ATTEMPTS = 5
 
