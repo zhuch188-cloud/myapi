@@ -27,13 +27,26 @@ def uses_remote_turso_only() -> bool:
 
 
 @contextmanager
-def turso_stream_lock():
-    """纯远程 Turso 时串行化 libsql 访问，避免 Stream already in use。"""
-    if uses_remote_turso_only():
-        with _turso_stream_lock:
-            yield
-    else:
+def turso_stream_lock(*, timeout: float | None = None):
+    """
+    纯远程 Turso 时串行化 libsql 访问，避免 Stream already in use。
+    timeout=None：后台长任务无限等待；>0：API 等锁超时后抛 TursoStreamBusyError。
+    显式 acquire/release，避免请求取消时在未获锁情况下 release 导致 RuntimeError。
+    """
+    if not uses_remote_turso_only():
         yield
+        return
+    wait = -1 if timeout is None else float(timeout)
+    acquired = _turso_stream_lock.acquire(timeout=wait)
+    if not acquired:
+        secs = int(wait) if wait > 0 else 0
+        raise TursoStreamBusyError(
+            f"数据库正忙于全量同步或净值重建，请稍后重试（已等待 {secs} 秒）"
+        )
+    try:
+        yield
+    finally:
+        _turso_stream_lock.release()
 
 
 class _LibsqlCursor:
@@ -731,6 +744,10 @@ class DatabaseNotReadyError(Exception):
     """Turso 尚未完成后台初始化（Render 冷启动）。"""
 
 
+class TursoStreamBusyError(Exception):
+    """远程 Turso 正被全量同步/净值任务占用 libsql 流，API 等待锁超时。"""
+
+
 def get_session():
     if SessionLocalFactory is None:
         from app.boot import boot_error, is_ready
@@ -740,7 +757,8 @@ def get_session():
         if not is_ready():
             raise DatabaseNotReadyError("数据库正在初始化，请约 1～2 分钟后重试")
         raise DatabaseNotReadyError("Database not initialized")
-    with turso_stream_lock():
+    api_timeout = float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
+    with turso_stream_lock(timeout=api_timeout if api_timeout > 0 else None):
         db = SessionLocalFactory()
         try:
             yield db

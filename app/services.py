@@ -1913,7 +1913,23 @@ def _rebuild_nav_for_strategy_yearly(
     sync_job_id: int | None = None,
 ) -> tuple[bool, Any]:
     """低内存：按时间分段 + 股票小批拉 EOD，避免全历史成分 day_map 一次占满内存。"""
-    wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, start_c, latest_trade_c)
+    from app.db import SessionLocalFactory, turso_stream_lock, uses_remote_turso_only
+
+    turso_remote = uses_remote_turso_only()
+
+    def _locked_db_op(fn):
+        if turso_remote:
+            with turso_stream_lock():
+                sess = SessionLocalFactory()
+                try:
+                    return fn(sess)
+                finally:
+                    sess.close()
+        return fn(db)
+
+    wind, td_all = _locked_db_op(
+        lambda sess: wind_bulk.fetch_trade_date_compacts(wind, sess, start_c, latest_trade_c)
+    )
     trade_days_all = [d for d in td_all if d >= start_c]
     if not trade_days_all:
         return False, wind
@@ -1922,7 +1938,14 @@ def _rebuild_nav_for_strategy_yearly(
     time_segs = _nav_eod_time_segments(start_c, latest_trade_c)
     for attempt in range(4):
         try:
-            db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid})
+
+            def _delete_nav(sess: Session) -> None:
+                sess.execute(
+                    text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid}
+                )
+                sess.commit()
+
+            _locked_db_op(_delete_nav)
             break
         except OperationalError as oe:
             if not _mysql_lock_contention(oe) or attempt >= 3:
@@ -1953,12 +1976,22 @@ def _rebuild_nav_for_strategy_yearly(
                 sync_job_id,
                 "nav",
                 f"阶段2/3 {sid}：行情段 {seg_i}/{len(time_segs)}（{seg_st}~{seg_ed}，{len(seg_codes)} 只股票）…",
-                db=db,
+                db=None if turso_remote else db,
                 do_commit=True,
             )
-        wind, day_map, bench_day_map = _load_segment_wind_maps(
-            wind, db, seg_codes, seg_st, seg_ed, bench_code
-        )
+
+        def _load_maps(sess: Session):
+            return _load_segment_wind_maps(wind, sess, seg_codes, seg_st, seg_ed, bench_code)
+
+        if turso_remote:
+            with turso_stream_lock():
+                seg_db = SessionLocalFactory()
+                try:
+                    wind, day_map, bench_day_map = _load_maps(seg_db)
+                finally:
+                    seg_db.close()
+        else:
+            wind, day_map, bench_day_map = _load_maps(db)
 
         for td in seg_days:
             td_i += 1
@@ -1967,7 +2000,7 @@ def _rebuild_nav_for_strategy_yearly(
                     sync_job_id,
                     "nav",
                     f"阶段2/3 {sid}：净值计算中 {td}（段 {seg_i}/{len(time_segs)}）…",
-                    db=db,
+                    db=None if turso_remote else db,
                     do_commit=True,
                 )
             rb_idx_at_start = rb_idx
@@ -2053,21 +2086,38 @@ def _rebuild_nav_for_strategy_yearly(
                 }
             )
             if len(nav_accum) >= nav_persist_chunk:
-                _flush_strategy_nav_daily_batch(db, nav_accum)
+                batch = nav_accum
+
+                def _flush_chunk(sess: Session) -> None:
+                    _flush_strategy_nav_daily_batch(sess, batch)
+                    sess.commit()
+
+                _locked_db_op(_flush_chunk)
                 nav_accum.clear()
 
         day_map.clear()
         bench_day_map.clear()
         if _wind_low_memory_mode():
-            try:
-                wind_sql.close_wind(wind, db)
-            except Exception:
-                pass
-            wind = wind_sql.open_wind(db)
+
+            def _reopen_wind(sess: Session):
+                nonlocal wind
+                try:
+                    wind_sql.close_wind(wind, sess)
+                except Exception:
+                    pass
+                wind = wind_sql.open_wind(sess)
+
+            _locked_db_op(_reopen_wind)
         gc.collect()
 
     if nav_accum:
-        _flush_strategy_nav_daily_batch(db, nav_accum)
+        batch = nav_accum
+
+        def _flush_tail(sess: Session) -> None:
+            _flush_strategy_nav_daily_batch(sess, batch)
+            sess.commit()
+
+        _locked_db_op(_flush_tail)
         nav_accum.clear()
     shares.clear()
     last_close_fill.clear()
@@ -2344,7 +2394,7 @@ def _rebuild_nav_for_strategy(
 
 
 def rebuild_nav_series(
-    db: Session,
+    db: Session | None,
     wind,
     strategy_ids: list[str],
     mode: str = "incremental",
@@ -2363,23 +2413,37 @@ def rebuild_nav_series(
     mode_l = str(mode or "incremental").strip().lower()
     if mode_l not in ("incremental", "full"):
         raise ValueError(f"invalid nav rebuild mode: {mode}")
+    from app.db import SessionLocalFactory, turso_stream_lock, uses_remote_turso_only
+
+    turso_remote = uses_remote_turso_only()
+
     sids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
     if not sids:
-        if do_commit:
+        if do_commit and db is not None:
             db.commit()
         return {"rebuilt": 0, "failed": 0, "errors": []}, wind
 
     mtd_nav = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
     latest_trade = mtd_nav["d"] if mtd_nav else None
     if not latest_trade:
-        if do_commit:
+        if do_commit and db is not None:
             db.commit()
         return {"rebuilt": 0, "failed": len(sids), "errors": ["No trade date in winddb"]}, wind
     latest_trade_c = _compact_date(latest_trade)
     if len(latest_trade_c) < 8:
         latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
-    plans = _batch_nav_mysql_plans(db, sids, mode_l)
+    if turso_remote:
+        with turso_stream_lock():
+            plan_db = SessionLocalFactory()
+            try:
+                plans = _batch_nav_mysql_plans(plan_db, sids, mode_l)
+            finally:
+                plan_db.close()
+    else:
+        if db is None:
+            raise ValueError("rebuild_nav_series requires db session")
+        plans = _batch_nav_mysql_plans(db, sids, mode_l)
     low_mem = _wind_low_memory_mode()
     wind_bundle: dict[str, Any] | None = None
     if not low_mem:
@@ -2396,16 +2460,35 @@ def rebuild_nav_series(
             if global_st is None or st < global_st:
                 global_st = st
         if global_st and union_codes:
-            wind, eod_all = wind_bulk.load_eod_by_code(
-                wind, sorted(union_codes), global_st, latest_trade_c, db
-            )
-            if union_bench:
-                wind, idx_all = wind_bulk.load_index_eod_by_code(
-                    wind, sorted(union_bench), global_st, latest_trade_c, db
-                )
+            if turso_remote:
+                with turso_stream_lock():
+                    bundle_db = SessionLocalFactory()
+                    try:
+                        wind, eod_all = wind_bulk.load_eod_by_code(
+                            wind, sorted(union_codes), global_st, latest_trade_c, bundle_db
+                        )
+                        if union_bench:
+                            wind, idx_all = wind_bulk.load_index_eod_by_code(
+                                wind, sorted(union_bench), global_st, latest_trade_c, bundle_db
+                            )
+                        else:
+                            idx_all = {}
+                        wind, td_all = wind_bulk.fetch_trade_date_compacts(
+                            wind, bundle_db, global_st, latest_trade_c
+                        )
+                    finally:
+                        bundle_db.close()
             else:
-                idx_all = {}
-            wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, latest_trade_c)
+                wind, eod_all = wind_bulk.load_eod_by_code(
+                    wind, sorted(union_codes), global_st, latest_trade_c, db
+                )
+                if union_bench:
+                    wind, idx_all = wind_bulk.load_index_eod_by_code(
+                        wind, sorted(union_bench), global_st, latest_trade_c, db
+                    )
+                else:
+                    idx_all = {}
+                wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, latest_trade_c)
             wind_bundle = {"eod": eod_all, "idx": idx_all, "td": td_all}
 
     skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
@@ -2423,74 +2506,127 @@ def rebuild_nav_series(
                 sync_job_id,
                 "nav",
                 f"阶段2/3 净值 [{nav_seq}/{total_nav}] 正在处理 {sid}…",
-                db=db,
-                do_commit=False,
+                db=None if turso_remote else db,
+                do_commit=bool(turso_remote),
             )
         per_bundle: dict[str, Any] | None = None
         try:
             # Turso 远程 Hrana 不支持 SQLAlchemy SAVEPOINT（sa_savepoint_*），勿用 begin_nested。
             pl = plans.get(sid)
-            if pl and low_mem:
-                counted, wind = _rebuild_nav_for_strategy(
-                    db,
+
+            def _rebuild_one(sdb: Session) -> tuple[bool, Any]:
+                if pl and low_mem:
+                    return _rebuild_nav_for_strategy(
+                        sdb,
+                        wind,
+                        sid,
+                        mode_l,
+                        latest_trade_c_cached=latest_trade_c,
+                        mysql_plan=pl,
+                        wind_bundle=None,
+                        sync_job_id=sync_job_id,
+                    )
+                if pl:
+                    return _rebuild_nav_for_strategy(
+                        sdb,
+                        wind,
+                        sid,
+                        mode_l,
+                        latest_trade_c_cached=latest_trade_c,
+                        mysql_plan=pl,
+                        wind_bundle=wind_bundle,
+                        sync_job_id=sync_job_id,
+                    )
+                return _rebuild_nav_for_strategy(
+                    sdb,
                     wind,
                     sid,
                     mode_l,
                     latest_trade_c_cached=latest_trade_c,
-                    mysql_plan=pl,
-                    wind_bundle=None,
                     sync_job_id=sync_job_id,
                 )
-            elif pl:
-                counted, wind = _rebuild_nav_for_strategy(
-                    db,
-                    wind,
-                    sid,
-                    mode_l,
-                    latest_trade_c_cached=latest_trade_c,
-                    mysql_plan=pl,
-                    wind_bundle=wind_bundle,
-                    sync_job_id=sync_job_id,
-                )
+
+            if turso_remote:
+                with turso_stream_lock():
+                    sdb = SessionLocalFactory()
+                    try:
+                        if wind is None:
+                            wind = wind_sql.open_wind(sdb)
+                        counted, wind = _rebuild_one(sdb)
+                        if counted:
+                            done += 1
+                            completed_nav.append(sid)
+                            if sync_job_id is not None:
+                                ck_row = (
+                                    sdb.execute(
+                                        text(
+                                            "SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"
+                                        ),
+                                        {"id": sync_job_id},
+                                    )
+                                    .mappings()
+                                    .first()
+                                )
+                                cp = _sync_load_checkpoint(
+                                    ck_row.get("checkpoint_json") if ck_row else None
+                                )
+                                _sync_save_checkpoint(
+                                    sdb,
+                                    sync_job_id,
+                                    completed_import=cp.get("completed_import") or [],
+                                    completed_nav=sorted(set(completed_nav)),
+                                    stage="nav",
+                                    do_commit=False,
+                                )
+                                _admin_sync_job_touch(
+                                    sync_job_id,
+                                    "nav",
+                                    f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] 已完成 {sid}",
+                                    db=sdb,
+                                    do_commit=False,
+                                )
+                        if do_commit:
+                            sdb.commit()
+                    finally:
+                        if low_mem:
+                            try:
+                                wind_sql.close_wind(wind, sdb)
+                            except Exception:
+                                pass
+                            wind = None
+                        sdb.close()
             else:
-                counted, wind = _rebuild_nav_for_strategy(
-                    db,
-                    wind,
-                    sid,
-                    mode_l,
-                    latest_trade_c_cached=latest_trade_c,
-                    sync_job_id=sync_job_id,
-                )
-            if counted:
-                done += 1
-                completed_nav.append(sid)
-                if sync_job_id is not None:
-                    ck_row = (
-                        db.execute(
-                            text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
-                            {"id": sync_job_id},
+                counted, wind = _rebuild_one(db)
+                if counted:
+                    done += 1
+                    completed_nav.append(sid)
+                    if sync_job_id is not None:
+                        ck_row = (
+                            db.execute(
+                                text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                                {"id": sync_job_id},
+                            )
+                            .mappings()
+                            .first()
                         )
-                        .mappings()
-                        .first()
-                    )
-                    cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
-                    _sync_save_checkpoint(
-                        db,
-                        sync_job_id,
-                        completed_import=cp.get("completed_import") or [],
-                        completed_nav=sorted(set(completed_nav)),
-                        stage="nav",
-                        do_commit=False,
-                    )
-                    _admin_sync_job_touch(
-                        sync_job_id,
-                        "nav",
-                        f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] 已完成 {sid}（写入 {counted} 条净值日）",
-                        db=db,
-                        do_commit=False,
-                    )
-            if do_commit:
-                db.commit()
+                        cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
+                        _sync_save_checkpoint(
+                            db,
+                            sync_job_id,
+                            completed_import=cp.get("completed_import") or [],
+                            completed_nav=sorted(set(completed_nav)),
+                            stage="nav",
+                            do_commit=False,
+                        )
+                        _admin_sync_job_touch(
+                            sync_job_id,
+                            "nav",
+                            f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] 已完成 {sid}",
+                            db=db,
+                            do_commit=False,
+                        )
+                if do_commit:
+                    db.commit()
         except Exception as ex:
             failed += 1
             errors.append(f"{sid}: {ex}")
@@ -2499,10 +2635,10 @@ def rebuild_nav_series(
                     sync_job_id,
                     "nav",
                     f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] {sid} 失败：{ex}"[:6000],
-                    db=db,
-                    do_commit=False,
+                    db=None if turso_remote else db,
+                    do_commit=bool(turso_remote),
                 )
-            if do_commit:
+            if do_commit and db is not None:
                 try:
                     db.rollback()
                 except Exception:
@@ -2519,7 +2655,7 @@ def rebuild_nav_series(
         finally:
             _release_wind_memory(per_bundle)
     _release_wind_memory(wind_bundle)
-    if do_commit:
+    if do_commit and db is not None:
         db.commit()
     return {
         "rebuilt": done,
@@ -2753,63 +2889,6 @@ def execute_admin_sync_pipeline(
                     "resumable": True,
                     **imp,
                 }
-            t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
-            if t1 > 0:
-                p("import", f"导入完成，休眠 {t1}s 后进入净值…")
-                time.sleep(t1)
-            if ids_set <= completed_nav:
-                nav_ret = {
-                    "rebuilt": len(completed_nav),
-                    "failed": 0,
-                    "errors": [],
-                    "completed_nav_ids": sorted(completed_nav),
-                }
-                p("nav", f"阶段2/3：净值已跳过（{len(completed_nav)} 个策略已于断点完成）")
-                wind = wind_sql.open_wind(db)
-            else:
-                p(
-                    "nav",
-                    f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略"
-                    f"{f'，续传跳过 {len(completed_nav)} 个' if completed_nav else ''}）…",
-                )
-                wind = wind_sql.open_wind(db)
-                nav_ret, wind = rebuild_nav_series(
-                    db,
-                    wind,
-                    ids,
-                    mode=import_mode,
-                    do_commit=True,
-                    skip_strategy_ids=completed_nav,
-                    sync_job_id=sync_job_id,
-                )
-                completed_nav = set(nav_ret.get("completed_nav_ids") or [])
-            if int(nav_ret.get("failed") or 0) > 0 and not ids_set <= completed_nav:
-                return {
-                    "ok": False,
-                    "stage": "nav",
-                    "resumable": True,
-                    "imported": imp.get("imported", 0),
-                    "nav_rebuilt": nav_ret.get("rebuilt", 0),
-                    "failed": nav_ret.get("failed", 0),
-                    "errors": nav_ret.get("errors", []),
-                }
-            if sync_job_id is not None:
-                _sync_save_checkpoint(
-                    db,
-                    sync_job_id,
-                    completed_import=sorted(completed_import),
-                    completed_nav=sorted(completed_nav),
-                    stage="update",
-                    do_commit=True,
-                )
-            t2 = float(settings.admin_sync_sleep_after_nav_seconds or 0.0)
-            if t2 > 0:
-                p("nav", f"净值完成，休眠 {t2}s…")
-                time.sleep(t2)
-            if wind is not None:
-                wind_sql.close_wind(wind, db)
-                wind = None
-            gc.collect()
         except Exception as ex:
             try:
                 db.rollback()
@@ -2817,19 +2896,94 @@ def execute_admin_sync_pipeline(
                 pass
             return {
                 "ok": False,
-                "stage": "import_or_nav",
+                "stage": "import",
                 "imported": (imp or {}).get("imported", 0),
-                "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
+                "nav_rebuilt": 0,
                 "failed": len(ids),
                 "errors": [str(ex)],
             }
         finally:
-            if wind is not None:
-                try:
-                    wind_sql.close_wind(wind, db)
-                except Exception:
-                    pass
             db.close()
+
+    t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
+    if t1 > 0:
+        p("import", f"导入完成，休眠 {t1}s 后进入净值…", detached=True)
+        time.sleep(t1)
+
+    try:
+        if ids_set <= completed_nav:
+            nav_ret = {
+                "rebuilt": len(completed_nav),
+                "failed": 0,
+                "errors": [],
+                "completed_nav_ids": sorted(completed_nav),
+            }
+            p("nav", f"阶段2/3：净值已跳过（{len(completed_nav)} 个策略已于断点完成）", detached=True)
+        else:
+            p(
+                "nav",
+                f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略"
+                f"{f'，续传跳过 {len(completed_nav)} 个' if completed_nav else ''}）…",
+                detached=True,
+            )
+            wind = wind_sql.open_wind(None)
+            nav_ret, wind = rebuild_nav_series(
+                None,
+                wind,
+                ids,
+                mode=import_mode,
+                do_commit=True,
+                skip_strategy_ids=completed_nav,
+                sync_job_id=sync_job_id,
+            )
+            completed_nav = set(nav_ret.get("completed_nav_ids") or [])
+        if int(nav_ret.get("failed") or 0) > 0 and not ids_set <= completed_nav:
+            return {
+                "ok": False,
+                "stage": "nav",
+                "resumable": True,
+                "imported": imp.get("imported", 0),
+                "nav_rebuilt": nav_ret.get("rebuilt", 0),
+                "failed": nav_ret.get("failed", 0),
+                "errors": nav_ret.get("errors", []),
+            }
+        if sync_job_id is not None:
+            with turso_stream_lock():
+                db_ck = SessionLocalFactory()
+                try:
+                    _sync_save_checkpoint(
+                        db_ck,
+                        sync_job_id,
+                        completed_import=sorted(completed_import),
+                        completed_nav=sorted(completed_nav),
+                        stage="update",
+                        do_commit=True,
+                    )
+                finally:
+                    db_ck.close()
+        t2 = float(settings.admin_sync_sleep_after_nav_seconds or 0.0)
+        if t2 > 0:
+            p("nav", f"净值完成，休眠 {t2}s…", detached=True)
+            time.sleep(t2)
+        if wind is not None:
+            wind_sql.close_wind(wind, None)
+            wind = None
+        gc.collect()
+    except Exception as ex:
+        if wind is not None:
+            try:
+                wind_sql.close_wind(wind, None)
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "stage": "nav",
+            "resumable": True,
+            "imported": (imp or {}).get("imported", 0),
+            "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
+            "failed": len(ids),
+            "errors": [str(ex)],
+        }
 
     cap = int(getattr(settings, "admin_sync_wait_idle_update_seconds", 180) or 0)
     step = 3

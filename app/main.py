@@ -28,7 +28,7 @@ from app.config import settings
 from app.timeutil import now, now_naive, today as beijing_today
 from app.bg_threads import spawn_daemon
 from app.boot import boot_error, is_ready, start_background_boot
-from app.db import DatabaseNotReadyError
+from app.db import DatabaseNotReadyError, TursoStreamBusyError
 
 _log = logging.getLogger(__name__)
 from app.access_logging import UserAccessLogMiddleware
@@ -107,6 +107,11 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 @app.exception_handler(DatabaseNotReadyError)
 def _database_not_ready_handler(_request: Request, exc: DatabaseNotReadyError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@app.exception_handler(TursoStreamBusyError)
+def _turso_stream_busy_handler(_request: Request, exc: TursoStreamBusyError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 

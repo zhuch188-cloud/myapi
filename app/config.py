@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     nav_rebuild_eod_months: int = 1
     # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
     skip_startup_date_normalization: bool = False
+    # 管理端 API 等待 Turso 流锁的最长时间（秒）；全量同步跑净值时其它接口可能排队
+    turso_stream_lock_api_timeout_seconds: int = 90
 
 
 settings = Settings()
