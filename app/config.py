@@ -89,8 +89,8 @@ class Settings(BaseSettings):
     nav_rebuild_persist_chunk: int = 400
     # 低内存下分段拉 Wind EOD 算净值（避免全区间 day_map 一次驻留）
     nav_rebuild_year_segments: bool = True
-    # 净值 EOD 时间分段：>0 时按 N 个自然月一段（推荐 2～3）；0 则按自然年
-    nav_rebuild_eod_months: int = 3
+    # 净值 EOD 时间分段：>0 时按 N 个自然月一段（Render 512MB 建议 1）；0 则按自然年
+    nav_rebuild_eod_months: int = 1
     # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
     skip_startup_date_normalization: bool = False
 

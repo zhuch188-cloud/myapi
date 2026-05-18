@@ -1818,18 +1818,29 @@ def _nav_eod_time_segments(start_c: str, latest_trade_c: str) -> list[tuple[str,
 
 
 def _codes_for_nav_segment(
+    rb_sorted: list[date],
     rb_map: dict[date, list[tuple[str, float]]],
     shares: dict[str, float],
+    seg_st_compact: str,
     seg_ed_compact: str,
 ) -> list[str]:
-    """仅拉截至本段末日已出现过的成分股 + 当前持仓股，避免全历史成分一次性进 day_map。"""
-    end_d = datetime.strptime(str(seg_ed_compact).strip()[:8], "%Y%m%d").date()
+    """
+    仅拉与本段时间窗有交集的调仓期成分 + 当前模拟持仓股。
+    禁止「截至 seg_ed 的全部历史成分」（否则第 13 段也会拉到 676 只）。
+    """
+    seg_start = datetime.strptime(str(seg_st_compact).strip()[:8], "%Y%m%d").date()
+    seg_end = datetime.strptime(str(seg_ed_compact).strip()[:8], "%Y%m%d").date()
     codes: set[str] = {c for c in shares if c}
-    for rb_d, holdings in rb_map.items():
-        if rb_d <= end_d:
-            for c, _w in holdings:
-                if c:
-                    codes.add(c)
+    for i, rb_d in enumerate(rb_sorted):
+        if rb_d > seg_end:
+            break
+        next_rb = rb_sorted[i + 1] if i + 1 < len(rb_sorted) else None
+        # 调仓有效期 [rb_d, next_rb) 与 [seg_start, seg_end] 无交集则跳过
+        if next_rb is not None and next_rb <= seg_start:
+            continue
+        for c, _w in rb_map.get(rb_d, ()):
+            if c:
+                codes.add(c)
     return sorted(codes)
 
 
@@ -1934,7 +1945,7 @@ def _rebuild_nav_for_strategy_yearly(
         seg_days = [d for d in trade_days_all if seg_st <= d <= seg_ed]
         if not seg_days:
             continue
-        seg_codes = _codes_for_nav_segment(rb_map, shares, seg_ed)
+        seg_codes = _codes_for_nav_segment(rb_sorted, rb_map, shares, seg_st, seg_ed)
         if not seg_codes:
             continue
         if sync_job_id is not None:
@@ -2047,6 +2058,12 @@ def _rebuild_nav_for_strategy_yearly(
 
         day_map.clear()
         bench_day_map.clear()
+        if _wind_low_memory_mode():
+            try:
+                wind_sql.close_wind(wind, db)
+            except Exception:
+                pass
+            wind = wind_sql.open_wind(db)
         gc.collect()
 
     if nav_accum:
