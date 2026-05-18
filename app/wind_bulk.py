@@ -23,7 +23,7 @@ def eod_stock_chunk_size() -> int:
     if n > 0:
         return max(20, n)
     if bool(getattr(settings, "wind_low_memory_mode", True)):
-        return 20
+        return 15
     return EOD_STOCK_CHUNK
 _EOD_WIND_MAX_ATTEMPTS = 5
 
@@ -90,6 +90,16 @@ def _wind_transient_disconnect(exc: BaseException) -> bool:
     if "通讯链接失败" in str(exc) or "远程主机强迫关闭" in str(exc):
         return True
     return "connection" in s and ("forcibly closed" in s or "broken pipe" in s)
+
+
+def eod_range_segments(st_compact: str, td_compact: str) -> list[tuple[str, str]]:
+    """低内存 + nav_rebuild_eod_months>0 时按月分段，否则按自然年。"""
+    st = str(st_compact).strip()[:8]
+    td = str(td_compact).strip()[:8]
+    months = int(getattr(settings, "nav_rebuild_eod_months", 0) or 0)
+    if months > 0 and bool(getattr(settings, "wind_low_memory_mode", True)):
+        return month_compact_segments(st, td, step_months=months)
+    return _year_compact_segments(st, td)
 
 
 def _year_compact_segments(st_compact: str, td_compact: str) -> list[tuple[str, str]]:
@@ -172,7 +182,7 @@ def load_eod_by_code(
         return wind, {}
     td_s = str(td_compact).strip()
     st_s = str(start_compact).strip()
-    segs = _year_compact_segments(st_s, td_s)
+    segs = eod_range_segments(st_s, td_s)
     if not segs:
         segs = [(st_s, td_s)]
     w = wind
@@ -259,7 +269,7 @@ def load_index_eod_by_code(
         return wind, {}
     td_s = str(td_compact).strip()
     st_s = str(start_compact).strip()
-    segs = _year_compact_segments(st_s, td_s)
+    segs = eod_range_segments(st_s, td_s)
     if not segs:
         segs = [(st_s, td_s)]
     w = wind

@@ -567,13 +567,13 @@
         const d = await api("/api/admin/import-jobs?limit=30");
         const items = d.items || [];
         document.getElementById("importJobTb").innerHTML = `
-          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>进度</th><th>说明</th><th>操作</th></tr></thead>
+          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>进度</th><th>说明</th><th>操作</th></tr></thead>
           <tbody>${items.map(j => {
             const all = (() => { try { return JSON.parse(j.strategy_ids_json || "[]").length; } catch (_) { return "?"; } })();
             const done = (() => { try { return JSON.parse(j.completed_strategy_ids_json || "[]").length; } catch (_) { return 0; } })();
             const btn = j.resumable ? resumableJobButtons("resumeImportJob", "abandonImportJob", j.id) : "";
-            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${done}/${all}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
-          }).join("") || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
+            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.started_at||"—")}</td><td>${done}/${all}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
+          }).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function pollSyncJob(jobId) {
         const msg = document.getElementById("jobMsg");
@@ -581,7 +581,8 @@
         while (Date.now() < deadline) {
           const st = await api("/api/admin/sync-jobs/" + encodeURIComponent(String(jobId)));
           const stg = st.stage ? ` · ${st.stage}` : "";
-          msg.textContent = `#${st.id} ${st.status}${stg}${st.message ? " — " + st.message : ""}`;
+          const stt = st.started_at ? ` · 开始 ${st.started_at}` : "";
+          msg.textContent = `#${st.id} ${st.status}${stg}${stt}${st.message ? " — " + st.message : ""}`;
           await loadSyncJobs();
           await loadUpdateJobs();
           if (st.status === "QUEUED" || st.status === "RUNNING") {
@@ -633,11 +634,11 @@
         const d = await api("/api/admin/sync-jobs?limit=20");
         const items = d.items || [];
         document.getElementById("syncJobTb").innerHTML = `
-          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>阶段</th><th>说明</th><th>操作</th></tr></thead>
+          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>阶段</th><th>说明</th><th>操作</th></tr></thead>
           <tbody>${items.map(j => {
             const btn = j.resumable ? resumableJobButtons("resumeSyncJob", "abandonSyncJob", j.id) : "";
-            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.stage||"-")}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
-          }).join("") || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
+            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.started_at||"—")}</td><td>${esc(j.stage||"-")}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
+          }).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function updateLatestSelected() {
         const ids = selectedStrategyIds();

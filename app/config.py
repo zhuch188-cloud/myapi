@@ -76,8 +76,10 @@ class Settings(BaseSettings):
     admin_sync_wait_idle_update_seconds: int = 180
     # Render 免费档等低内存环境：按策略串行拉 Wind 算净值/快照，不合并多策略 EOD（默认开；大内存本机可设 false）
     wind_low_memory_mode: bool = True
-    # Wind 单次 IN 股票数（默认 80）；大策略/Render 512MB 可改为 40～50 降低峰值内存
+    # Wind 单次 IN 股票数（默认 80）；Render 512MB 建议 10～15（低内存未设时默认 15）
     wind_eod_stock_chunk: int = 0
+    # 低内存：数据更新按「调仓期 × 股票小批」拉 EOD，避免千只股票全历史一次进内存
+    update_eod_per_rebalance_chunk: bool = True
     # 策略 Excel 导入：持仓 UPSERT 批大小（减少逐行往返）
     strategy_import_position_batch_size: int = 500
     # 大 Excel（如沪深300增强）：openpyxl 流式读行，避免整表进 pandas（阶段1 导入）

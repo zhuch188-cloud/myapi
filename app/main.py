@@ -3708,11 +3708,22 @@ def admin_import(
             raise HTTPException(status_code=404, detail="strategy import job not found")
         if not strategy_import_job_is_resumable(job):
             raise HTTPException(status_code=400, detail="该导入任务不可续传")
+        from app.timeutil import now_naive
+
+        resume_ts = now_naive().strftime("%Y-%m-%d %H:%M:%S")
         db.execute(
             text(
-                "UPDATE strategy_import_jobs SET status='QUEUED', message='续传已入队' WHERE id=:id"
+                f"""
+                UPDATE strategy_import_jobs
+                SET status='QUEUED',
+                    started_at={sql_now()},
+                    progress_at={sql_now()},
+                    finished_at=NULL,
+                    message=:m
+                WHERE id=:id
+                """
             ),
-            {"id": job_id},
+            {"id": job_id, "m": f"续传已入队（{resume_ts}）"},
         )
         db.commit()
         background_tasks.add_task(run_strategy_import_background_task, job_id, resume=True)
@@ -3863,7 +3874,7 @@ def admin_list_sync_jobs(
         text(
             """
             SELECT id, status, stage, message, import_mode, triggered_by,
-                   created_at, finished_at, result_json, checkpoint_json, progress_at
+                   created_at, started_at, finished_at, result_json, checkpoint_json, progress_at
             FROM admin_sync_jobs
             ORDER BY id DESC
             LIMIT :lim
@@ -3936,11 +3947,23 @@ def admin_sync_job_resume(
     ids = json.loads(str(row.get("strategy_ids_json") or "[]"))
     import_mode = str(row.get("import_mode") or "incremental")
     username = str(user.get("username") or "admin")
+    from app.timeutil import now_naive
+
+    resume_ts = now_naive().strftime("%Y-%m-%d %H:%M:%S")
     db.execute(
         text(
-            "UPDATE admin_sync_jobs SET status='QUEUED', message='续传已入队', finished_at=NULL WHERE id=:id"
+            f"""
+            UPDATE admin_sync_jobs
+            SET status='QUEUED',
+                stage='queued',
+                started_at={sql_now()},
+                progress_at={sql_now()},
+                finished_at=NULL,
+                message=:m
+            WHERE id=:id
+            """
         ),
-        {"id": job_id},
+        {"id": job_id, "m": f"续传已入队（{resume_ts}）"},
     )
     db.commit()
     background_tasks.add_task(
@@ -4022,8 +4045,8 @@ def admin_list_import_jobs(
         text(
             """
             SELECT id, status, import_mode, strategy_ids_json, completed_strategy_ids_json,
-                   imported_count, failed_count, message, triggered_by, created_at, finished_at,
-                   progress_at
+                   imported_count, failed_count, message, triggered_by, created_at, started_at,
+                   finished_at, progress_at
             FROM strategy_import_jobs
             ORDER BY id DESC
             LIMIT :lim
