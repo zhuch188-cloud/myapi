@@ -88,7 +88,7 @@
           <button class="secondary" onclick="exportStrategyConfigs()">导出配置模板</button>
           <button class="secondary" onclick="triggerImportStrategyConfigs()">导入配置文件</button>
           <input id="cfgImportFile" type="file" accept=".csv" style="display:none" onchange="importStrategyConfigsFile(this)" />
-          <button class="secondary" onclick="loadAdminStrategies()">刷新列表</button>
+          <button class="secondary" id="btnRefreshStrategies" onclick="loadAdminStrategies({ preserveSelection: true })">刷新列表</button>
           <span id="msg" class="muted"></span>
         </div>
       </div>
@@ -147,10 +147,34 @@
         if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
         return res.json();
       }
-      async function loadAdminStrategies() {
-        const data = await api("/api/admin/strategies", { headers: authHeaders() });
+      async function loadAdminStrategies(opts) {
+        const preserveSelection = !!(opts && opts.preserveSelection);
+        const prevSelected = preserveSelection
+          ? new Set([
+              ...selectedSidSet,
+              ...Array.from(document.querySelectorAll("input.sid-check"))
+                .filter((x) => x.checked)
+                .map((x) => (x.value || x.dataset.sid || "").trim())
+                .filter(Boolean),
+            ])
+          : null;
+        const btn = document.getElementById("btnRefreshStrategies");
+        const prevBtnText = btn ? btn.textContent : "";
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = "刷新中…";
+        }
+        let data;
+        try {
+          data = await api("/api/admin/strategies", { headers: authHeaders() });
+        } finally {
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = prevBtnText || "刷新列表";
+          }
+        }
         const items = data.items || [];
-        selectedSidSet = new Set();
+        if (!preserveSelection) selectedSidSet = new Set();
         strategyMap = new Map(items.map((x) => [String(x.strategy_id || ""), x]));
         document.getElementById("adminCfgTable").innerHTML = `
           <thead><tr><th>勾选</th><th>可见</th><th>策略ID</th><th>显示名</th><th>分类</th><th>调仓频率</th><th>文件目录</th><th>文件名</th><th>文件存在</th><th>库内最新调仓日</th><th>基准代码</th><th>基准名称</th><th>状态</th><th>来源</th><th>备注</th><th>文件时间</th></tr></thead>
@@ -175,7 +199,26 @@
               <td>${esc(i.file_mtime || (fileOk ? "" : "—"))}</td>
             </tr>`;
           }).join("")}</tbody>`;
+        if (preserveSelection && prevSelected) {
+          selectedSidSet = prevSelected;
+          document.querySelectorAll(".sid-check").forEach((x) => {
+            const sid = (x.value || x.dataset.sid || "").trim();
+            if (sid && selectedSidSet.has(sid)) x.checked = true;
+          });
+        }
         refreshSelectedInfo();
+      }
+      async function refreshStrategyListAfterJob() {
+        try {
+          await loadAdminStrategies({ preserveSelection: true });
+        } catch (_) { /* 同步占用数据库时可能短暂失败，不影响任务状态 */ }
+      }
+      let lastStrategyListRefreshAt = 0;
+      async function maybeRefreshStrategyListDuringPoll() {
+        const now = Date.now();
+        if (now - lastStrategyListRefreshAt < 15000) return;
+        lastStrategyListRefreshAt = now;
+        await refreshStrategyListAfterJob();
       }
       function onSidCheck(el) {
         const sid = (el && (el.value || el.dataset.sid || "") || "").trim();
@@ -256,7 +299,7 @@
           if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
           const ret = await res.json();
           msg.textContent = `导入成功：${ret.upserted || 0} 条`;
-          loadAdminStrategies();
+          await loadAdminStrategies({ preserveSelection: true });
         } catch (e) { msg.textContent = `导入失败：${formatFetchError(e)}`; }
       }
       async function exportStrategyConfigs() {
@@ -310,6 +353,9 @@
               const stg = st.stage ? ` · ${st.stage}` : "";
               const tail = st.message ? ` — ${st.message}` : "";
               msg.textContent = `#${st.id} ${st.status}${stg}${tail}`;
+              if (st.status === "QUEUED" || st.status === "RUNNING") {
+                await maybeRefreshStrategyListDuringPoll();
+              }
               if (st.status !== "QUEUED" && st.status !== "RUNNING") {
                 await loadSyncJobs();
                 const rj = parseSyncResultJson(st.result_json) || {};
@@ -318,8 +364,8 @@
                   msg.textContent = `执行失败（${rj.stage || st.stage || ""}）：${(rj.errors || []).join("；") || "未知原因"}${hint}`;
                 } else {
                   msg.textContent = `执行成功：导入 ${rj.imported != null ? rj.imported : "—"} 个策略并完成最新交易日提取`;
-                  loadAdminStrategies();
                 }
+                await refreshStrategyListAfterJob();
                 return;
               }
               await sleep(2000);
@@ -332,7 +378,7 @@
             return;
           }
           msg.textContent = `执行成功：导入 ${ret.imported} 个策略并完成最新交易日提取`;
-          loadAdminStrategies();
+          await refreshStrategyListAfterJob();
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -386,7 +432,7 @@
           msg.textContent = "修正路径中…";
           const ret = await api("/api/admin/strategies/normalize-upload-paths", { method: "POST" });
           msg.textContent = `已修正 ${ret.updated || 0} 条 file_dir`;
-          loadAdminStrategies();
+          await loadAdminStrategies({ preserveSelection: true });
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       async function batchUploadStrategyDataFiles() {
@@ -407,7 +453,7 @@
           const fails = (ret.results || []).filter((x) => !x.ok);
           msg.textContent = `批量完成：成功 ${ret.uploaded || 0}，失败 ${ret.failed || 0}` +
             (fails.length ? `；例：${fails[0].filename} — ${fails[0].error}` : "");
-          loadAdminStrategies();
+          await loadAdminStrategies({ preserveSelection: true });
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       async function uploadStrategyDataFile() {
@@ -435,6 +481,7 @@
           document.getElementById("file_dir").value = body.file_dir || "";
           document.getElementById("file_name").value = body.file_name || "";
           msg.textContent = `已上传：${body.path || ""}`;
+          await refreshStrategyListAfterJob();
         } catch (e) {
           msg.textContent = formatFetchError(e);
         }
@@ -449,7 +496,13 @@
           const j = await api("/api/admin/import-jobs/" + encodeURIComponent(String(jobId)));
           msg.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
           await loadImportJobs();
-          if (j.status !== "QUEUED" && j.status !== "RUNNING") return j;
+          if (j.status === "QUEUED" || j.status === "RUNNING") {
+            await maybeRefreshStrategyListDuringPoll();
+          }
+          if (j.status !== "QUEUED" && j.status !== "RUNNING") {
+            await refreshStrategyListAfterJob();
+            return j;
+          }
           await sleep(2000);
         }
         msg.textContent += "（轮询超时）";
@@ -518,7 +571,13 @@
           msg.textContent = `#${st.id} ${st.status}${stg}${st.message ? " — " + st.message : ""}`;
           await loadSyncJobs();
           await loadUpdateJobs();
-          if (st.status !== "QUEUED" && st.status !== "RUNNING") return st;
+          if (st.status === "QUEUED" || st.status === "RUNNING") {
+            await maybeRefreshStrategyListDuringPoll();
+          }
+          if (st.status !== "QUEUED" && st.status !== "RUNNING") {
+            await refreshStrategyListAfterJob();
+            return st;
+          }
           await sleep(2000);
         }
         msg.textContent += "（轮询超时）";
@@ -593,11 +652,18 @@
             }
             msg.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
             await loadUpdateJobs();
-            if (j.status !== "RUNNING") return;
+            if (j.status === "RUNNING") {
+              await maybeRefreshStrategyListDuringPoll();
+            }
+            if (j.status !== "RUNNING") {
+              await refreshStrategyListAfterJob();
+              return;
+            }
             await sleep(2000);
           }
           msg.textContent += "（轮询超时）";
           await loadUpdateJobs();
+          await refreshStrategyListAfterJob();
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       async function deleteSelected() {
@@ -613,7 +679,7 @@
             body: JSON.stringify({ strategy_ids: ids })
           });
           msg.textContent = `删除完成：${ret.deleted_count || 0} 个`;
-          loadAdminStrategies();
+          await loadAdminStrategies({ preserveSelection: true });
         } catch (e) {
           msg.textContent = formatFetchError(e);
         }
@@ -644,7 +710,7 @@
         try {
           await api("/api/admin/strategies", { method: "POST", body: JSON.stringify(payload) });
           msg.textContent = "保存成功";
-          loadAdminStrategies();
+          await loadAdminStrategies({ preserveSelection: true });
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       ensureAuth();

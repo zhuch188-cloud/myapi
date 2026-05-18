@@ -2168,13 +2168,19 @@ def execute_admin_sync_pipeline(
     if not ids:
         return {"ok": False, "stage": "validate", "failed": 0, "errors": ["strategy_ids 为空"]}
 
-    from app.db import SessionLocalFactory
+    from app.db import SessionLocalFactory, turso_stream_lock
 
     db = SessionLocalFactory()
 
-    def p(stage: str, msg: str) -> None:
+    def p(stage: str, msg: str, *, detached: bool = False) -> None:
         if sync_job_id is not None:
-            _admin_sync_job_touch(sync_job_id, stage, msg, db=db, do_commit=True)
+            _admin_sync_job_touch(
+                sync_job_id,
+                stage,
+                msg,
+                db=None if detached else db,
+                do_commit=True,
+            )
 
     p("precheck", "检查僵尸 RUNNING、数据更新任务互斥…")
     wind = None
@@ -2346,7 +2352,7 @@ def execute_admin_sync_pipeline(
 
     cap = int(getattr(settings, "admin_sync_wait_idle_update_seconds", 180) or 0)
     step = 3
-    p("wait_idle", "阶段3/3 前：等待进程内数据更新互斥锁释放…")
+    p("wait_idle", "阶段3/3 前：等待进程内数据更新互斥锁释放…", detached=True)
     if cap > 0:
         t0 = time.monotonic()
         last_touch = 0.0
@@ -2354,7 +2360,7 @@ def execute_admin_sync_pipeline(
             elapsed = int(time.monotonic() - t0)
             if elapsed - last_touch >= 9:
                 last_touch = float(elapsed)
-                p("wait_idle", f"等待其它数据更新结束… 已等待 {elapsed}s / 上限 {cap}s")
+                p("wait_idle", f"等待其它数据更新结束… 已等待 {elapsed}s / 上限 {cap}s", detached=True)
             time.sleep(step)
     if _job_running:
         wait_hint = f"已等待 {cap} 秒" if cap > 0 else "未配置等待（ADMIN_SYNC_WAIT_IDLE_UPDATE_SECONDS=0）"
@@ -2369,20 +2375,21 @@ def execute_admin_sync_pipeline(
             ],
         }
 
-    p("holding_update", "阶段3/3：写入最新交易日持仓快照（可能较久）…")
+    p("holding_update", "阶段3/3：写入最新交易日持仓快照（可能较久）…", detached=True)
     db2: Session | None = None
     try:
-        db2 = SessionLocalFactory()
-        run_update(
-            db2,
-            "MANUAL",
-            username,
-            full_refresh=True,
-            selected_strategy_ids=ids,
-            do_commit=True,
-            skip_nav_rebuild=True,
-            sync_job_id=sync_job_id,
-        )
+        with turso_stream_lock():
+            db2 = SessionLocalFactory()
+            run_update(
+                db2,
+                "MANUAL",
+                username,
+                full_refresh=True,
+                selected_strategy_ids=ids,
+                do_commit=True,
+                skip_nav_rebuild=True,
+                sync_job_id=sync_job_id,
+            )
         return {
             "ok": True,
             "stage": "all_success",
@@ -2421,16 +2428,18 @@ def run_admin_sync_background_task(
     """供 FastAPI BackgroundTasks 调用：先标 RUNNING，再跑管道并落库终态。"""
     from app.db import turso_stream_lock
 
-    with turso_stream_lock():
-        try:
+    try:
+        with turso_stream_lock():
             if not _admin_sync_mark_running(job_id):
                 return
-            ret = execute_admin_sync_pipeline(
-                username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
-            )
+        ret = execute_admin_sync_pipeline(
+            username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
+        )
+        with turso_stream_lock():
             _finalize_admin_sync_job(job_id, ret)
-        except Exception as ex:
-            _log.exception("admin_sync job %s failed", job_id)
+    except Exception as ex:
+        _log.exception("admin_sync job %s failed", job_id)
+        with turso_stream_lock():
             _finalize_admin_sync_job(
                 job_id,
                 {
