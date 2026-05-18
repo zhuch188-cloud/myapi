@@ -1664,8 +1664,9 @@ def run_update(
             elif rb_chunked_eod:
                 chunk_n = _effective_eod_chunk_size(len(stock_codes))
                 prog(
-                    f"[{i_active}/{n_active}] {sid}：低内存按调仓期分批 EOD"
-                    f"（每期最多 {chunk_n} 只/批，按各调仓日缩短区间，共 {len(stock_codes)} 只成分）…"
+                    f"[{i_active}/{n_active}] {sid}：低内存按股票分批 EOD"
+                    f"（约 {max(1, (len(stock_codes) + chunk_n - 1) // chunk_n)} 批 × "
+                    f"{n_rb} 个调仓期，共 {len(stock_codes)} 只成分）…"
                 )
             else:
                 prog(
@@ -1704,81 +1705,14 @@ def run_update(
                         db.rollback()
                     time.sleep(0.25 * (2**attempt))
             skip_rb = skip_update_rebalance_dates or set()
-            for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
-                if not positions:
-                    prog(f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} 无仓位，跳过")
-                    continue
-                rb_compact = _compact_date(rebalance)
-                if rb_compact and rb_compact in skip_rb:
-                    prog(
-                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance} "
-                        f"已跳过（断点已完成）"
-                    )
-                    continue
 
-                prepared_rows: list[dict[str, Any]] = []
-                total_weight = 0.0
-                for p in positions:
-                    total_weight += max(float(p["holding_weight"] or 0.0), 0.0)
-
-                if rb_chunked_eod:
-                    start_c_rb = wind_bulk.bulk_eod_start_compact(trade_date, rebalance)
-                    stocks_rb = sorted(
-                        {
-                            _wind_code_key(p["stock_code"])
-                            for p in positions
-                            if p.get("stock_code")
-                        }
-                    )
-                    chunk_sz = _effective_eod_chunk_size(len(stock_codes))
-                    n_chunks = max(1, (len(stocks_rb) + chunk_sz - 1) // chunk_sz)
-                    for ci in range(0, len(stocks_rb), chunk_sz):
-                        part = stocks_rb[ci : ci + chunk_sz]
-                        cno = ci // chunk_sz + 1
-                        prog(
-                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance}："
-                            f"EOD {cno}/{n_chunks}（{len(part)} 只，{start_c_rb}~{latest_trade}）…"
-                        )
-                        wind, quote_part = _fetch_wind_quote_map_batched(
-                            db, wind, part, latest_trade
-                        )
-                        wind, eod_part = wind_bulk.load_eod_by_code(
-                            wind, part, start_c_rb, str(latest_trade), db
-                        )
-                        for p in positions:
-                            wk = _wind_code_key(p["stock_code"])
-                            if wk not in eod_part:
-                                continue
-                            prepared_rows.append(
-                                _build_holding_daily_row_from_wind(
-                                    sid=sid,
-                                    trade_date=trade_date,
-                                    rebalance=rebalance,
-                                    p=p,
-                                    quote_map=quote_part,
-                                    eod_series=eod_part.get(wk, []),
-                                    latest_trade=str(latest_trade),
-                                )
-                            )
-                        quote_part.clear()
-                        eod_part.clear()
-                        del eod_part
-                        gc.collect()
-                else:
-                    for p in positions:
-                        wk = _wind_code_key(p["stock_code"])
-                        prepared_rows.append(
-                            _build_holding_daily_row_from_wind(
-                                sid=sid,
-                                trade_date=trade_date,
-                                rebalance=rebalance,
-                                p=p,
-                                quote_map=quote_map,
-                                eod_series=eod_by_code.get(wk, []),
-                                latest_trade=str(latest_trade),
-                            )
-                        )
-
+            def _flush_one_rebalance(
+                i_rb: int,
+                rebalance,
+                prepared_rows: list[dict[str, Any]],
+                total_weight: float,
+                rb_compact: str,
+            ) -> None:
                 n_written = _flush_rebalance_holding_period(
                     db,
                     sid=sid,
@@ -1795,6 +1729,108 @@ def run_update(
                 )
                 if sync_job_id is not None and rb_compact:
                     _sync_mark_update_rb_done(sync_job_id, rb_compact)
+
+            if rb_chunked_eod:
+                # 按股票分批只拉一次 EOD，再扫全部调仓期（避免 125 期 × 16 批重复拉同一股票）
+                active_rb: list[tuple[int, Any, list, str, float]] = []
+                for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                    if not positions:
+                        prog(
+                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
+                            f"调仓日 {rebalance} 无仓位，跳过"
+                        )
+                        continue
+                    rb_compact = _compact_date(rebalance)
+                    if rb_compact and rb_compact in skip_rb:
+                        prog(
+                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance} "
+                            f"已跳过（断点已完成）"
+                        )
+                        continue
+                    tw = sum(max(float(p["holding_weight"] or 0.0), 0.0) for p in positions)
+                    active_rb.append((i_rb, rebalance, positions, rb_compact, tw))
+
+                chunk_sz = _effective_eod_chunk_size(len(stock_codes))
+                n_chunks = max(1, (len(stock_codes) + chunk_sz - 1) // chunk_sz)
+                prog(
+                    f"[{i_active}/{n_active}] {sid}：EOD {n_chunks} 批 × "
+                    f"{len(active_rb)} 个调仓期（{len(stock_codes)} 只股票，{start_c}~{latest_trade}）…"
+                )
+                rows_by_rb: dict[int, list[dict[str, Any]]] = {t[0]: [] for t in active_rb}
+                for ci in range(0, len(stock_codes), chunk_sz):
+                    part = stock_codes[ci : ci + chunk_sz]
+                    part_set = set(part)
+                    cno = ci // chunk_sz + 1
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：EOD 批次 {cno}/{n_chunks}（{len(part)} 只）…"
+                    )
+                    wind, quote_part = _fetch_wind_quote_map_batched(
+                        db, wind, part, latest_trade
+                    )
+                    wind, eod_part = wind_bulk.load_eod_by_code(
+                        wind, part, start_c, str(latest_trade), db
+                    )
+                    for i_rb, rebalance, positions, _rb_c, _tw in active_rb:
+                        for p in positions:
+                            wk = _wind_code_key(p["stock_code"])
+                            if wk not in part_set:
+                                continue
+                            rows_by_rb[i_rb].append(
+                                _build_holding_daily_row_from_wind(
+                                    sid=sid,
+                                    trade_date=trade_date,
+                                    rebalance=rebalance,
+                                    p=p,
+                                    quote_map=quote_part,
+                                    eod_series=eod_part.get(wk, []),
+                                    latest_trade=str(latest_trade),
+                                )
+                            )
+                    quote_part.clear()
+                    eod_part.clear()
+                    del eod_part
+                    gc.collect()
+
+                for i_rb, rebalance, _positions, rb_compact, total_weight in active_rb:
+                    _flush_one_rebalance(
+                        i_rb, rebalance, rows_by_rb[i_rb], total_weight, rb_compact
+                    )
+                    rows_by_rb[i_rb] = []
+            else:
+                for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                    if not positions:
+                        prog(
+                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
+                            f"调仓日 {rebalance} 无仓位，跳过"
+                        )
+                        continue
+                    rb_compact = _compact_date(rebalance)
+                    if rb_compact and rb_compact in skip_rb:
+                        prog(
+                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance} "
+                            f"已跳过（断点已完成）"
+                        )
+                        continue
+
+                    prepared_rows = []
+                    total_weight = 0.0
+                    for p in positions:
+                        total_weight += max(float(p["holding_weight"] or 0.0), 0.0)
+                        wk = _wind_code_key(p["stock_code"])
+                        prepared_rows.append(
+                            _build_holding_daily_row_from_wind(
+                                sid=sid,
+                                trade_date=trade_date,
+                                rebalance=rebalance,
+                                p=p,
+                                quote_map=quote_map,
+                                eod_series=eod_by_code.get(wk, []),
+                                latest_trade=str(latest_trade),
+                            )
+                        )
+                    _flush_one_rebalance(
+                        i_rb, rebalance, prepared_rows, total_weight, rb_compact
+                    )
 
             if not skip_nav_rebuild:
                 try:
