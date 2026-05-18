@@ -1,4 +1,3 @@
-import contextvars
 import json
 import logging
 import threading
@@ -21,10 +20,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _stream_sem = threading.Semaphore(1)
 _depth_guard = threading.Lock()
 _depth_by_thread: dict[int, int] = {}
-_API_LOCK_TIMEOUT_UNSET = object()
-_api_lock_timeout_var: contextvars.ContextVar[float | None | object] = contextvars.ContextVar(
-    "turso_api_lock_timeout", default=_API_LOCK_TIMEOUT_UNSET
-)
 
 
 def uses_remote_turso_only() -> bool:
@@ -102,12 +97,7 @@ def _statement_lock_acquire(conn) -> None:
         return
     if _thread_depth() > 0:
         return
-    raw = _api_lock_timeout_var.get()
-    if raw is _API_LOCK_TIMEOUT_UNSET:
-        timeout = _default_api_lock_timeout()
-    else:
-        timeout = None if raw is None else float(raw)
-    wait = _resolve_lock_wait(timeout)
+    wait = _resolve_lock_wait(_default_api_lock_timeout())
     ok = _stream_sem.acquire(timeout=wait if wait >= 0 else None)
     if not ok:
         secs = int(wait) if wait > 0 else 0
@@ -889,11 +879,8 @@ def get_session():
         if not is_ready():
             raise DatabaseNotReadyError("数据库正在初始化，请约 1～2 分钟后重试")
         raise DatabaseNotReadyError("Database not initialized")
-    api_timeout = float(getattr(settings, "turso_stream_lock_api_timeout_seconds", 90) or 90)
-    tok = _api_lock_timeout_var.set(api_timeout if api_timeout > 0 else None)
     db = SessionLocalFactory()
     try:
         yield db
     finally:
         db.close()
-        _api_lock_timeout_var.reset(tok)
