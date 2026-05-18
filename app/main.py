@@ -3813,9 +3813,9 @@ def admin_sync(
         ),
         {"msg": "任务已入队，即将在后台执行", "sj": sj, "im": import_mode, "by": username},
     )
-    from app.services import _executed_rowid
+    from app.sql_dialect import executed_rowid
 
-    job_id = _executed_rowid(db, res)
+    job_id = executed_rowid(db, res)
     if not job_id:
         raise HTTPException(status_code=500, detail="创建同步任务失败")
     db.commit()

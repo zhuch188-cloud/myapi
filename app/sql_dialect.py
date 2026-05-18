@@ -141,6 +141,15 @@ def coerce_bind_value(v: Any) -> Any:
     return v
 
 
+def executed_rowid(db: Session, result: Any) -> int:
+    """Turso/libsql 下 CursorResult.lastrowid 有时为 0，回退 last_insert_rowid()。"""
+    rid = int(getattr(result, "lastrowid", None) or 0)
+    if rid:
+        return rid
+    row = db.execute(text("SELECT last_insert_rowid() AS id")).mappings().first()
+    return int((row or {}).get("id") or 0)
+
+
 def coerce_bind_parameters(parameters: Any) -> Any:
     if parameters is None:
         return parameters
