@@ -80,8 +80,15 @@ class Settings(BaseSettings):
     wind_eod_stock_chunk: int = 0
     # 策略 Excel 导入：持仓 UPSERT 批大小（减少逐行往返）
     strategy_import_position_batch_size: int = 500
-    # 净值重建：每 N 个交易日落库一批，避免 nav_accum 与 day_map 同时撑满内存
+    # 大 Excel（如沪深300增强）：openpyxl 流式读行，避免整表进 pandas（阶段1 导入）
+    strategy_excel_streaming_import: bool = True
+    # 文件大于该 MB 时启用流式导入；0=始终流式
+    strategy_excel_streaming_min_mb: int = 0
+    strategy_excel_import_row_batch: int = 2500
+    # 净值重建：每 N 个交易日落库一批（仅阶段2 nav_accum；不减小 day_map 峰值）
     nav_rebuild_persist_chunk: int = 400
+    # 低内存下按自然年分段拉 Wind EOD 算净值，避免全区间 day_map 一次驻留
+    nav_rebuild_year_segments: bool = True
     # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
     skip_startup_date_normalization: bool = False
 

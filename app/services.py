@@ -203,6 +203,185 @@ _STRATEGY_EXCEL_REQUIRED_COLS = ("调整日期", "证券代码")
 _STRATEGY_EXCEL_OPTIONAL_COLS = frozenset(
     {"持仓权重", "行业中性权重", "分类", "策略分类", "调仓频率"}
 )
+_STRATEGY_EXCEL_STREAM_SUFFIXES = (".xlsx", ".xlsm")
+
+
+def _strategy_excel_use_streaming(file_path: str) -> bool:
+    if not bool(getattr(settings, "strategy_excel_streaming_import", True)):
+        return False
+    suf = Path(file_path).suffix.lower()
+    if suf not in _STRATEGY_EXCEL_STREAM_SUFFIXES:
+        return False
+    min_mb = int(getattr(settings, "strategy_excel_streaming_min_mb", 0))
+    try:
+        size = os.path.getsize(file_path)
+    except OSError:
+        return True
+    if min_mb <= 0:
+        return True
+    return size >= min_mb * 1024 * 1024
+
+
+def _read_strategy_excel_label_meta(file_path: str) -> dict[str, str]:
+    """只读分类/调仓频率列的前若干行，避免为 meta 加载整表。"""
+    meta_names = {"分类", "策略分类", "调仓频率"}
+    try:
+        header = pd.read_excel(file_path, sheet_name=0, nrows=0)
+        cols = [str(c).strip() for c in header.columns]
+        pick = [c for c in cols if c in meta_names]
+        if not pick:
+            return {}
+        kw: dict[str, Any] = {"sheet_name": 0, "usecols": pick, "nrows": 3000}
+        try:
+            df = pd.read_excel(file_path, engine="calamine", **kw)
+        except Exception:
+            df = pd.read_excel(file_path, **kw)
+        return _excel_meta_strategy_labels(df)
+    except Exception:
+        return {}
+
+
+def _excel_cell_rebalance_date(v: Any) -> date | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            ts = pd.Timestamp("1899-12-30") + pd.Timedelta(days=float(v))
+            return ts.date()
+        except (ValueError, OverflowError):
+            return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.date() if hasattr(ts, "date") else pd.Timestamp(ts).date()
+    except Exception:
+        return None
+
+
+def _excel_cell_weight(v: Any) -> float | None:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_strategy_holdings_excel_batches(
+    file_path: str,
+) -> Any:
+    """openpyxl 流式按批产出持仓行，不将整个 Excel 载入 DataFrame。"""
+    from openpyxl import load_workbook
+
+    batch_size = max(500, int(getattr(settings, "strategy_excel_import_row_batch", 2500)))
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        row_it = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(row_it)
+        except StopIteration:
+            return
+        headers = [str(c).strip() if c is not None else "" for c in header_row]
+        idx: dict[str, int] = {h: i for i, h in enumerate(headers) if h}
+        for need in _STRATEGY_EXCEL_REQUIRED_COLS:
+            if need not in idx:
+                raise ValueError(f"缺少列: {need}")
+        i_dt = idx["调整日期"]
+        i_code = idx["证券代码"]
+        i_hw = idx.get("持仓权重")
+        i_iw = idx.get("行业中性权重")
+        batch: list[tuple[date, str, float | None, float | None]] = []
+        last_rb: date | None = None
+        for row in row_it:
+            if not row:
+                continue
+            ncol = len(headers)
+            cells = list(row) + [None] * max(0, ncol - len(row))
+            rb = _excel_cell_rebalance_date(cells[i_dt] if i_dt < len(cells) else None)
+            raw_code = cells[i_code] if i_code < len(cells) else None
+            if raw_code is None or (isinstance(raw_code, float) and pd.isna(raw_code)):
+                continue
+            if rb is None:
+                rb = last_rb
+            if rb is None:
+                continue
+            last_rb = rb
+            try:
+                code = normalize_code(raw_code)
+            except ValueError:
+                continue
+            hw = _excel_cell_weight(cells[i_hw]) if i_hw is not None and i_hw < len(cells) else None
+            iw = _excel_cell_weight(cells[i_iw]) if i_iw is not None and i_iw < len(cells) else None
+            batch.append((rb, code, hw, iw))
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+    finally:
+        wb.close()
+
+
+def _import_strategy_holdings_from_excel(
+    db: Session,
+    sid: str,
+    file_path: str,
+    import_mode: str,
+) -> dict[str, str]:
+    """导入单策略 Excel 持仓；大文件走流式，返回 label_meta。"""
+    label_meta = _read_strategy_excel_label_meta(file_path)
+    if _strategy_excel_use_streaming(file_path):
+        if import_mode == "full":
+            db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
+        max_rb: date | None = None
+        if import_mode != "full":
+            max_row = db.execute(
+                text(
+                    f"""
+                    SELECT {sql_max_date_expr("rebalance_date")} AS d
+                    FROM strategy_positions
+                    WHERE strategy_id=:sid
+                    """
+                ),
+                {"sid": sid},
+            ).mappings().first()
+            max_rb = _row_sql_date(max_row["d"]) if max_row else None
+        imported_rows = 0
+        for chunk in _iter_strategy_holdings_excel_batches(file_path):
+            if import_mode != "full" and max_rb is not None:
+                chunk = [x for x in chunk if x[0] > max_rb]
+            if not chunk:
+                continue
+            _import_positions_batch(db, sid, chunk)
+            imported_rows += len(chunk)
+            if _wind_low_memory_mode():
+                gc.collect()
+        if imported_rows == 0 and import_mode == "full":
+            raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
+    else:
+        label_meta2, rows_to_write = _read_strategy_holdings_excel(file_path)
+        label_meta = label_meta2 or label_meta
+        _import_write_positions_one_strategy(db, sid, rows_to_write, label_meta, import_mode)
+        return label_meta
+    if label_meta:
+        keys = list(label_meta.keys())
+        sets = ", ".join(f"{k}=:{k}" for k in keys)
+        params = {k: label_meta[k] for k in keys}
+        params["sid"] = sid
+        db.execute(
+            text(f"UPDATE strategy_configs SET {sets} WHERE strategy_id=:sid"),
+            params,
+        )
+    return label_meta
 
 _POSITION_UPSERT_SQL = text(
     """
@@ -1055,13 +1234,16 @@ def import_strategy_files(
                 do_commit=do_commit,
             )
         try:
-            label_meta, rows_to_write = _read_strategy_holdings_excel(file_path)
-
             for attempt in range(4):
                 try:
-                    _import_write_positions_one_strategy(
-                        db, sid, rows_to_write, label_meta, import_mode
-                    )
+                    if _strategy_excel_use_streaming(file_path):
+                        _import_strategy_holdings_from_excel(db, sid, file_path, import_mode)
+                    else:
+                        label_meta, rows_to_write = _read_strategy_holdings_excel(file_path)
+                        _import_write_positions_one_strategy(
+                            db, sid, rows_to_write, label_meta, import_mode
+                        )
+                        rows_to_write = None
                     if do_commit:
                         db.commit()
                     break
@@ -1614,6 +1796,190 @@ def _batch_nav_mysql_plans(db: Session, strategy_ids: list[str], _mode_l: str) -
     return plans
 
 
+def _eod_dict_to_day_map(
+    eod_by_code: dict[str, list],
+) -> dict[str, dict[str, tuple[float | None, float | None]]]:
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]] = {}
+    for c, series in eod_by_code.items():
+        dct: dict[str, tuple[float | None, float | None]] = {}
+        for d, cl, pc, _raw in series:
+            clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
+            pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
+            dct[_compact_date(d)] = (clv, pcv)
+        day_map[c] = dct
+    return day_map
+
+
+def _index_eod_to_bench_day_map(
+    index_eod_by_code: dict[str, list], bench_code: str
+) -> dict[str, tuple[float | None, float | None]]:
+    bench_day_map: dict[str, tuple[float | None, float | None]] = {}
+    if not bench_code:
+        return bench_day_map
+    for d, cl, pc, _raw in index_eod_by_code.get(bench_code, []):
+        clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
+        pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
+        bench_day_map[_compact_date(d)] = (clv, pcv)
+    return bench_day_map
+
+
+def _rebuild_nav_for_strategy_yearly(
+    db: Session,
+    wind: Any,
+    sid: str,
+    rb_map: dict[date, list[tuple[str, float]]],
+    bench_code: str,
+    start_c: str,
+    latest_trade_c: str,
+    ic0: float,
+) -> tuple[bool, Any]:
+    """低内存：按自然年分段拉 EOD，避免全区间 day_map 一次占满内存。"""
+    codes_for_eod = sorted({c for holdings in rb_map.values() for c, _ in holdings if c})
+    if not codes_for_eod:
+        return False, wind
+    wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, start_c, latest_trade_c)
+    trade_days_all = [d for d in td_all if d >= start_c]
+    if not trade_days_all:
+        return False, wind
+
+    nav_persist_chunk = max(100, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
+    for attempt in range(4):
+        try:
+            db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid})
+            break
+        except OperationalError as oe:
+            if not _mysql_lock_contention(oe) or attempt >= 3:
+                raise
+            time.sleep(0.25 * (2**attempt))
+
+    rb_sorted = sorted(rb_map.keys())
+    rb_idx = 0
+    current_rb = rb_sorted[0]
+    prev_td_date: date | None = None
+    shares: dict[str, float] = {}
+    last_close_fill: dict[str, float] = {}
+    prev_mv: float | None = None
+    bench_nav_acc: float | None = 1.0 if bench_code else None
+    nav_accum: list[dict[str, Any]] = []
+    first_trade_day = True
+
+    for seg_st, seg_ed in wind_bulk._year_compact_segments(start_c, latest_trade_c):
+        seg_days = [d for d in trade_days_all if seg_st <= d <= seg_ed]
+        if not seg_days:
+            continue
+        wind, eod_by_code = wind_bulk.load_eod_by_code(
+            wind, codes_for_eod, seg_st, seg_ed, db
+        )
+        index_eod_by_code: dict[str, list] = {}
+        if bench_code:
+            wind, index_eod_by_code = wind_bulk.load_index_eod_by_code(
+                wind, [bench_code], seg_st, seg_ed, db
+            )
+        day_map = _eod_dict_to_day_map(eod_by_code)
+        bench_day_map = _index_eod_to_bench_day_map(index_eod_by_code, bench_code)
+        eod_by_code.clear()
+        index_eod_by_code.clear()
+
+        for td in seg_days:
+            rb_idx_at_start = rb_idx
+            td_date = datetime.strptime(td, "%Y%m%d").date()
+            while rb_idx + 1 < len(rb_sorted) and rb_sorted[rb_idx + 1] <= td_date:
+                rb_idx += 1
+                current_rb = rb_sorted[rb_idx]
+            snap_rebalance = (
+                (rb_idx != rb_idx_at_start)
+                or (td_date == current_rb)
+                or (
+                    prev_td_date is not None
+                    and prev_td_date < current_rb <= td_date
+                )
+                or (prev_td_date is None and current_rb <= td_date)
+            )
+            holdings = rb_map.get(current_rb, [])
+            total_weight = sum(max(float(w or 0.0), 0.0) for _, w in holdings)
+            if snap_rebalance:
+                if not shares:
+                    mv_pre = ic0
+                else:
+                    mv_pre = 0.0
+                    for sc2, sh in list(shares.items()):
+                        if sh <= 0:
+                            continue
+                        px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
+                        if px is not None:
+                            mv_pre += sh * px
+                new_shares: dict[str, float] = {}
+                if total_weight > 0 and mv_pre > 0:
+                    valid: list[tuple[str, float, float]] = []
+                    for sc, w0 in holdings:
+                        w0p = max(float(w0 or 0.0), 0.0)
+                        if w0p <= 0:
+                            continue
+                        px = _adj_close_td_ff(day_map, sc, td, last_close_fill)
+                        if px is None or px <= 0:
+                            continue
+                        valid.append((sc, w0p, px))
+                    tw2 = sum(w for _, w, _ in valid)
+                    if tw2 > 0:
+                        for sc, w0p, px in valid:
+                            dollar = mv_pre * (w0p / tw2)
+                            new_shares[sc] = dollar / px
+                shares = new_shares
+            mv_eod = 0.0
+            for sc2, sh in shares.items():
+                if sh <= 0:
+                    continue
+                px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
+                if px is not None:
+                    mv_eod += sh * px
+            nav = mv_eod / ic0 if ic0 > 0 else 1.0
+            if prev_mv is not None and prev_mv > 0:
+                day_ret = mv_eod / prev_mv - 1.0
+            else:
+                day_ret = (mv_eod / ic0 - 1.0) if ic0 > 0 else 0.0
+            prev_mv = mv_eod
+            prev_td_date = td_date
+            bench_ret_ins = None
+            bench_nav_ins = None
+            if bench_code and bench_nav_acc is not None:
+                bp = bench_day_map.get(td) if bench_day_map else None
+                br = _safe_return(bp[0], bp[1]) if bp else None
+                if br is not None:
+                    bench_ret_ins = float(br)
+                    bench_nav_acc *= 1.0 + bench_ret_ins
+                    bench_nav_ins = bench_nav_acc
+                elif first_trade_day:
+                    bench_ret_ins = 0.0
+                    bench_nav_ins = float(bench_nav_acc)
+            first_trade_day = False
+            nav_accum.append(
+                {
+                    "sid": sid,
+                    "td": td_date,
+                    "nav": nav,
+                    "ret": day_ret,
+                    "bret": bench_ret_ins,
+                    "bnav": bench_nav_ins,
+                    "rb": current_rb,
+                }
+            )
+            if len(nav_accum) >= nav_persist_chunk:
+                _flush_strategy_nav_daily_batch(db, nav_accum)
+                nav_accum.clear()
+
+        day_map.clear()
+        bench_day_map.clear()
+        gc.collect()
+
+    if nav_accum:
+        _flush_strategy_nav_daily_batch(db, nav_accum)
+        nav_accum.clear()
+    shares.clear()
+    last_close_fill.clear()
+    gc.collect()
+    return True, wind
+
+
 def _rebuild_nav_for_strategy(
     db: Session,
     wind: Any,
@@ -1709,6 +2075,15 @@ def _rebuild_nav_for_strategy(
         if len(latest_trade_c) < 8:
             latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
+    if (
+        wind_bundle is None
+        and _wind_low_memory_mode()
+        and bool(getattr(settings, "nav_rebuild_year_segments", True))
+    ):
+        return _rebuild_nav_for_strategy_yearly(
+            db, wind, sid, rb_map, bench_code, start_c, latest_trade_c, ic0
+        )
+
     codes_for_eod = sorted(code_set)
     if wind_bundle is not None:
         full_eod = wind_bundle["eod"]
@@ -1734,20 +2109,8 @@ def _rebuild_nav_for_strategy(
     if not trade_days:
         return False, wind
 
-    day_map: dict[str, dict[str, tuple[float | None, float | None]]] = {}
-    for c, series in eod_by_code.items():
-        dct: dict[str, tuple[float | None, float | None]] = {}
-        for d, cl, pc, _raw in series:
-            clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
-            pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
-            dct[_compact_date(d)] = (clv, pcv)
-        day_map[c] = dct
-    bench_day_map: dict[str, tuple[float | None, float | None]] = {}
-    if bench_code:
-        for d, cl, pc, _raw in index_eod_by_code.get(bench_code, []):
-            clv = None if (isinstance(cl, float) and cl != cl) else float(cl)
-            pcv = None if (isinstance(pc, float) and pc != pc) else float(pc)
-            bench_day_map[_compact_date(d)] = (clv, pcv)
+    day_map = _eod_dict_to_day_map(eod_by_code)
+    bench_day_map = _index_eod_to_bench_day_map(index_eod_by_code, bench_code)
 
     eod_by_code.clear()
     index_eod_by_code.clear()
@@ -1964,7 +2327,6 @@ def rebuild_nav_series(
             # Turso 远程 Hrana 不支持 SQLAlchemy SAVEPOINT（sa_savepoint_*），勿用 begin_nested。
             pl = plans.get(sid)
             if pl and low_mem:
-                wind, per_bundle = _load_wind_bundle_for_nav_plan(wind, db, pl, latest_trade_c)
                 counted, wind = _rebuild_nav_for_strategy(
                     db,
                     wind,
@@ -1972,7 +2334,7 @@ def rebuild_nav_series(
                     mode_l,
                     latest_trade_c_cached=latest_trade_c,
                     mysql_plan=pl,
-                    wind_bundle=per_bundle,
+                    wind_bundle=None,
                 )
             elif pl:
                 counted, wind = _rebuild_nav_for_strategy(
