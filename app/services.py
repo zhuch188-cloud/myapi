@@ -843,7 +843,7 @@ def create_strategy_import_job(
             "by": triggered_by,
         },
     )
-    job_id = int(res.lastrowid or 0)
+    job_id = _executed_rowid(db, res)
     if not job_id:
         raise RuntimeError("创建策略导入任务失败")
     return job_id
@@ -1073,7 +1073,7 @@ def import_strategy_files(
                     time.sleep(0.25 * (2**attempt))
 
             imported_new += 1
-            del df, rows_to_write
+            rows_to_write = None
             if _wind_low_memory_mode():
                 gc.collect()
             completed.add(sid)
@@ -2055,26 +2055,36 @@ def rebuild_nav_series(
     }, wind
 
 
-def _admin_sync_mark_running(job_id: int) -> bool:
-    from app.db import SessionLocalFactory
+def _executed_rowid(db: Session, result: Any) -> int:
+    """Turso/libsql 下 CursorResult.lastrowid 有时为 0，回退 last_insert_rowid()。"""
+    rid = int(getattr(result, "lastrowid", None) or 0)
+    if rid:
+        return rid
+    row = db.execute(text("SELECT last_insert_rowid() AS id")).mappings().first()
+    return int((row or {}).get("id") or 0)
 
-    db = SessionLocalFactory()
-    try:
-        cur = db.execute(
-            text(
-                f"""
-                UPDATE admin_sync_jobs
-                SET status='RUNNING', started_at={sql_now()}, stage='start',
-                    message=:m, progress_at={sql_now()}
-                WHERE id=:id AND status <> 'ABANDONED'
-                """
-            ),
-            {"m": "后台任务已启动，正在执行…", "id": job_id},
-        )
-        db.commit()
-        return int(getattr(cur, "rowcount", 0) or 0) > 0
-    finally:
-        db.close()
+
+def _admin_sync_mark_running(job_id: int) -> bool:
+    from app.db import SessionLocalFactory, turso_stream_lock
+
+    with turso_stream_lock():
+        db = SessionLocalFactory()
+        try:
+            cur = db.execute(
+                text(
+                    f"""
+                    UPDATE admin_sync_jobs
+                    SET status='RUNNING', started_at={sql_now()}, stage='start',
+                        message=:m, progress_at={sql_now()}
+                    WHERE id=:id AND status <> 'ABANDONED'
+                    """
+                ),
+                {"m": "后台任务已启动，正在执行…", "id": job_id},
+            )
+            db.commit()
+            return int(getattr(cur, "rowcount", 0) or 0) > 0
+        finally:
+            db.close()
 
 
 def _admin_sync_job_touch(
@@ -2114,7 +2124,7 @@ def _admin_sync_job_touch(
 
 
 def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
-    from app.db import SessionLocalFactory
+    from app.db import SessionLocalFactory, turso_stream_lock
 
     ok = bool(result.get("ok"))
     status = "SUCCESS" if ok else "FAILED"
@@ -2125,31 +2135,32 @@ def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
         else ("失败：" + ("；".join(str(x) for x in errs)[:1800]))
     )
     body = json.dumps(result, ensure_ascii=False)
-    db = SessionLocalFactory()
-    try:
-        db.execute(
-            text(
-                f"""
-                UPDATE admin_sync_jobs
-                SET status=:st,
-                    finished_at={sql_now()},
-                    stage=:sg,
-                    message=:sm,
-                    result_json=:rj
-                WHERE id=:id AND status <> 'ABANDONED'
-                """
-            ),
-            {
-                "st": status,
-                "sg": str(result.get("stage") or "")[:64],
-                "sm": summary[:4000],
-                "rj": body,
-                "id": job_id,
-            },
-        )
-        db.commit()
-    finally:
-        db.close()
+    with turso_stream_lock():
+        db = SessionLocalFactory()
+        try:
+            db.execute(
+                text(
+                    f"""
+                    UPDATE admin_sync_jobs
+                    SET status=:st,
+                        finished_at={sql_now()},
+                        stage=:sg,
+                        message=:sm,
+                        result_json=:rj
+                    WHERE id=:id AND status <> 'ABANDONED'
+                    """
+                ),
+                {
+                    "st": status,
+                    "sg": str(result.get("stage") or "")[:64],
+                    "sm": summary[:4000],
+                    "rj": body,
+                    "id": job_id,
+                },
+            )
+            db.commit()
+        finally:
+            db.close()
 
 
 def execute_admin_sync_pipeline(
@@ -2170,8 +2181,6 @@ def execute_admin_sync_pipeline(
 
     from app.db import SessionLocalFactory, turso_stream_lock
 
-    db = SessionLocalFactory()
-
     def p(stage: str, msg: str, *, detached: bool = False) -> None:
         if sync_job_id is not None:
             _admin_sync_job_touch(
@@ -2182,173 +2191,180 @@ def execute_admin_sync_pipeline(
                 do_commit=True,
             )
 
-    p("precheck", "检查僵尸 RUNNING、数据更新任务互斥…")
     wind = None
     imp: dict | None = None
     nav_ret: dict | None = None
     completed_import: set[str] = set()
     completed_nav: set[str] = set()
-    if sync_job_id is not None and resume:
-        ck_row = (
-            db.execute(
-                text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
-                {"id": sync_job_id},
-            )
-            .mappings()
-            .first()
-        )
-        cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
-        completed_import = set(cp.get("completed_import") or [])
-        completed_nav = set(cp.get("completed_nav") or [])
-        if completed_import:
-            p("resume", f"续传：导入阶段已完成 {len(completed_import)} 个策略，净值已完成 {len(completed_nav)} 个")
-    try:
-        stale_mins = max(1, int(getattr(settings, "stale_running_update_job_minutes", 240)))
-        db.execute(
-            text(
-                f"""
-                UPDATE strategy_update_jobs
-                SET status='FAILED', finished_at={sql_now()},
-                    message=COALESCE(message, '') || '（僵尸RUNNING：已超过 ' || :mins || ' 分钟未结束，同步前自动标记失败；若确为长跑任务请调大 STALE_RUNNING_UPDATE_JOB_MINUTES）'
-                WHERE status='RUNNING'
-                  AND started_at < {sql_minutes_ago(':mins')}
-                """
-            ),
-            {"mins": stale_mins},
-        )
-        db.commit()
-        running = db.execute(
-            text(
-                """
-                SELECT id, started_at
-                FROM strategy_update_jobs
-                WHERE status='RUNNING'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            )
-        ).first()
-        if running:
-            rid, rst = running[0], running[1]
-            return {
-                "ok": False,
-                "stage": "blocked",
-                "imported": 0,
-                "nav_rebuilt": 0,
-                "failed": len(ids),
-                "errors": [
-                    f"已有进行中的数据更新任务 id={rid}（开始于 {rst}），请待其完成后再执行同步。"
-                    f"若确认无进程在跑，可将该条 status 改为 FAILED，或等待超过 {stale_mins} 分钟后重试。"
-                ],
-            }
-        ids_set = set(ids)
-        if ids_set <= completed_import:
-            imp = {
-                "imported": len(completed_import),
-                "failed": 0,
-                "errors": [],
-                "completed_strategy_ids": sorted(completed_import),
-            }
-            p("import", f"阶段1/3：导入已跳过（{len(completed_import)} 个策略已于断点完成）")
-        else:
-            p(
-                "import",
-                f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}"
-                f"{f'，续传跳过 {len(completed_import)} 个' if completed_import else ''}）…",
-            )
-            imp = import_strategy_files(
-                db,
-                selected_strategy_ids=ids,
-                import_mode=import_mode,
-                do_commit=True,
-                skip_strategy_ids=completed_import,
-                sync_job_id=sync_job_id,
-            )
-            completed_import = set(imp.get("completed_strategy_ids") or [])
-        if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
-            return {
-                "ok": False,
-                "stage": "import",
-                "resumable": True,
-                **imp,
-            }
-        t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
-        if t1 > 0:
-            p("import", f"导入完成，休眠 {t1}s 后进入净值…")
-            time.sleep(t1)
-        if ids_set <= completed_nav:
-            nav_ret = {
-                "rebuilt": len(completed_nav),
-                "failed": 0,
-                "errors": [],
-                "completed_nav_ids": sorted(completed_nav),
-            }
-            p("nav", f"阶段2/3：净值已跳过（{len(completed_nav)} 个策略已于断点完成）")
-            wind = wind_sql.open_wind(db)
-        else:
-            p(
-                "nav",
-                f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略"
-                f"{f'，续传跳过 {len(completed_nav)} 个' if completed_nav else ''}）…",
-            )
-            wind = wind_sql.open_wind(db)
-            nav_ret, wind = rebuild_nav_series(
-                db,
-                wind,
-                ids,
-                mode=import_mode,
-                do_commit=True,
-                skip_strategy_ids=completed_nav,
-                sync_job_id=sync_job_id,
-            )
-            completed_nav = set(nav_ret.get("completed_nav_ids") or [])
-        if int(nav_ret.get("failed") or 0) > 0 and not ids_set <= completed_nav:
-            return {
-                "ok": False,
-                "stage": "nav",
-                "resumable": True,
-                "imported": imp.get("imported", 0),
-                "nav_rebuilt": nav_ret.get("rebuilt", 0),
-                "failed": nav_ret.get("failed", 0),
-                "errors": nav_ret.get("errors", []),
-            }
-        if sync_job_id is not None:
-            _sync_save_checkpoint(
-                db,
-                sync_job_id,
-                completed_import=sorted(completed_import),
-                completed_nav=sorted(completed_nav),
-                stage="update",
-                do_commit=True,
-            )
-        t2 = float(settings.admin_sync_sleep_after_nav_seconds or 0.0)
-        if t2 > 0:
-            p("nav", f"净值完成，休眠 {t2}s…")
-            time.sleep(t2)
-        if wind is not None:
-            wind_sql.close_wind(wind, db)
-            wind = None
-        gc.collect()
-    except Exception as ex:
+
+    with turso_stream_lock():
+        db = SessionLocalFactory()
         try:
-            db.rollback()
-        except Exception:
-            pass
-        return {
-            "ok": False,
-            "stage": "import_or_nav",
-            "imported": (imp or {}).get("imported", 0),
-            "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
-            "failed": len(ids),
-            "errors": [str(ex)],
-        }
-    finally:
-        if wind is not None:
+            p("precheck", "检查僵尸 RUNNING、数据更新任务互斥…")
+            if sync_job_id is not None and resume:
+                ck_row = (
+                    db.execute(
+                        text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                        {"id": sync_job_id},
+                    )
+                    .mappings()
+                    .first()
+                )
+                cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
+                completed_import = set(cp.get("completed_import") or [])
+                completed_nav = set(cp.get("completed_nav") or [])
+                if completed_import:
+                    p(
+                        "resume",
+                        f"续传：导入阶段已完成 {len(completed_import)} 个策略，净值已完成 {len(completed_nav)} 个",
+                    )
             try:
-                wind_sql.close_wind(wind, db)
-            except Exception:
-                pass
-        db.close()
+                stale_mins = max(1, int(getattr(settings, "stale_running_update_job_minutes", 240)))
+                db.execute(
+                    text(
+                        f"""
+                        UPDATE strategy_update_jobs
+                        SET status='FAILED', finished_at={sql_now()},
+                            message=COALESCE(message, '') || '（僵尸RUNNING：已超过 ' || :mins || ' 分钟未结束，同步前自动标记失败；若确为长跑任务请调大 STALE_RUNNING_UPDATE_JOB_MINUTES）'
+                        WHERE status='RUNNING'
+                          AND started_at < {sql_minutes_ago(':mins')}
+                        """
+                    ),
+                    {"mins": stale_mins},
+                )
+                db.commit()
+                running = db.execute(
+                    text(
+                        """
+                        SELECT id, started_at
+                        FROM strategy_update_jobs
+                        WHERE status='RUNNING'
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    )
+                ).first()
+                if running:
+                    rid, rst = running[0], running[1]
+                    return {
+                        "ok": False,
+                        "stage": "blocked",
+                        "imported": 0,
+                        "nav_rebuilt": 0,
+                        "failed": len(ids),
+                        "errors": [
+                            f"已有进行中的数据更新任务 id={rid}（开始于 {rst}），请待其完成后再执行同步。"
+                            f"若确认无进程在跑，可将该条 status 改为 FAILED，或等待超过 {stale_mins} 分钟后重试。"
+                        ],
+                    }
+                ids_set = set(ids)
+                if ids_set <= completed_import:
+                    imp = {
+                        "imported": len(completed_import),
+                        "failed": 0,
+                        "errors": [],
+                        "completed_strategy_ids": sorted(completed_import),
+                    }
+                    p("import", f"阶段1/3：导入已跳过（{len(completed_import)} 个策略已于断点完成）")
+                else:
+                    p(
+                        "import",
+                        f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}"
+                        f"{f'，续传跳过 {len(completed_import)} 个' if completed_import else ''}）…",
+                    )
+                    imp = import_strategy_files(
+                        db,
+                        selected_strategy_ids=ids,
+                        import_mode=import_mode,
+                        do_commit=True,
+                        skip_strategy_ids=completed_import,
+                        sync_job_id=sync_job_id,
+                    )
+                    completed_import = set(imp.get("completed_strategy_ids") or [])
+                if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
+                    return {
+                        "ok": False,
+                        "stage": "import",
+                        "resumable": True,
+                        **imp,
+                    }
+                t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
+                if t1 > 0:
+                    p("import", f"导入完成，休眠 {t1}s 后进入净值…")
+                    time.sleep(t1)
+                if ids_set <= completed_nav:
+                    nav_ret = {
+                        "rebuilt": len(completed_nav),
+                        "failed": 0,
+                        "errors": [],
+                        "completed_nav_ids": sorted(completed_nav),
+                    }
+                    p("nav", f"阶段2/3：净值已跳过（{len(completed_nav)} 个策略已于断点完成）")
+                    wind = wind_sql.open_wind(db)
+                else:
+                    p(
+                        "nav",
+                        f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略"
+                        f"{f'，续传跳过 {len(completed_nav)} 个' if completed_nav else ''}）…",
+                    )
+                    wind = wind_sql.open_wind(db)
+                    nav_ret, wind = rebuild_nav_series(
+                        db,
+                        wind,
+                        ids,
+                        mode=import_mode,
+                        do_commit=True,
+                        skip_strategy_ids=completed_nav,
+                        sync_job_id=sync_job_id,
+                    )
+                    completed_nav = set(nav_ret.get("completed_nav_ids") or [])
+                if int(nav_ret.get("failed") or 0) > 0 and not ids_set <= completed_nav:
+                    return {
+                        "ok": False,
+                        "stage": "nav",
+                        "resumable": True,
+                        "imported": imp.get("imported", 0),
+                        "nav_rebuilt": nav_ret.get("rebuilt", 0),
+                        "failed": nav_ret.get("failed", 0),
+                        "errors": nav_ret.get("errors", []),
+                    }
+                if sync_job_id is not None:
+                    _sync_save_checkpoint(
+                        db,
+                        sync_job_id,
+                        completed_import=sorted(completed_import),
+                        completed_nav=sorted(completed_nav),
+                        stage="update",
+                        do_commit=True,
+                    )
+                t2 = float(settings.admin_sync_sleep_after_nav_seconds or 0.0)
+                if t2 > 0:
+                    p("nav", f"净值完成，休眠 {t2}s…")
+                    time.sleep(t2)
+                if wind is not None:
+                    wind_sql.close_wind(wind, db)
+                    wind = None
+                gc.collect()
+            except Exception as ex:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "stage": "import_or_nav",
+                    "imported": (imp or {}).get("imported", 0),
+                    "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
+                    "failed": len(ids),
+                    "errors": [str(ex)],
+                }
+            finally:
+                if wind is not None:
+                    try:
+                        wind_sql.close_wind(wind, db)
+                    except Exception:
+                        pass
+                db.close()
 
     cap = int(getattr(settings, "admin_sync_wait_idle_update_seconds", 180) or 0)
     step = 3
@@ -2426,32 +2442,27 @@ def run_admin_sync_background_task(
     resume: bool = False,
 ) -> None:
     """供 FastAPI BackgroundTasks 调用：先标 RUNNING，再跑管道并落库终态。"""
-    from app.db import turso_stream_lock
-
     try:
-        with turso_stream_lock():
-            if not _admin_sync_mark_running(job_id):
-                return
+        if not _admin_sync_mark_running(job_id):
+            return
         ret = execute_admin_sync_pipeline(
             username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
         )
-        with turso_stream_lock():
-            _finalize_admin_sync_job(job_id, ret)
+        _finalize_admin_sync_job(job_id, ret)
     except Exception as ex:
         _log.exception("admin_sync job %s failed", job_id)
-        with turso_stream_lock():
-            _finalize_admin_sync_job(
-                job_id,
-                {
-                    "ok": False,
-                    "stage": "exception",
-                    "resumable": True,
-                    "imported": 0,
-                    "nav_rebuilt": 0,
-                    "failed": len(selected_ids),
-                    "errors": [str(ex)],
-                },
-            )
+        _finalize_admin_sync_job(
+            job_id,
+            {
+                "ok": False,
+                "stage": "exception",
+                "resumable": True,
+                "imported": 0,
+                "nav_rebuilt": 0,
+                "failed": len(selected_ids),
+                "errors": [str(ex)],
+            },
+        )
 
 
 def run_strategy_import_background_task(
