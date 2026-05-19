@@ -28,7 +28,26 @@
       }
       button.logout-soft:hover { background: #e9eef5; color: #64748b; }
       table { width: 100%; border-collapse: collapse; font-size: 13px; }
-      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; white-space: nowrap; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; }
+      #adminCfgTable th, #adminCfgTable td { white-space: nowrap; }
+      .job-task-table { table-layout: fixed; }
+      .job-task-table th, .job-task-table td {
+        vertical-align: top;
+        white-space: normal;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+      }
+      .job-task-table .col-compact { white-space: nowrap; width: 1%; }
+      .job-task-table .col-actions {
+        white-space: nowrap;
+        width: 1%;
+        vertical-align: middle;
+        text-align: right;
+      }
+      .job-task-table .col-actions .secondary { display: inline-block; margin: 2px 0 2px 4px; }
+      .job-task-table .col-msg { width: 42%; min-width: 8rem; }
+      .job-task-table .job-msg { line-height: 1.45; }
+      .job-task-table .job-msg-time { font-size: 11px; color: #667085; margin-bottom: 2px; }
       .scroll { overflow-x: auto; }
     </style>
   </head>
@@ -117,16 +136,16 @@
       </div>
       <div class="card">
         <h4>策略 Excel 导入任务 <button type="button" class="secondary" onclick="loadImportJobs()">刷新</button></h4>
-        <div class="scroll"><table id="importJobTb"></table></div>
+        <div class="scroll"><table id="importJobTb" class="job-task-table"></table></div>
       </div>
       <div class="card">
         <h4>导入并提取任务 <button type="button" class="secondary" onclick="loadSyncJobs()">刷新</button></h4>
-        <div class="scroll"><table id="syncJobTb"></table></div>
+        <div class="scroll"><table id="syncJobTb" class="job-task-table"></table></div>
       </div>
       <div class="card">
         <h4>数据更新任务 <button type="button" class="secondary" onclick="loadUpdateJobs()">刷新</button></h4>
         <p class="muted" style="margin:0 0 8px;font-size:12px;">「仅更新最新交易日」与全量同步第 3 步的进度写入说明列，关闭页面后点刷新仍可查看。</p>
-        <div class="scroll"><table id="updateJobTb"></table></div>
+        <div class="scroll"><table id="updateJobTb" class="job-task-table"></table></div>
       </div>
     </div>
     <script>
@@ -535,9 +554,9 @@
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       function jobMsgCell(j) {
-        const at = j.progress_at ? `<div class="muted" style="font-size:11px">${esc(j.progress_at)}</div>` : "";
+        const at = j.progress_at ? `<div class="job-msg-time">${esc(j.progress_at)}</div>` : "";
         const body = esc((j.message || "").slice(0, 280));
-        return at + body;
+        return `<div class="job-msg">${at}${body}</div>`;
       }
       function resumableJobButtons(resumeFn, abandonFn, id) {
         return `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px;margin-right:4px" onclick="${resumeFn}(${id})">续传</button>`
@@ -567,12 +586,18 @@
         const d = await api("/api/admin/import-jobs?limit=30");
         const items = d.items || [];
         document.getElementById("importJobTb").innerHTML = `
-          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>进度</th><th>说明</th><th>操作</th></tr></thead>
+          <thead><tr>
+            <th class="col-compact">ID</th><th class="col-compact">模式</th><th class="col-compact">状态</th>
+            <th class="col-compact">开始</th><th class="col-compact">进度</th><th class="col-msg">说明</th><th class="col-actions">操作</th>
+          </tr></thead>
           <tbody>${items.map(j => {
             const all = (() => { try { return JSON.parse(j.strategy_ids_json || "[]").length; } catch (_) { return "?"; } })();
             const done = (() => { try { return JSON.parse(j.completed_strategy_ids_json || "[]").length; } catch (_) { return 0; } })();
             const btn = j.resumable ? resumableJobButtons("resumeImportJob", "abandonImportJob", j.id) : "";
-            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.started_at||"—")}</td><td>${done}/${all}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
+            return `<tr>
+              <td class="col-compact">${j.id}</td><td class="col-compact">${esc(j.import_mode)}</td><td class="col-compact">${esc(j.status)}</td>
+              <td class="col-compact">${esc(j.started_at||"—")}</td><td class="col-compact">${done}/${all}</td>
+              <td class="col-msg">${jobMsgCell(j)}</td><td class="col-actions">${btn}</td></tr>`;
           }).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function pollSyncJob(jobId) {
@@ -618,26 +643,35 @@
         const d = await api("/api/admin/update-jobs", { headers: authHeaders() });
         const items = d.items || [];
         document.getElementById("updateJobTb").innerHTML = `
-          <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>触发</th><th>说明</th><th>开始</th><th>结束</th></tr></thead>
+          <thead><tr>
+            <th class="col-compact">ID</th><th class="col-compact">类型</th><th class="col-compact">状态</th>
+            <th class="col-compact">触发</th><th class="col-msg">说明</th><th class="col-compact">开始</th><th class="col-compact">结束</th>
+          </tr></thead>
           <tbody>${items.map(j => `
             <tr>
-              <td>${j.id}</td>
-              <td>${esc(j.job_type||"-")}</td>
-              <td>${esc(j.status)}</td>
-              <td>${esc(j.triggered_by||"")}</td>
-              <td>${jobMsgCell(j)}</td>
-              <td>${esc(j.started_at||"")}</td>
-              <td>${esc(j.finished_at||"—")}</td>
+              <td class="col-compact">${j.id}</td>
+              <td class="col-compact">${esc(j.job_type||"-")}</td>
+              <td class="col-compact">${esc(j.status)}</td>
+              <td class="col-compact">${esc(j.triggered_by||"")}</td>
+              <td class="col-msg">${jobMsgCell(j)}</td>
+              <td class="col-compact">${esc(j.started_at||"")}</td>
+              <td class="col-compact">${esc(j.finished_at||"—")}</td>
             </tr>`).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function loadSyncJobs() {
         const d = await api("/api/admin/sync-jobs?limit=20");
         const items = d.items || [];
         document.getElementById("syncJobTb").innerHTML = `
-          <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>阶段</th><th>说明</th><th>操作</th></tr></thead>
+          <thead><tr>
+            <th class="col-compact">ID</th><th class="col-compact">模式</th><th class="col-compact">状态</th>
+            <th class="col-compact">开始</th><th class="col-compact">阶段</th><th class="col-msg">说明</th><th class="col-actions">操作</th>
+          </tr></thead>
           <tbody>${items.map(j => {
             const btn = j.resumable ? resumableJobButtons("resumeSyncJob", "abandonSyncJob", j.id) : "";
-            return `<tr><td>${j.id}</td><td>${esc(j.import_mode)}</td><td>${esc(j.status)}</td><td>${esc(j.started_at||"—")}</td><td>${esc(j.stage||"-")}</td><td>${jobMsgCell(j)}</td><td>${btn}</td></tr>`;
+            return `<tr>
+              <td class="col-compact">${j.id}</td><td class="col-compact">${esc(j.import_mode)}</td><td class="col-compact">${esc(j.status)}</td>
+              <td class="col-compact">${esc(j.started_at||"—")}</td><td class="col-compact">${esc(j.stage||"-")}</td>
+              <td class="col-msg">${jobMsgCell(j)}</td><td class="col-actions">${btn}</td></tr>`;
           }).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function updateLatestSelected() {
