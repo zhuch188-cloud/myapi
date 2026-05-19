@@ -1448,6 +1448,14 @@ def import_strategy_files(
             errors.append(f"{sid} ({c['file_name']}): 文件不存在: {file_path}")
             continue
         seq = len(completed) + 1
+        stream = _strategy_excel_use_streaming(file_path)
+        _log.info(
+            "import_strategy %s file=%s streaming=%s sync_job=%s",
+            sid,
+            c.get("file_name"),
+            stream,
+            sync_job_id,
+        )
         start_msg = (
             f"阶段1/3 [{seq}/{total_targets}] 正在导入 {sid}（{c.get('file_name') or ''}）…"
         )
@@ -1465,7 +1473,7 @@ def import_strategy_files(
         try:
             for attempt in range(4):
                 try:
-                    if _strategy_excel_use_streaming(file_path):
+                    if stream:
                         _import_strategy_holdings_from_excel(db, sid, file_path, import_mode)
                     else:
                         label_meta, rows_to_write = _read_strategy_holdings_excel(file_path)
@@ -3166,6 +3174,14 @@ def execute_admin_sync_pipeline(
     if not ids:
         return {"ok": False, "stage": "validate", "failed": 0, "errors": ["strategy_ids 为空"]}
 
+    _log.info(
+        "admin_sync pipeline start job=%s ids=%s resume=%s mode=%s",
+        sync_job_id,
+        ids,
+        resume,
+        import_mode,
+    )
+
     from app.db import SessionLocalFactory, turso_stream_lock
 
     def p(stage: str, msg: str, *, detached: bool = False) -> None:
@@ -3184,6 +3200,8 @@ def execute_admin_sync_pipeline(
     completed_import: set[str] = set()
     completed_nav: set[str] = set()
     completed_update_rb: set[str] = set()
+    ids_set = set(ids)
+    import_pending = True
 
     with turso_stream_lock():
         db = SessionLocalFactory()
@@ -3250,16 +3268,29 @@ def execute_admin_sync_pipeline(
                         f"若确认无进程在跑，可将该条 status 改为 FAILED，或等待超过 {stale_mins} 分钟后重试。"
                     ],
                 }
-            ids_set = set(ids)
-            if ids_set <= completed_import:
-                imp = {
-                    "imported": len(completed_import),
-                    "failed": 0,
-                    "errors": [],
-                    "completed_strategy_ids": sorted(completed_import),
-                }
-                p("import", f"阶段1/3：导入已跳过（{len(completed_import)} 个策略已于断点完成）")
-            else:
+            import_pending = not (ids_set <= completed_import)
+        except Exception as ex:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            _log.exception("admin_sync job %s precheck failed", sync_job_id)
+            return {
+                "ok": False,
+                "stage": "precheck",
+                "imported": 0,
+                "nav_rebuilt": 0,
+                "failed": len(ids),
+                "errors": [str(ex)],
+            }
+        finally:
+            db.close()
+
+    if import_pending:
+        _log.info("admin_sync job %s: stage1 import begin", sync_job_id)
+        with turso_stream_lock():
+            db = SessionLocalFactory()
+            try:
                 p(
                     "import",
                     f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}"
@@ -3274,28 +3305,43 @@ def execute_admin_sync_pipeline(
                     sync_job_id=sync_job_id,
                 )
                 completed_import = set(imp.get("completed_strategy_ids") or [])
-            if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
+                if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
+                    return {
+                        "ok": False,
+                        "stage": "import",
+                        "resumable": True,
+                        **imp,
+                    }
+            except Exception as ex:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                _log.exception("admin_sync job %s stage1 import failed", sync_job_id)
                 return {
                     "ok": False,
                     "stage": "import",
-                    "resumable": True,
-                    **imp,
+                    "imported": (imp or {}).get("imported", 0),
+                    "nav_rebuilt": 0,
+                    "failed": len(ids),
+                    "errors": [str(ex)],
                 }
-        except Exception as ex:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            return {
-                "ok": False,
-                "stage": "import",
-                "imported": (imp or {}).get("imported", 0),
-                "nav_rebuilt": 0,
-                "failed": len(ids),
-                "errors": [str(ex)],
-            }
-        finally:
-            db.close()
+            finally:
+                db.close()
+        _log.info(
+            "admin_sync job %s: stage1 import done imported=%s failed=%s",
+            sync_job_id,
+            len(completed_import),
+            int((imp or {}).get("failed") or 0),
+        )
+    else:
+        imp = {
+            "imported": len(completed_import),
+            "failed": 0,
+            "errors": [],
+            "completed_strategy_ids": sorted(completed_import),
+        }
+        p("import", f"阶段1/3：导入已跳过（{len(completed_import)} 个策略已于断点完成）", detached=True)
 
     t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
     if t1 > 0:
@@ -3313,6 +3359,7 @@ def execute_admin_sync_pipeline(
             }
             p("nav", f"阶段2/3：净值已跳过（{len(completed_nav)} 个策略已于断点完成）", detached=True)
         else:
+            _log.info("admin_sync job %s: stage2 nav rebuild begin", sync_job_id)
             p(
                 "nav",
                 f"阶段2/3：重建净值序列（Wind，{len(ids)} 个策略"
