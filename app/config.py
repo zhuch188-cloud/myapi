@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     admin_sync_wait_idle_update_seconds: int = 180
     # Render 免费档等低内存环境：按策略串行拉 Wind 算净值/快照，不合并多策略 EOD（默认开；大内存本机可设 false）
     wind_low_memory_mode: bool = True
+    # 仅当待更新策略数 <= 该值且成分去重数 <= wind_merged_prefetch_max_union_codes 时合并预拉 Wind（多策略易 OOM，默认 1）
+    wind_merged_prefetch_max_strategies: int = 1
+    wind_merged_prefetch_max_union_codes: int = 800
     # Wind 单次 IN 股票数（默认 80）；Render 512MB 建议 10～15（低内存未设时默认 15）
     wind_eod_stock_chunk: int = 0
     # 低内存：数据更新按「每个调仓期 × 该期成分股小批」拉 EOD 并立即落库（峰值≈单期持仓，Wind 重复读可接受）

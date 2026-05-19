@@ -1036,11 +1036,40 @@ def _release_wind_memory(*bundles: dict[str, Any] | None) -> None:
     for wb in bundles:
         if not wb:
             continue
-        for key in ("eod", "idx", "quote"):
+        for key in ("eod", "idx", "quote", "td"):
             part = wb.get(key)
             if isinstance(part, dict):
                 part.clear()
+            elif isinstance(part, list):
+                part.clear()
         wb.clear()
+    gc.collect()
+
+
+def _use_wind_merged_prefetch(n_strategies: int, n_union_codes: int) -> bool:
+    """多策略合并预拉 EOD 会长期占用内存直至整轮结束，Render 上默认仅单策略启用。"""
+    if _wind_low_memory_mode():
+        return False
+    max_s = max(1, int(getattr(settings, "wind_merged_prefetch_max_strategies", 1) or 1))
+    if n_strategies > max_s:
+        return False
+    max_codes = int(getattr(settings, "wind_merged_prefetch_max_union_codes", 800) or 800)
+    if max_codes > 0 and n_union_codes > max_codes:
+        return False
+    return True
+
+
+def _release_run_update_strategy_memory(
+    *,
+    eod_by_code: dict | None = None,
+    index_eod_by_code: dict | None = None,
+    quote_map: dict | None = None,
+    eod_local: dict | None = None,
+) -> None:
+    """单策略 run_update 循环末尾：断开对大 dict 的引用并建议 GC。"""
+    for d in (eod_by_code, index_eod_by_code, quote_map, eod_local):
+        if isinstance(d, dict):
+            d.clear()
     gc.collect()
 
 
@@ -1754,16 +1783,19 @@ def run_update(
             )
         active = [w for w in work_items if w is not None]
         n_active = len(active)
-        if active and not _wind_low_memory_mode():
-            n_union = len({c for w in active for c in w["stock_codes"]})
+        n_union = len({c for w in active for c in w["stock_codes"]}) if active else 0
+        if active and _use_wind_merged_prefetch(n_active, n_union):
             prog(
                 f"合并拉取 Wind：{n_active} 个策略、{n_union} 只不重复股票（EOD+行情+指数一次批量）…"
             )
             wind, wind_merged = _run_update_prefetch_wind_merged(
                 db, wind, active, str(latest_trade)
             )
-        elif active and _wind_low_memory_mode():
-            prog(f"低内存模式：按策略串行拉 Wind（共 {n_active} 个策略）…")
+        elif active:
+            prog(
+                f"按策略串行拉 Wind（共 {n_active} 个策略，"
+                f"去重 {n_union} 只；合并预拉已关闭，避免多策略占满内存）…"
+            )
 
         i_active = 0
         for wi in work_items:
@@ -1785,8 +1817,8 @@ def run_update(
             quote_map: dict[str, Any] = {}
             rb_chunked_eod = (
                 wind_merged is None
-                and _wind_low_memory_mode()
                 and bool(getattr(settings, "update_eod_per_rebalance_chunk", True))
+                and (_wind_low_memory_mode() or n_active > 1)
             )
 
             if wind_merged is not None:
@@ -1989,20 +2021,17 @@ def run_update(
                     )
 
             if not skip_nav_rebuild:
+                nav_wb: dict[str, Any] | None = None
                 try:
                     plans1 = _batch_nav_mysql_plans(db, [sid], "full")
                     pl1 = plans1.get(sid)
                     if pl1:
-                        wb = None
-                        if wind_merged is not None and wind_merged.get("td"):
-                            wb = {
-                                "eod": wind_merged["eod"],
-                                "idx": wind_merged["idx"],
-                                "td": wind_merged["td"],
-                            }
                         prog(
                             f"[{i_active}/{n_active}] {sid}：固定股数全量重算净值"
                             f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
+                        )
+                        wind, nav_wb = _load_wind_bundle_for_nav_plan(
+                            wind, db, pl1, str(latest_trade)
                         )
                         _, wind = _rebuild_nav_for_strategy(
                             db,
@@ -2011,21 +2040,22 @@ def run_update(
                             "full",
                             latest_trade_c_cached=str(latest_trade),
                             mysql_plan=pl1,
-                            wind_bundle=wb,
+                            wind_bundle=nav_wb,
                         )
                 except Exception as ex_nav:
                     _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
                     prog(f"[{i_active}/{n_active}] {sid}：净值重算失败（已跳过）：{ex_nav}"[:6000])
+                finally:
+                    _release_wind_memory(nav_wb)
+                    nav_wb = None
             if do_commit:
                 db.commit()
-            if _wind_low_memory_mode():
-                if eod_local is not None:
-                    eod_local.clear()
-                if isinstance(index_eod_by_code, dict) and index_eod_by_code:
-                    index_eod_by_code.clear()
-                if isinstance(quote_map, dict) and quote_map:
-                    quote_map.clear()
-                gc.collect()
+            _release_run_update_strategy_memory(
+                eod_by_code=eod_by_code,
+                index_eod_by_code=index_eod_by_code,
+                quote_map=quote_map,
+                eod_local=eod_local,
+            )
 
         if wind_merged is not None:
             _release_wind_memory(wind_merged)
@@ -2057,8 +2087,15 @@ def run_update(
     finally:
         if wind_merged is not None:
             _release_wind_memory(wind_merged)
+            wind_merged = None
         if wind is not None:
-            wind_sql.close_wind(wind, db)
+            try:
+                wind_sql.close_wind(wind, db)
+            except Exception:
+                pass
+            wind = None
+        work_items.clear()
+        gc.collect()
         _job_running = False
 
 
@@ -2925,20 +2962,20 @@ def rebuild_nav_series(
         plans = _batch_nav_mysql_plans(db, sids, mode_l)
     low_mem = _wind_low_memory_mode()
     wind_bundle: dict[str, Any] | None = None
-    if not low_mem:
-        union_codes: set[str] = set()
-        union_bench: set[str] = set()
-        global_st: str | None = None
-        for _sid, pl in plans.items():
-            for c in pl["code_set"]:
-                union_codes.add(c)
-            bc = str(pl.get("bench_code") or "").strip().upper()
-            if bc:
-                union_bench.add(bc)
-            st = pl["start_c"]
-            if global_st is None or st < global_st:
-                global_st = st
-        if global_st and union_codes:
+    union_codes: set[str] = set()
+    union_bench: set[str] = set()
+    global_st: str | None = None
+    for _sid, pl in plans.items():
+        for c in pl["code_set"]:
+            union_codes.add(c)
+        bc = str(pl.get("bench_code") or "").strip().upper()
+        if bc:
+            union_bench.add(bc)
+        st = pl["start_c"]
+        if global_st is None or st < global_st:
+            global_st = st
+    merge_nav_prefetch = (not low_mem) and _use_wind_merged_prefetch(len(sids), len(union_codes))
+    if merge_nav_prefetch and global_st and union_codes:
             if turso_remote:
                 with turso_stream_lock():
                     bundle_db = SessionLocalFactory()
@@ -2969,6 +3006,12 @@ def rebuild_nav_series(
                     idx_all = {}
                 wind, td_all = wind_bulk.fetch_trade_date_compacts(wind, db, global_st, latest_trade_c)
             wind_bundle = {"eod": eod_all, "idx": idx_all, "td": td_all}
+    elif not low_mem and global_st and union_codes and len(sids) > 1:
+        _log.info(
+            "nav rebuild: skip merged EOD prefetch (strategies=%s union_codes=%s); per-strategy load",
+            len(sids),
+            len(union_codes),
+        )
 
     skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
     done = len(skip)
@@ -3137,7 +3180,11 @@ def rebuild_nav_series(
                     pass
         finally:
             _release_wind_memory(per_bundle)
+            per_bundle = None
+            gc.collect()
     _release_wind_memory(wind_bundle)
+    wind_bundle = None
+    gc.collect()
     if do_commit and db is not None:
         db.commit()
     return {
