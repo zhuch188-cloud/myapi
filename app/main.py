@@ -4102,15 +4102,16 @@ def admin_update(
                 status_code=409,
                 detail=f"已有进行中的更新任务 id={row[0]}，请稍候或刷新页面查看进度",
             )
-        started = now_naive()
+        from app.sql_dialect import sql_now
+
         job_id = db.execute(
             text(
-                """
+                f"""
                 INSERT INTO strategy_update_jobs(job_type,status,triggered_by,started_at)
-                VALUES ('MANUAL','RUNNING',:by,:st)
+                VALUES ('MANUAL','RUNNING',:by,{sql_now()})
                 """
             ),
-            {"by": username, "st": started},
+            {"by": username},
         ).lastrowid
         db.commit()
 

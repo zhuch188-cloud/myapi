@@ -26,6 +26,11 @@ def now_naive() -> datetime:
     return now().replace(tzinfo=None)
 
 
+def db_timestamp_str() -> str:
+    """写入 TEXT 时间列的统一格式：YYYY-MM-DD HH:MM:SS（北京时间）。"""
+    return now_naive().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def to_beijing_naive(v: datetime | None) -> datetime | None:
     if v is None:
         return None

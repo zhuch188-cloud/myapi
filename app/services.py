@@ -25,7 +25,6 @@ from app.sql_dialect import (
     sql_order_date_asc,
     sql_order_date_desc,
 )
-from app.timeutil import now_naive
 
 _log = logging.getLogger(__name__)
 _job_running = False
@@ -549,9 +548,9 @@ def _format_update_job_failure_message(exc: BaseException) -> str:
 
 def _mark_update_job_failed(db: Session, job_id: int, message: str, do_commit: bool) -> None:
     """将任务标为 FAILED；主 Session 失效时用新连接补写，避免界面长期卡在 RUNNING。"""
-    params = {"ft": now_naive(), "m": message[:65000], "id": job_id}
+    params = {"m": message[:65000], "id": job_id}
     upd = text(
-        "UPDATE strategy_update_jobs SET status='FAILED', finished_at=:ft, message=:m WHERE id=:id"
+        f"UPDATE strategy_update_jobs SET status='FAILED', finished_at={sql_now()}, message=:m WHERE id=:id"
     )
     try:
         db.execute(upd, params)
@@ -1611,18 +1610,17 @@ def run_update(
         )
     _job_running = True
 
-    started = now_naive()
     if existing_job_id is not None:
         job_id = int(existing_job_id)
     else:
         job_id = db.execute(
             text(
-                """
+                f"""
                 INSERT INTO strategy_update_jobs(job_type,status,triggered_by,started_at)
-                VALUES (:jt,'RUNNING',:by,:st)
+                VALUES (:jt,'RUNNING',:by,{sql_now()})
                 """
             ),
-            {"jt": job_type, "by": triggered_by, "st": started},
+            {"jt": job_type, "by": triggered_by},
         ).lastrowid
         if do_commit:
             db.commit()
@@ -1974,10 +1972,13 @@ def run_update(
 
         db.execute(
             text(
-                "UPDATE strategy_update_jobs SET status='SUCCESS', finished_at=:ft, message=:m WHERE id=:id"
+                f"""
+                UPDATE strategy_update_jobs
+                SET status='SUCCESS', finished_at={sql_now()}, message=:m
+                WHERE id=:id
+                """
             ),
             {
-                "ft": now_naive(),
                 "m": f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}）",
                 "id": job_id,
             },
