@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     strategy_excel_streaming_import: bool = True
     # 文件大于该 MB 时启用流式导入；0=始终流式
     strategy_excel_streaming_min_mb: int = 0
+    # 流式 Excel 每批行数；Render 低内存建议 200～500（默认随 wind_low_memory_mode 自动缩小）
     strategy_excel_import_row_batch: int = 2500
     # 净值重建：每 N 个交易日落库一批（仅阶段2 nav_accum；不减小 day_map 峰值）
     nav_rebuild_persist_chunk: int = 400

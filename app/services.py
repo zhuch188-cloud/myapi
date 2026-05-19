@@ -275,13 +275,20 @@ def _excel_cell_weight(v: Any) -> float | None:
         return None
 
 
+def _strategy_excel_row_batch_size() -> int:
+    n = int(getattr(settings, "strategy_excel_import_row_batch", 2500) or 2500)
+    if _wind_low_memory_mode():
+        return max(100, min(n, 400))
+    return max(500, n)
+
+
 def _iter_strategy_holdings_excel_batches(
     file_path: str,
 ) -> Any:
     """openpyxl 流式按批产出持仓行，不将整个 Excel 载入 DataFrame。"""
     from openpyxl import load_workbook
 
-    batch_size = max(500, int(getattr(settings, "strategy_excel_import_row_batch", 2500)))
+    batch_size = _strategy_excel_row_batch_size()
     wb = load_workbook(file_path, read_only=True, data_only=True)
     try:
         ws = wb.active
@@ -336,6 +343,8 @@ def _import_strategy_holdings_from_excel(
     sid: str,
     file_path: str,
     import_mode: str,
+    *,
+    sync_job_id: int | None = None,
 ) -> dict[str, str]:
     """导入单策略 Excel 持仓；大文件走流式，返回 label_meta。"""
     label_meta = _read_strategy_excel_label_meta(file_path)
@@ -356,17 +365,35 @@ def _import_strategy_holdings_from_excel(
             ).mappings().first()
             max_rb = _row_sql_date(max_row["d"]) if max_row else None
         imported_rows = 0
+        batch_no = 0
         for chunk in _iter_strategy_holdings_excel_batches(file_path):
             if import_mode != "full" and max_rb is not None:
                 chunk = [x for x in chunk if x[0] > max_rb]
             if not chunk:
                 continue
+            batch_no += 1
             _import_positions_batch(db, sid, chunk)
             imported_rows += len(chunk)
+            db.commit()
+            if sync_job_id is not None and (batch_no == 1 or batch_no % 3 == 0):
+                _admin_sync_job_touch(
+                    sync_job_id,
+                    "import",
+                    f"阶段1/3 {sid}：流式导入中… 已写入 {imported_rows} 行（第 {batch_no} 批）",
+                    db=db,
+                    do_commit=False,
+                )
+            chunk.clear()
             if _wind_low_memory_mode():
                 gc.collect()
         if imported_rows == 0 and import_mode == "full":
             raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
+        _log.info(
+            "import_strategy %s streaming done rows=%s batches=%s",
+            sid,
+            imported_rows,
+            batch_no,
+        )
     else:
         label_meta2, rows_to_write = _read_strategy_holdings_excel(file_path)
         label_meta = label_meta2 or label_meta
@@ -1474,7 +1501,9 @@ def import_strategy_files(
             for attempt in range(4):
                 try:
                     if stream:
-                        _import_strategy_holdings_from_excel(db, sid, file_path, import_mode)
+                        _import_strategy_holdings_from_excel(
+                            db, sid, file_path, import_mode, sync_job_id=sync_job_id
+                        )
                     else:
                         label_meta, rows_to_write = _read_strategy_holdings_excel(file_path)
                         _import_write_positions_one_strategy(
