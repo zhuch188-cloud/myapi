@@ -3498,7 +3498,10 @@ def list_admin_strategies(user=Depends(require_roles("admin", "editor")), db: Se
         d["file_resolved_path"] = st.get("file_path") or ""
         d["latest_rebalance_date"] = latest_rb_map.get(sid) or ""
         items.append(d)
-    return {"items": items}
+    return JSONResponse(
+        content={"items": items},
+        media_type="application/json; charset=utf-8",
+    )
 
 
 @app.get("/api/admin/strategies/export")
@@ -3557,7 +3560,9 @@ async def import_admin_strategies(
         raise HTTPException(status_code=400, detail="empty file")
 
     if fname.endswith(".csv"):
-        text_data = raw.decode("utf-8-sig", errors="ignore")
+        from app.text_encoding import decode_text_bytes
+
+        text_data = decode_text_bytes(raw)
         reader = csv.DictReader(io.StringIO(text_data))
         rows = [dict(r) for r in reader]
     else:

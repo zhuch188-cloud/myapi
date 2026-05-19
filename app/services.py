@@ -170,7 +170,7 @@ def _job_progress(
 
 
 def _excel_meta_strategy_labels(df: pd.DataFrame) -> dict[str, str]:
-    """从持仓 Excel 读取策略级「分类」「调仓频率」（列存在即写入，可多行取首个非空）。"""
+    """从持仓 Excel 读取策略级「分类」「调仓频率」（列存在且首个非空才写入）。"""
     out: dict[str, str] = {}
     if "分类" in df.columns or "策略分类" in df.columns:
         val = ""
@@ -184,7 +184,8 @@ def _excel_meta_strategy_labels(df: pd.DataFrame) -> dict[str, str]:
                 if t:
                     val = t[:128]
                     break
-        out["strategy_category"] = val
+        if val:
+            out["strategy_category"] = val
     if "调仓频率" in df.columns:
         val = ""
         for x in df["调仓频率"].tolist():
@@ -194,7 +195,59 @@ def _excel_meta_strategy_labels(df: pd.DataFrame) -> dict[str, str]:
             if t:
                 val = t[:128]
                 break
-        out["rebalance_frequency"] = val
+        if val:
+            out["rebalance_frequency"] = val
+    return out
+
+
+def _first_nonempty_meta_from_openpyxl(
+    ws: Any, col_index: dict[str, int], col_names: tuple[str, ...], *, max_rows: int = 3000
+) -> str:
+    from app.text_encoding import normalize_unicode_text
+
+    idx = next((col_index[c] for c in col_names if c in col_index), None)
+    if idx is None:
+        return ""
+    n = 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        n += 1
+        if n > max_rows:
+            break
+        if not row or idx >= len(row):
+            continue
+        cell = row[idx]
+        if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+            continue
+        t = normalize_unicode_text(cell, max_len=128)
+        if t:
+            return t
+    return ""
+
+
+def _read_strategy_excel_label_meta_openpyxl(file_path: str) -> dict[str, str]:
+    """与流式导入同一套 openpyxl 读表头/元数据，避免 pandas 引擎差异导致中文列名或值乱码。"""
+    from openpyxl import load_workbook
+
+    out: dict[str, str] = {}
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            return out
+        col_index: dict[str, int] = {}
+        for i, c in enumerate(header_row):
+            name = str(c).strip() if c is not None else ""
+            if name and name not in col_index:
+                col_index[name] = i
+        cat = _first_nonempty_meta_from_openpyxl(ws, col_index, ("分类", "策略分类"))
+        if cat:
+            out["strategy_category"] = cat
+        freq = _first_nonempty_meta_from_openpyxl(ws, col_index, ("调仓频率",))
+        if freq:
+            out["rebalance_frequency"] = freq
+    finally:
+        wb.close()
     return out
 
 
@@ -223,6 +276,12 @@ def _strategy_excel_use_streaming(file_path: str) -> bool:
 
 def _read_strategy_excel_label_meta(file_path: str) -> dict[str, str]:
     """只读分类/调仓频率列的前若干行，避免为 meta 加载整表。"""
+    suf = Path(file_path).suffix.lower()
+    if suf in _STRATEGY_EXCEL_STREAM_SUFFIXES:
+        try:
+            return _read_strategy_excel_label_meta_openpyxl(file_path)
+        except Exception:
+            _log.warning("openpyxl label meta failed, fallback pandas: %s", file_path, exc_info=True)
     meta_names = {"分类", "策略分类", "调仓频率"}
     try:
         header = pd.read_excel(file_path, sheet_name=0, nrows=0)
@@ -399,14 +458,15 @@ def _import_strategy_holdings_from_excel(
         _import_write_positions_one_strategy(db, sid, rows_to_write, label_meta, import_mode)
         return label_meta
     if label_meta:
-        keys = list(label_meta.keys())
-        sets = ", ".join(f"{k}=:{k}" for k in keys)
-        params = {k: label_meta[k] for k in keys}
-        params["sid"] = sid
-        db.execute(
-            text(f"UPDATE strategy_configs SET {sets} WHERE strategy_id=:sid"),
-            params,
-        )
+        keys = [k for k, v in label_meta.items() if str(v or "").strip()]
+        if keys:
+            sets = ", ".join(f"{k}=:{k}" for k in keys)
+            params = {k: label_meta[k] for k in keys}
+            params["sid"] = sid
+            db.execute(
+                text(f"UPDATE strategy_configs SET {sets} WHERE strategy_id=:sid"),
+                params,
+            )
     return label_meta
 
 _POSITION_UPSERT_SQL = text(
@@ -1062,14 +1122,15 @@ def _import_write_positions_one_strategy(
         write_rows = [x for x in rows_to_write if (max_rb is None or x[0] > max_rb)]
     _import_positions_batch(db, sid, write_rows)
     if label_meta:
-        keys = list(label_meta.keys())
-        sets = ", ".join(f"{k}=:{k}" for k in keys)
-        params = {k: label_meta[k] for k in keys}
-        params["sid"] = sid
-        db.execute(
-            text(f"UPDATE strategy_configs SET {sets} WHERE strategy_id=:sid"),
-            params,
-        )
+        keys = [k for k, v in label_meta.items() if str(v or "").strip()]
+        if keys:
+            sets = ", ".join(f"{k}=:{k}" for k in keys)
+            params = {k: label_meta[k] for k in keys}
+            params["sid"] = sid
+            db.execute(
+                text(f"UPDATE strategy_configs SET {sets} WHERE strategy_id=:sid"),
+                params,
+            )
 
 
 def normalize_code(code) -> str:
