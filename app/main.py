@@ -204,6 +204,127 @@ def _strategy_weight_display_mode_store() -> str:
     return "holding"
 
 
+def _strategy_rebalance_dates_list(
+    db: Session, strategy_id: str, *, latest_only: bool
+) -> list[str]:
+    """调仓日列表：有持仓日快照时 latest_only 取最新行情日截面；否则用导入的 strategy_positions。"""
+    if latest_only:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT DISTINCT rebalance_date
+                FROM strategy_holding_daily
+                WHERE strategy_id=:sid
+                  AND trade_date = (
+                    SELECT {sql_max_date_expr("trade_date")}
+                    FROM strategy_holding_daily WHERE strategy_id=:sid
+                  )
+                ORDER BY {sql_order_date_desc("rebalance_date")}
+                """
+            ),
+            {"sid": strategy_id},
+        ).mappings().all()
+        if rows:
+            return [str(r["rebalance_date"]) for r in rows]
+    rows = db.execute(
+        text(
+            f"""
+            SELECT DISTINCT rebalance_date
+            FROM strategy_positions
+            WHERE strategy_id=:sid
+            ORDER BY {sql_order_date_desc("rebalance_date")}
+            """
+        ),
+        {"sid": strategy_id},
+    ).mappings().all()
+    return [str(r["rebalance_date"]) for r in rows]
+
+
+def _strategy_holdings_from_positions(
+    db: Session,
+    strategy_id: str,
+    rebalance_date: str | None,
+) -> tuple[list[dict], dict]:
+    """全量导入后尚未跑持仓更新时，用 strategy_positions 展示权重（无行情指标）。"""
+    rb = (rebalance_date or "").strip() or None
+    if rb is None:
+        rb_row = db.execute(
+            text(
+                f"""
+                SELECT {sql_max_date_expr("rebalance_date")} AS rb
+                FROM strategy_positions WHERE strategy_id=:sid
+                """
+            ),
+            {"sid": strategy_id},
+        ).mappings().first()
+        rb = str(rb_row["rb"]) if rb_row and rb_row.get("rb") is not None else None
+    if not rb:
+        return [], {
+            "latest_trade_date": None,
+            "rebalance_periods": 0,
+            "current_rebalance_date": None,
+            "data_source": "positions_import",
+        }
+    nav_td_row = db.execute(
+        text(
+            f"SELECT {sql_max_date_expr('trade_date')} AS d "
+            "FROM strategy_nav_daily WHERE strategy_id=:sid"
+        ),
+        {"sid": strategy_id},
+    ).mappings().first()
+    latest_trade_date = nav_td_row["d"] if nav_td_row else None
+    periods = db.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT rebalance_date) AS c
+            FROM strategy_positions WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": strategy_id},
+    ).scalar()
+    pos_rows = db.execute(
+        text(
+            """
+            SELECT stock_code, holding_weight, industry_neutral_weight
+            FROM strategy_positions
+            WHERE strategy_id=:sid AND rebalance_date=:rb
+            ORDER BY holding_weight DESC, stock_code
+            """
+        ),
+        {"sid": strategy_id, "rb": rb},
+    ).mappings().all()
+    items: list[dict] = []
+    for r in pos_rows:
+        w = float(r.get("holding_weight") or 0.0)
+        items.append(
+            {
+                "trade_date": latest_trade_date,
+                "stock_code": r.get("stock_code"),
+                "stock_name": None,
+                "period_weight": w,
+                "latest_weight": w,
+                "latest_price": None,
+                "last_1d_pct": None,
+                "period_return": None,
+                "ret_5d": None,
+                "ret_20d": None,
+                "ret_60d": None,
+                "ret_ytd": None,
+                "market_cap": None,
+                "industry_name": None,
+                "pe": None,
+                "pb": None,
+                "rebalance_date": rb,
+            }
+        )
+    return items, {
+        "latest_trade_date": str(latest_trade_date or "") or None,
+        "rebalance_periods": int(periods or 0),
+        "current_rebalance_date": rb,
+        "data_source": "positions_import",
+    }
+
+
 @app.exception_handler(HTTPException)
 async def _http_exception_cn(_, exc: HTTPException):
     return JSONResponse(
@@ -2728,17 +2849,44 @@ def strategy_holdings(
     ).mappings().first()
     latest_trade_date = latest_td_row["d"] if latest_td_row else None
     if latest_trade_date is None:
+        pos_items, pos_meta = _strategy_holdings_from_positions(
+            db, strategy_id, rebalance_date
+        )
+        if not pos_items:
+            return {
+                "page": page,
+                "page_size": page_size,
+                "total": 0,
+                "meta": {
+                    "latest_trade_date": None,
+                    "rebalance_periods": 0,
+                    "current_rebalance_date": None,
+                    "wind_data_source": "sqlserver",
+                },
+                "items": [],
+            }
+        meta_out = {
+            "latest_trade_date": pos_meta.get("latest_trade_date"),
+            "rebalance_periods": pos_meta.get("rebalance_periods", 0),
+            "current_rebalance_date": pos_meta.get("current_rebalance_date"),
+            "wind_data_source": "sqlserver",
+        }
+        if int(all_rows or 0) == 1:
+            return {
+                "page": 1,
+                "page_size": len(pos_items),
+                "total": len(pos_items),
+                "meta": meta_out,
+                "items": pos_items,
+            }
+        offset = (page - 1) * page_size
+        page_items = pos_items[offset : offset + page_size]
         return {
             "page": page,
             "page_size": page_size,
-            "total": 0,
-            "meta": {
-                "latest_trade_date": None,
-                "rebalance_periods": 0,
-                "current_rebalance_date": None,
-                "wind_data_source": "sqlserver",
-            },
-            "items": [],
+            "total": len(pos_items),
+            "meta": meta_out,
+            "items": page_items,
         }
 
     selected_rb = rebalance_date.strip() if rebalance_date else None
@@ -2839,35 +2987,10 @@ def strategy_rebalance_dates(
     db: Session = Depends(get_session),
 ):
     _ = user
-    if int(latest_only or 0) == 1:
-        rows = db.execute(
-            text(
-                f"""
-                SELECT DISTINCT rebalance_date
-                FROM strategy_holding_daily
-                WHERE strategy_id=:sid
-                  AND trade_date = (
-                    SELECT {sql_max_date_expr("trade_date")}
-                    FROM strategy_holding_daily WHERE strategy_id=:sid
-                  )
-                ORDER BY {sql_order_date_desc("rebalance_date")}
-                """
-            ),
-            {"sid": strategy_id},
-        ).mappings().all()
-    else:
-        rows = db.execute(
-            text(
-                f"""
-                SELECT DISTINCT rebalance_date
-                FROM strategy_positions
-                WHERE strategy_id=:sid
-                ORDER BY {sql_order_date_desc("rebalance_date")}
-                """
-            ),
-            {"sid": strategy_id},
-        ).mappings().all()
-    return {"items": [str(r["rebalance_date"]) for r in rows]}
+    items = _strategy_rebalance_dates_list(
+        db, strategy_id, latest_only=bool(int(latest_only or 0))
+    )
+    return {"items": items}
 
 
 @app.get("/api/strategies/{strategy_id}/stocks/{stock_code}")

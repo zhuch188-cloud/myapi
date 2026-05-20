@@ -146,7 +146,7 @@
         document.getElementById("nextPeriodBtn").disabled = idx <= 0;
       }
       async function loadRebalanceDates() {
-        const data = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/rebalance-dates?latest_only=1");
+        const data = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/rebalance-dates");
         rebalanceDates = (data.items || []).map((x) => String(x).slice(0, 10));
         const sel = document.getElementById("rebalanceSel");
         sel.innerHTML = rebalanceDates.length ? rebalanceDates.map((d) => '<option value="' + d + '">' + d + "</option>").join("") : '<option value="">-</option>';
