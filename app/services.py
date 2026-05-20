@@ -2084,6 +2084,10 @@ def run_update(
                 try:
                     plans1 = _batch_nav_mysql_plans(db, [sid], "full")
                     pl1 = plans1.get(sid)
+                    if pl1 and not pl1.get("code_set"):
+                        raise RuntimeError(
+                            f"{sid} 无 strategy_positions 仓位，无法算净值；请先全量导入"
+                        )
                     if pl1:
                         last_nav_c = _last_nav_compact_for_update(db, sid)
                         if last_nav_c and _compact_date(latest_trade) <= last_nav_c:
@@ -2830,6 +2834,82 @@ def _nav_first_trade_on_or_after(rb: date, trade_days: list[str]) -> str | None:
     return None
 
 
+def _nav_notional_from_row(row: Any | None, ic0: float) -> float | None:
+    """组合名义市值 = nav_unit × 名义本金（ic0）；锚定/续算均用此尺度，勿用裸 ic0 代替。"""
+    if not row or ic0 <= 0:
+        return None
+    try:
+        nu = float(row.get("nav_unit") or 0)
+    except (TypeError, ValueError):
+        return None
+    return nu * ic0 if nu > 0 else None
+
+
+def _nav_mv_pre_for_rebalance_snap(
+    shares: dict[str, float],
+    prev_mv: float | None,
+    ic0: float,
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    td: str,
+    last_close_fill: dict[str, float],
+) -> float:
+    """
+    调仓日再平衡前的组合市值。
+    已有持仓：按昨持仓×现价；否则用上一日市值 prev_mv（= 末净值×本金），
+    仅策略首段首日前才用 ic0（净值≈1）。
+    """
+    if shares:
+        mv = 0.0
+        for sc2, sh in list(shares.items()):
+            if sh <= 0:
+                continue
+            px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
+            if px is not None:
+                mv += sh * px
+        return mv
+    if prev_mv is not None and prev_mv > 0:
+        return prev_mv
+    return ic0
+
+
+def _nav_bootstrap_state_from_append_row(
+    db: Session,
+    sid: str,
+    append_after_c: str,
+    rb_sorted: list[date],
+    rb_map: dict[date, list[tuple[str, float]]],
+    ic0: float,
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    bench_code: str,
+) -> (
+    int,
+    date,
+    date | None,
+    dict[str, float],
+    dict[str, float],
+    float | None,
+    float | None,
+) | None:
+    """增量/回退重放：以库内末净值日 nav_unit×本金 初始化股数，再只写入之后交易日。"""
+    row_last = _nav_fetch_row_on_day(db, sid, append_after_c)
+    if not row_last:
+        return None
+    prev_mv0 = _nav_notional_from_row(row_last, ic0)
+    if not prev_mv0 or prev_mv0 <= 0:
+        return None
+    return _nav_init_state_from_last_row(
+        db,
+        sid,
+        append_after_c,
+        rb_sorted,
+        rb_map,
+        ic0,
+        day_map,
+        row_last,
+        bench_code,
+    )
+
+
 def _nav_align_sim_state_to_db_last(
     append_after_c: str,
     row_last: Any | None,
@@ -2841,12 +2921,9 @@ def _nav_align_sim_state_to_db_last(
     """增量模拟经过末净值日后，用库内净值对齐 prev_mv / 基准净值，保证后续日收益率与列表指标口径连续。"""
     if row_last is None:
         return prev_mv, bench_nav_acc
-    try:
-        nu = row_last.get("nav_unit")
-        if nu is not None and float(nu) > 0 and ic0 > 0:
-            prev_mv = float(nu) * ic0
-    except (TypeError, ValueError):
-        pass
+    aligned = _nav_notional_from_row(row_last, ic0)
+    if aligned is not None and aligned > 0:
+        prev_mv = aligned
     if bench_code:
         try:
             bn = row_last.get("benchmark_nav")
@@ -3053,12 +3130,7 @@ def _nav_init_state_from_last_row(
     """用库内末净值日持仓与市值初始化，仅用于模拟 append_after_c 之后的交易日。"""
     last_nav_d = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
     rb_idx, current_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d)
-    prev_mv = ic0
-    if row_last and row_last.get("nav_unit") is not None:
-        try:
-            prev_mv = float(row_last["nav_unit"]) * ic0
-        except (TypeError, ValueError):
-            prev_mv = ic0
+    prev_mv = _nav_notional_from_row(row_last, ic0) or ic0
     bench_nav_acc: float | None = 1.0 if bench_code else None
     if bench_code and row_last and row_last.get("benchmark_nav") is not None:
         try:
@@ -3219,16 +3291,9 @@ def _nav_process_one_trade_day(
     )
     holdings = rb_map.get(current_rb, [])
     if snap_rebalance:
-        if not shares:
-            mv_pre = ic0
-        else:
-            mv_pre = 0.0
-            for sc2, sh in list(shares.items()):
-                if sh <= 0:
-                    continue
-                px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
-                if px is not None:
-                    mv_pre += sh * px
+        mv_pre = _nav_mv_pre_for_rebalance_snap(
+            shares, prev_mv, ic0, day_map, td, last_close_fill
+        )
         shares = _nav_snap_shares_from_holdings(
             holdings, mv_pre, day_map, td, last_close_fill
         )
@@ -3728,6 +3793,7 @@ def _rebuild_nav_for_strategy_yearly(
     bench_nav_acc: float | None = 1.0 if bench_code else None
     nav_accum: list[dict[str, Any]] = []
     td_i = 0
+    nav_bootstrapped = False
     if not nav_full_rebuild and append_after_c:
         last_nav_d_y = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
         rb_idx, current_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d_y)
@@ -3780,6 +3846,39 @@ def _rebuild_nav_for_strategy_yearly(
         else:
             wind, day_map, _ = _load_maps(db)
 
+        if (
+            not nav_full_rebuild
+            and append_after_c
+            and not nav_bootstrapped
+            and append_after_c in day_map
+        ):
+            boot = _nav_bootstrap_state_from_append_row(
+                db,
+                sid,
+                append_after_c,
+                rb_sorted,
+                rb_map,
+                ic0,
+                day_map,
+                bench_code,
+            )
+            if boot:
+                (
+                    rb_idx,
+                    current_rb,
+                    prev_td_date,
+                    shares,
+                    last_close_fill,
+                    prev_mv,
+                    bench_nav_acc,
+                ) = boot
+                nav_bootstrapped = True
+                _log.info(
+                    "nav %s: bootstrapped sim state from %s (nav×本金)",
+                    sid,
+                    append_after_c,
+                )
+
         for td in seg_days:
             td_i += 1
             if sync_job_id is not None and td_i % 40 == 0:
@@ -3805,35 +3904,13 @@ def _rebuild_nav_for_strategy_yearly(
                 or (prev_td_date is None and current_rb <= td_date)
             )
             holdings = rb_map.get(current_rb, [])
-            total_weight = sum(max(float(w or 0.0), 0.0) for _, w in holdings)
             if snap_rebalance:
-                if not shares:
-                    mv_pre = ic0
-                else:
-                    mv_pre = 0.0
-                    for sc2, sh in list(shares.items()):
-                        if sh <= 0:
-                            continue
-                        px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
-                        if px is not None:
-                            mv_pre += sh * px
-                new_shares: dict[str, float] = {}
-                if total_weight > 0 and mv_pre > 0:
-                    valid: list[tuple[str, float, float]] = []
-                    for sc, w0 in holdings:
-                        w0p = max(float(w0 or 0.0), 0.0)
-                        if w0p <= 0:
-                            continue
-                        px = _adj_close_td_ff(day_map, sc, td, last_close_fill)
-                        if px is None or px <= 0:
-                            continue
-                        valid.append((sc, w0p, px))
-                    tw2 = sum(w for _, w, _ in valid)
-                    if tw2 > 0:
-                        for sc, w0p, px in valid:
-                            dollar = mv_pre * (w0p / tw2)
-                            new_shares[sc] = dollar / px
-                shares = new_shares
+                mv_pre = _nav_mv_pre_for_rebalance_snap(
+                    shares, prev_mv, ic0, day_map, td, last_close_fill
+                )
+                shares = _nav_snap_shares_from_holdings(
+                    holdings, mv_pre, day_map, td, last_close_fill
+                )
             mv_eod = 0.0
             for sc2, sh in shares.items():
                 if sh <= 0:
@@ -3905,6 +3982,15 @@ def _rebuild_nav_for_strategy_yearly(
     gc.collect()
     if append_after_c:
         _log.info("nav incremental %s: appended after %s through %s", sid, append_after_c, latest_trade_c)
+    nav_max_c = _strategy_nav_max_trade_compact(db, sid)
+    if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
+        _log.warning(
+            "nav %s: max trade_date %s < wind latest %s after yearly rebuild",
+            sid,
+            nav_max_c,
+            latest_trade_c,
+        )
+        return False, wind
     return True, wind
 
 
@@ -4155,6 +4241,32 @@ def _rebuild_nav_for_strategy(
     shares: dict[str, float] = {}
     last_close_fill: dict[str, float] = {}
     prev_mv: float | None = None
+    if not nav_full_rebuild and append_after_c:
+        boot = _nav_bootstrap_state_from_append_row(
+            db,
+            sid,
+            append_after_c,
+            rb_sorted,
+            rb_map,
+            ic0,
+            day_map,
+            bench_code,
+        )
+        if boot:
+            (
+                rb_idx,
+                current_rb,
+                prev_td_date,
+                shares,
+                last_close_fill,
+                prev_mv,
+                bench_nav_acc,
+            ) = boot
+            _log.info(
+                "nav %s: bootstrapped sim state from %s (nav×本金)",
+                sid,
+                append_after_c,
+            )
     for i_td, td in enumerate(trade_days):
         rb_idx_at_start = rb_idx
         td_date = datetime.strptime(td, "%Y%m%d").date()
@@ -4173,35 +4285,13 @@ def _rebuild_nav_for_strategy(
             or (prev_td_date is None and current_rb <= td_date)
         )
         holdings = rb_map.get(current_rb, [])
-        total_weight = sum(max(float(w or 0.0), 0.0) for _, w in holdings)
         if snap_rebalance:
-            if not shares:
-                mv_pre = ic0
-            else:
-                mv_pre = 0.0
-                for sc2, sh in list(shares.items()):
-                    if sh <= 0:
-                        continue
-                    px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
-                    if px is not None:
-                        mv_pre += sh * px
-            new_shares: dict[str, float] = {}
-            if total_weight > 0 and mv_pre > 0:
-                valid: list[tuple[str, float, float]] = []
-                for sc, w0 in holdings:
-                    w0p = max(float(w0 or 0.0), 0.0)
-                    if w0p <= 0:
-                        continue
-                    px = _adj_close_td_ff(day_map, sc, td, last_close_fill)
-                    if px is None or px <= 0:
-                        continue
-                    valid.append((sc, w0p, px))
-                tw2 = sum(w for _, w, _ in valid)
-                if tw2 > 0:
-                    for sc, w0p, px in valid:
-                        dollar = mv_pre * (w0p / tw2)
-                        new_shares[sc] = dollar / px
-            shares = new_shares
+            mv_pre = _nav_mv_pre_for_rebalance_snap(
+                shares, prev_mv, ic0, day_map, td, last_close_fill
+            )
+            shares = _nav_snap_shares_from_holdings(
+                holdings, mv_pre, day_map, td, last_close_fill
+            )
         mv_eod = 0.0
         for sc2, sh in shares.items():
             if sh <= 0:
