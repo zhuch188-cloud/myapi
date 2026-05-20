@@ -1524,6 +1524,8 @@ def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> 
             continue
         rows.sort(key=lambda r: _nav_list_trade_date_as_date(r["trade_date"]), reverse=True)
         last_td = _nav_list_trade_date_as_date(rows[0]["trade_date"])
+        month_cut = last_td.replace(day=1)
+        year_cut = date(last_td.year, 1, 1)
         max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
         p0_nav = (
             _nav_period_start_nav_unit(db, sid, max_rb) if max_rb is not None else None
