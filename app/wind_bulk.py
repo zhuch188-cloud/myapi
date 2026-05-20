@@ -185,6 +185,25 @@ def holding_eod_desc_max_bars() -> int:
     return max(65, min(n, 280)) if n > 0 else 65
 
 
+def holding_eod_start_for_period(
+    trade_date: date | str | Any,
+    rebalance_date: date | str | Any,
+    *,
+    full_refresh: bool,
+) -> str:
+    """
+    持仓单期 EOD 起点：全量用 bulk_eod_start_compact；
+    增量时短周期指标用约 N 日回溯，但「本期收益」须含调仓日 → 起点不晚于调仓日。
+    """
+    if full_refresh:
+        return bulk_eod_start_compact(trade_date, rebalance_date)
+    rb_c = _dt_compact(rebalance_date)
+    inc = holding_eod_start_incremental(trade_date, rebalance_date)
+    if len(rb_c) >= 8 and len(inc) >= 8 and rb_c < inc:
+        return rb_c
+    return inc
+
+
 def holding_eod_start_incremental(
     trade_date: date | str | Any, rebalance_date: date | str | Any
 ) -> str:

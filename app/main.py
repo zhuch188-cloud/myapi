@@ -70,6 +70,8 @@ from app.services import (
     abandon_admin_sync_job,
     reconcile_stale_admin_sync_jobs,
     latest_rebalance_date_by_strategy,
+    _nav_rb_idx_on_date,
+    _row_sql_date,
 )
 from app.supplement_import import (
     CODE_COMPANY_PROFILE_EXCEL,
@@ -1336,16 +1338,79 @@ _NAV_LIST_SUMMARY_EMPTY: dict[str, Any] = {
 
 
 def _nav_list_trade_date_as_date(td: Any) -> date:
+    d = _row_sql_date(td)
+    if d is not None:
+        return d
     if isinstance(td, datetime):
         return td.date()
     if isinstance(td, date):
         return td
-    s = str(td)[:10]
+    s = str(td).strip()[:10]
     return date.fromisoformat(s)
 
 
+def _nav_list_period_rebalance_date(
+    db: Session, strategy_id: str, last_td: date
+) -> date | None:
+    """列表「本期」：截至最新净值日的有效调仓日（与净值增量锚定一致，取自 strategy_positions）。"""
+    rb_rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT rebalance_date
+            FROM strategy_positions
+            WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": strategy_id},
+    ).mappings().all()
+    rb_sorted: list[date] = []
+    for r in rb_rows:
+        d = _row_sql_date(r.get("rebalance_date"))
+        if d is not None:
+            rb_sorted.append(d)
+    if not rb_sorted:
+        return None
+    rb_sorted.sort()
+    _, current_rb = _nav_rb_idx_on_date(rb_sorted, last_td)
+    return current_rb
+
+
+def _nav_period_start_nav_unit(
+    db: Session, strategy_id: str, period_rb: date
+) -> float | None:
+    """该调仓期在净值表中的期初单位净值（首条 rebalance_date 匹配行）。"""
+    rd_iso = period_rb.isoformat()
+    row = db.execute(
+        text(
+            f"""
+            SELECT nav_unit
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+              AND rebalance_date IN (:rd_iso, :rd_cmp)
+            ORDER BY {sql_order_date_asc("trade_date")}
+            LIMIT 1
+            """
+        ),
+        {
+            "sid": strategy_id,
+            "rd_iso": rd_iso,
+            "rd_cmp": rd_iso.replace("-", ""),
+        },
+    ).mappings().first()
+    if not row or row.get("nav_unit") is None:
+        return None
+    try:
+        v = float(row["nav_unit"])
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _nav_list_summary_from_desc_rows(
-    rows_desc: list[Any], max_rb: date | None
+    rows_desc: list[Any],
+    max_rb: date | None,
+    *,
+    period_start_nav: float | None = None,
 ) -> tuple[float, float | None, float | None, float | None, float | None, float | None] | None:
     """
     rows_desc: 同一 strategy 的 nav 行，按 trade_date 降序（与 SQL ORDER BY trade_date DESC 一致）。
@@ -1385,16 +1450,18 @@ def _nav_list_summary_from_desc_rows(
 
     period_ret = None
     if max_rb is not None:
-        first_nav_after = None
-        for r in reversed(rows_desc):
-            td = _nav_list_trade_date_as_date(r["trade_date"])
-            if td >= max_rb:
-                first_nav_after = float(r["nav_unit"])
-                break
-        if first_nav_after is not None and first_nav_after > 0:
-            period_ret = last_nav / first_nav_after - 1.0
-        elif last_nav > 0:
-            period_ret = last_nav / 1.0 - 1.0
+        p0 = period_start_nav
+        if p0 is None or p0 <= 0:
+            for r in reversed(rows_desc):
+                td = _nav_list_trade_date_as_date(r["trade_date"])
+                if td >= max_rb:
+                    try:
+                        p0 = float(r["nav_unit"])
+                    except (TypeError, ValueError):
+                        p0 = None
+                    break
+        if p0 is not None and p0 > 0:
+            period_ret = last_nav / p0 - 1.0
 
     return last_nav, last_1d_return, last_5d_return, period_ret, month_ret, year_ret
 
@@ -1432,11 +1499,14 @@ def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> 
         if not rows:
             continue
         rows.sort(key=lambda r: _nav_list_trade_date_as_date(r["trade_date"]), reverse=True)
-        max_rb: date | None = None
-        rd_top = rows[0].get("rebalance_date")
-        if rd_top is not None:
-            max_rb = _nav_list_trade_date_as_date(rd_top)
-        pack = _nav_list_summary_from_desc_rows(rows, max_rb)
+        last_td = _nav_list_trade_date_as_date(rows[0]["trade_date"])
+        max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
+        p0_nav = (
+            _nav_period_start_nav_unit(db, sid, max_rb) if max_rb is not None else None
+        )
+        pack = _nav_list_summary_from_desc_rows(
+            rows, max_rb, period_start_nav=p0_nav
+        )
         if pack is None:
             continue
         last_nav, last_1d_return, last_5d_return, period_ret, month_ret, year_ret = pack

@@ -859,10 +859,11 @@ def _holding_eod_start_for_indices(
     starts: list[str] = []
     for i in indices:
         rb = rb_positions[i][0]
-        if full_refresh:
-            starts.append(wind_bulk.bulk_eod_start_compact(trade_date, rb))
-        else:
-            starts.append(wind_bulk.holding_eod_start_incremental(trade_date, rb))
+        starts.append(
+            wind_bulk.holding_eod_start_for_period(
+                trade_date, rb, full_refresh=full_refresh
+            )
+        )
     return min(starts)
 
 
@@ -1177,6 +1178,13 @@ def _run_update_try_build_work_item(
         start_c = _holding_eod_start_for_indices(
             trade_date, rb_positions, wind_rb_indices, full_refresh=False
         )
+        for i in wind_rb_indices:
+            rb = rb_positions[i][0]
+            st = wind_bulk.holding_eod_start_for_period(
+                trade_date, rb, full_refresh=False
+            )
+            if st < start_c:
+                start_c = st
     skip_holdings = False
     if (not full_refresh) and last_td is not None and last_td >= trade_date:
         rb_pos_row = db.execute(
@@ -2281,14 +2289,9 @@ def run_update(
                         )
                         continue
                     # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
-                    if full_refresh:
-                        period_start_c = wind_bulk.bulk_eod_start_compact(
-                            trade_date, rebalance
-                        )
-                    else:
-                        period_start_c = wind_bulk.holding_eod_start_incremental(
-                            trade_date, rebalance
-                        )
+                    period_start_c = wind_bulk.holding_eod_start_for_period(
+                        trade_date, rebalance, full_refresh=full_refresh
+                    )
                     eod_load_end_c = period_end_c or str(latest_trade)
                     wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     prog(
