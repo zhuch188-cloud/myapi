@@ -2117,23 +2117,38 @@ def run_update(
                                 f"[{i_active}/{n_active}] {sid}：净值 {nav_hint}"
                                 f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
                             )
-                            _, wind = _rebuild_nav_for_strategy(
+                            nav_mode = "full" if full_refresh else "incremental"
+                            ok_nav, wind = _rebuild_nav_for_strategy(
                                 db,
                                 wind,
                                 sid,
-                                "incremental",
+                                nav_mode,
                                 latest_trade_c_cached=str(latest_trade),
                                 mysql_plan=pl1,
                                 wind_bundle=None,
-                                nav_full_rebuild=False,
+                                nav_full_rebuild=bool(full_refresh),
+                            )
+                            nav_max_c = _strategy_nav_max_trade_compact(db, sid)
+                            lt_c = _compact_date(latest_trade)
+                            if not ok_nav:
+                                raise RuntimeError(
+                                    f"{sid} 净值重建未完成（请查看服务端日志）"
+                                )
+                            if nav_max_c and lt_c and nav_max_c < lt_c:
+                                raise RuntimeError(
+                                    f"{sid} 净值仅至 {nav_max_c}，未到 Wind 最新 {lt_c}"
+                                    "（常见原因：末净值日无持仓快照导致增量尺度回滚；"
+                                    "全量更新将删净值重算，或先跑持仓更新）"
+                                )
+                            prog(
+                                f"[{i_active}/{n_active}] {sid}：净值已更新至 {nav_max_c or lt_c}"
                             )
                 except Exception as ex_nav:
                     _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
                     prog(
-                        f"[{i_active}/{n_active}] {sid}：净值重算失败（已跳过）：{ex_nav}"[
-                            :6000
-                        ]
+                        f"[{i_active}/{n_active}] {sid}：净值重算失败：{ex_nav}"[:6000]
                     )
+                    raise
                 if do_commit:
                     db.commit()
 
@@ -3469,6 +3484,9 @@ def _rebuild_nav_incremental_from_current_period(
                 good_c,
             )
             return False, wind
+        nav_max_c = _strategy_nav_max_trade_compact(db, sid)
+        if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
+            return False, wind
         return True, wind
 
     wind, eod_by_code = wind_bulk.load_eod_by_code(
@@ -4234,6 +4252,15 @@ def _rebuild_nav_for_strategy(
         gc.collect()
     if append_after_c:
         _log.info("nav incremental %s: appended after %s through %s", sid, append_after_c, latest_trade_c)
+    nav_max_c = _strategy_nav_max_trade_compact(db, sid)
+    if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
+        _log.warning(
+            "nav %s: max trade_date %s < wind latest %s after rebuild",
+            sid,
+            nav_max_c,
+            latest_trade_c,
+        )
+        return False, wind
     return True, wind
 
 
