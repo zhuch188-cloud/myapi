@@ -1423,23 +1423,20 @@ def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> 
     ).mappings().all()
 
     by_sid: defaultdict[str, list[Any]] = defaultdict(list)
-    max_rb_by: dict[str, date | None] = {}
     for row in nav_rows:
         sid = str(row["strategy_id"]).strip()
         by_sid[sid].append(row)
-        rd = row.get("rebalance_date")
-        if rd is not None:
-            d = _nav_list_trade_date_as_date(rd)
-            cur = max_rb_by.get(sid)
-            if cur is None or d > cur:
-                max_rb_by[sid] = d
 
     for sid in ids:
         rows = by_sid.get(sid, [])
         if not rows:
             continue
         rows.sort(key=lambda r: _nav_list_trade_date_as_date(r["trade_date"]), reverse=True)
-        pack = _nav_list_summary_from_desc_rows(rows, max_rb_by.get(sid))
+        max_rb: date | None = None
+        rd_top = rows[0].get("rebalance_date")
+        if rd_top is not None:
+            max_rb = _nav_list_trade_date_as_date(rd_top)
+        pack = _nav_list_summary_from_desc_rows(rows, max_rb)
         if pack is None:
             continue
         last_nav, last_1d_return, last_5d_return, period_ret, month_ret, year_ret = pack

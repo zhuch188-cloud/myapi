@@ -2004,7 +2004,9 @@ def run_update(
                 full_qu = wind_merged["quote"]
                 quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
             elif rb_chunked_eod:
-                pass  # 锚定说明在下方 hold_start_idx 计算后输出
+                prog(
+                    f"[{i_active}/{n_active}] {sid}：按 {n_rb} 个调仓期逐期拉 EOD…"
+                )
             else:
                 prog(
                     f"[{i_active}/{n_active}] {sid}：串行拉取 A 股 EOD {len(stock_codes)} 只"
@@ -2019,73 +2021,24 @@ def run_update(
                     )
                 wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
 
-            hold_start_idx, anchor_rb_hold = _holding_anchor_start_idx(
-                db, sid, rb_positions, full_refresh
+            prog(
+                f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入最新日持仓快照"
+                f"（各期按本区间 EOD 重算 1日/5日/本期等；净值仍走锚定增量）…"
             )
-            last_nav_c_hold = _strategy_nav_max_trade_compact(db, sid)
-            n_rb_wind = n_rb - hold_start_idx
-            if hold_start_idx > 0 and anchor_rb_hold is not None:
-                prog(
-                    f"[{i_active}/{n_active}] {sid}：持仓与净值同锚定"
-                    f"（末净值 {last_nav_c_hold or '?'} → 调仓 {_compact_date(anchor_rb_hold)}），"
-                    f"仅 {n_rb_wind}/{n_rb} 期拉 Wind，前 {hold_start_idx} 期沿用上一行情日"
-                )
-                _log.info(
-                    "holding anchor %s: last_nav=%s anchor_rb=%s start_idx=%s wind_periods=%s",
-                    sid,
-                    last_nav_c_hold,
-                    _compact_date(anchor_rb_hold),
-                    hold_start_idx,
-                    n_rb_wind,
-                )
-            else:
-                reason = (
-                    "全量刷新"
-                    if full_refresh
-                    else ("库内无净值" if not last_nav_c_hold else "锚定异常")
-                )
-                prog(
-                    f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入持仓"
-                    f"（{reason}，自第 1 期起拉 Wind）…"
-                )
-                _log.info(
-                    "holding no anchor %s: full_refresh=%s last_nav=%s",
-                    sid,
-                    full_refresh,
-                    last_nav_c_hold,
-                )
             eod_local = eod_by_code if wind_merged is None and not rb_chunked_eod else None
             td_cmp = _compact_date(trade_date)
-            anchor_cmp = (
-                _compact_date(anchor_rb_hold)
-                if hold_start_idx > 0 and anchor_rb_hold is not None
-                else None
-            )
             for attempt in range(4):
                 try:
-                    if anchor_cmp:
-                        db.execute(
-                            text(
-                                f"""
-                                DELETE FROM strategy_holding_daily
-                                WHERE strategy_id = :sid
-                                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                                  AND {sql_date_compact_expr("rebalance_date")} >= :anchor_cmp
-                                """
-                            ),
-                            {"sid": sid, "td_cmp": td_cmp, "anchor_cmp": anchor_cmp},
-                        )
-                    else:
-                        db.execute(
-                            text(
-                                f"""
-                                DELETE FROM strategy_holding_daily
-                                WHERE strategy_id = :sid
-                                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                                """
-                            ),
-                            {"sid": sid, "td_cmp": td_cmp},
-                        )
+                    db.execute(
+                        text(
+                            f"""
+                            DELETE FROM strategy_holding_daily
+                            WHERE strategy_id = :sid
+                              AND {sql_date_compact_expr("trade_date")} = :td_cmp
+                            """
+                        ),
+                        {"sid": sid, "td_cmp": td_cmp},
+                    )
                     break
                 except OperationalError as oe:
                     if not _mysql_lock_contention(oe) or attempt >= 3 or not do_commit:
@@ -2094,28 +2047,6 @@ def run_update(
                         db.rollback()
                     time.sleep(0.25 * (2**attempt))
             skip_rb = skip_update_rebalance_dates or set()
-            if hold_start_idx > 0 and anchor_rb_hold is not None:
-                prior_td = _holding_prior_trade_date(db, sid, trade_date)
-                if prior_td is not None:
-                    rb_before = [rb for rb, _ in rb_positions[:hold_start_idx]]
-                    n_copy = _copy_holding_daily_rebalances(
-                        db,
-                        sid=sid,
-                        from_trade_date=prior_td,
-                        to_trade_date=trade_date,
-                        rebalance_dates=rb_before,
-                        do_commit=do_commit,
-                    )
-                    prog(
-                        f"[{i_active}/{n_active}] {sid}：已沿用 {prior_td} 快照"
-                        f"（锚定前 {hold_start_idx} 期，{n_copy} 条）"
-                    )
-                else:
-                    prog(
-                        f"[{i_active}/{n_active}] {sid}：无上一行情日可沿用"
-                        f"（锚定前 {hold_start_idx} 期本日留空），"
-                        f"自锚定调仓 {_compact_date(anchor_rb_hold)} 起拉 Wind"
-                    )
 
             def _flush_one_rebalance(
                 i_rb: int,
@@ -2144,8 +2075,6 @@ def run_update(
             if rb_chunked_eod:
                 # 按调仓期：只拉该期成分股 EOD，凑齐一期即算权重并落库（峰值内存≈单期行数+一小批 K 线）
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
-                    if i_rb - 1 < hold_start_idx:
-                        continue
                     next_rebalance = (
                         rb_positions[i_rb][0] if i_rb < len(rb_positions) else None
                     )
@@ -2184,10 +2113,8 @@ def run_update(
                     # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
                     period_start_c = wind_bulk.bulk_eod_start_compact(trade_date, rebalance)
                     eod_load_end_c = period_end_c or str(latest_trade)
-                    wind_i = i_rb - hold_start_idx
                     prog(
-                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}]"
-                        f"（Wind {wind_i}/{n_rb_wind}）调仓日 {rebalance} "
+                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} "
                         f"拉 EOD+行情 {len(period_codes)} 只（{period_start_c}~{eod_load_end_c}）…"
                     )
                     if sync_job_id is not None:
@@ -2229,8 +2156,6 @@ def run_update(
                     prepared_rows.clear()
             else:
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
-                    if i_rb - 1 < hold_start_idx:
-                        continue
                     if not positions:
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
@@ -2664,6 +2589,33 @@ def _nav_first_trade_on_or_after(rb: date, trade_days: list[str]) -> str | None:
     return None
 
 
+def _nav_align_sim_state_to_db_last(
+    append_after_c: str,
+    row_last: Any | None,
+    ic0: float,
+    prev_mv: float | None,
+    bench_nav_acc: float | None,
+    bench_code: str,
+) -> tuple[float | None, float | None]:
+    """增量模拟经过末净值日后，用库内净值对齐 prev_mv / 基准净值，保证后续日收益率与列表指标口径连续。"""
+    if row_last is None:
+        return prev_mv, bench_nav_acc
+    try:
+        nu = row_last.get("nav_unit")
+        if nu is not None and float(nu) > 0 and ic0 > 0:
+            prev_mv = float(nu) * ic0
+    except (TypeError, ValueError):
+        pass
+    if bench_code:
+        try:
+            bn = row_last.get("benchmark_nav")
+            if bn is not None and float(bn) > 0:
+                bench_nav_acc = float(bn)
+        except (TypeError, ValueError):
+            pass
+    return prev_mv, bench_nav_acc
+
+
 def _nav_fetch_row_on_day(db: Session, sid: str, td_compact: str) -> Any | None:
     return (
         db.execute(
@@ -2823,9 +2775,9 @@ def _rebuild_nav_incremental_from_current_period(
     sync_job_id: int | None = None,
 ) -> tuple[bool, Any]:
     """
-    以库内最后净值日 anchor：取该日仍有效的最近调仓期，自该期首交易日起拉 Wind、
-    用该日（或期初）库内净值与该期持仓重算股数，模拟至最新日；仅落库 append_after_c 之后各日。
-    若之后又出现新调仓，模拟中会在调仓日按规则换仓。成功 (True, wind)，否则回退全历史重放。
+    以库内最后净值日 anchor：自锚定调仓期首交易日起在内存中模拟至最新日（换仓逻辑同全量），
+    仅落库 append_after_c 之后各日；经过 append_after_c 当日末将 prev_mv/基准净值与库内对齐，
+    避免新增日的 daily_ret 与策略列表「1日/5日/本月/本年/本期」脱节。
     """
     if not _nav_incremental_from_period_enabled():
         _log.info("nav incremental %s: disabled (NAV_INCREMENTAL_FROM_CURRENT_PERIOD)", sid)
@@ -2872,6 +2824,7 @@ def _rebuild_nav_incremental_from_current_period(
         idx_all.clear()
 
     row0 = _nav_fetch_row_on_day(db, sid, period_start_td)
+    row_last = _nav_fetch_row_on_day(db, sid, append_after_c)
     bench_nav_acc: float | None = None
     if bench_code:
         if row0 and row0.get("benchmark_nav") is not None:
@@ -2931,6 +2884,10 @@ def _rebuild_nav_incremental_from_current_period(
                 bench_day_map=bench_day_map,
                 bench_nav_acc=bench_nav_acc,
             )
+            if td == append_after_c:
+                prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
+                    append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
+                )
             if td > append_after_c:
                 nav_accum.append(
                     {
@@ -3026,6 +2983,10 @@ def _rebuild_nav_incremental_from_current_period(
                     bench_day_map=bench_day_map,
                     bench_nav_acc=bench_nav_acc,
                 )
+                if td == append_after_c:
+                    prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
+                        append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
+                    )
                 if td > append_after_c:
                     nav_accum.append(
                         {
