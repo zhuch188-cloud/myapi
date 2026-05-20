@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     nav_rebuild_year_segments: bool = True
     # 日常增量净值：以库内最后净值日对应调仓期为锚，自该期首交易日起拉 Wind 并补之后各日
     nav_incremental_from_current_period: bool = True
+    # 日常增量持仓：开放调仓期 EOD 自行情日向前日历天数（默认 110，覆盖约 60 个交易日）
+    holding_eod_lookback_calendar_days: int = 110
+    # 持仓 5/20/60 日指标从 EOD 序列取的最近 K 线根数（日常增量默认 65）
+    holding_eod_desc_max_bars: int = 65
     # 净值 EOD 动态分段：最新一期成分股数 × 每段月数 <= budget（阶段2 开算前按 CL1 最新期成分重算）
     nav_rebuild_stock_month_budget: int = 300
     # 动态月数上限（0=不设顶，仅受 budget 约束）；对应环境变量 NAV_REBUILD_EOD_MONTHS_MAX

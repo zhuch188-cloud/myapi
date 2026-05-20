@@ -162,7 +162,7 @@ def month_compact_segments(
 
 
 def bulk_eod_start_compact(trade_date: date | str | Any, min_rebalance_date: date | str | Any) -> str:
-    """EOD 拉取起点：须包含「上年」行情，以便 YTD 用上年末最后交易日收盘；并覆盖最早调仓与约 260+ 交易日回溯。"""
+    """全量/首建：EOD 起点取调仓日、上年与约 420 自然日回溯中最早者（覆盖 YTD 与长周期指标）。"""
     td_c = _dt_compact(trade_date)
     rb_c = _dt_compact(min_rebalance_date)
     if len(td_c) < 8 or len(rb_c) < 8:
@@ -171,6 +171,66 @@ def bulk_eod_start_compact(trade_date: date | str | Any, min_rebalance_date: dat
     y_prev = f"{td_d.year - 1}0101"
     lb = (td_d - timedelta(days=420)).strftime("%Y%m%d")
     return min(y_prev, rb_c, lb)
+
+
+def holding_eod_lookback_calendar_days() -> int:
+    """日常增量持仓：自行情日向前日历天数（覆盖 ret_60 约 60 个交易日 + 缓冲）。"""
+    n = int(getattr(settings, "holding_eod_lookback_calendar_days", 0) or 0)
+    return max(75, min(n, 200)) if n > 0 else 110
+
+
+def holding_eod_desc_max_bars() -> int:
+    """从 EOD 序列取近 N 根交易日算 5/20/60 日涨跌（须 ≤ 实际拉取长度）。"""
+    n = int(getattr(settings, "holding_eod_desc_max_bars", 0) or 0)
+    return max(65, min(n, 280)) if n > 0 else 65
+
+
+def holding_eod_start_incremental(
+    trade_date: date | str | Any, rebalance_date: date | str | Any
+) -> str:
+    """
+    日常增量持仓（开放调仓期）：起点取「调仓日、上年、行情日前 N 日」中最晚者，
+    避免 min(调仓日,2016…) 把 2026 开放期拉到全历史。
+    """
+    td_c = _dt_compact(trade_date)
+    rb_c = _dt_compact(rebalance_date)
+    if len(td_c) < 8 or len(rb_c) < 8:
+        raise ValueError("invalid trade_date or rebalance_date for incremental EOD")
+    td_d = datetime.strptime(td_c[:8], "%Y%m%d").date()
+    y_prev = f"{td_d.year - 1}0101"
+    lb = (td_d - timedelta(days=holding_eod_lookback_calendar_days())).strftime("%Y%m%d")
+    return max(rb_c, y_prev, lb)
+
+
+def nav_incremental_eod_start(
+    append_after_c: str,
+    rb_sorted: list[date],
+    last_nav_d: date,
+    latest_d: date,
+    trade_days: list[str],
+) -> str:
+    """净值增量 EOD：默认末净值日；若其间有新调仓，起点前移到该调仓首个交易日。"""
+    start = str(append_after_c).strip()[:8]
+    if len(start) < 8:
+        return start
+    for rb in rb_sorted:
+        if rb <= last_nav_d:
+            continue
+        if rb > latest_d:
+            break
+        p0 = first_trade_on_or_after(rb, trade_days)
+        if p0 and p0 < start:
+            start = p0
+    return start
+
+
+def first_trade_on_or_after(rb: date, trade_days: list[str]) -> str | None:
+    """trade_days 升序 compact；首个 >= 调仓日的交易日。"""
+    rb_c = _dt_compact(rb)
+    for td in trade_days:
+        if td >= rb_c:
+            return td
+    return None
 
 
 def load_eod_by_code(

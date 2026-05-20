@@ -762,24 +762,108 @@ def _group_strategy_positions_by_rebalance(
     return rb_positions, rb_sorted[-1], rb_sorted[0]
 
 
+def _last_nav_compact_for_update(db: Session, sid: str) -> str | None:
+    """日常增量用末净值日；若尾部存在尺度断裂则退回最后一个好交易日。"""
+    return _nav_last_good_trade_compact(db, sid) or _strategy_nav_max_trade_compact(
+        db, sid
+    )
+
+
+def _holding_incremental_scope(
+    db: Session,
+    sid: str,
+    rb_positions: list[tuple[date, list[dict[str, Any]]]],
+    full_refresh: bool,
+) -> tuple[int, date | None, str | None, str]:
+    """
+    与净值增量同一约定：末净值日 → 调仓日≤该日的最近一期为锚；
+    仅锚定及之后调仓期拉 Wind，更早期沿用上一行情日快照（不逐期重拉全历史）。
+    返回 (hold_start_idx, anchor_rb, last_nav_c, 说明文案)。
+    """
+    n_rb = len(rb_positions)
+    if full_refresh:
+        return 0, (rb_positions[0][0] if rb_positions else None), None, "全量刷新"
+    last_nav_c = _last_nav_compact_for_update(db, sid)
+    if not last_nav_c or len(last_nav_c) < 8:
+        return (
+            0,
+            None,
+            None,
+            "库中无末净值，无法锚定；持仓将逐期拉 Wind（与首建相同）",
+        )
+    rb_sorted = [rb for rb, _ in rb_positions]
+    last_nav_d = datetime.strptime(last_nav_c[:8], "%Y%m%d").date()
+    hold_start_idx, anchor_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d)
+    note = (
+        f"末净值 {last_nav_c} → 锚定调仓 {_compact_date(anchor_rb)}，"
+        f"持仓仅开放调仓期拉 Wind（EOD 回溯约 "
+        f"{wind_bulk.holding_eod_lookback_calendar_days()} 自然日）"
+    )
+    return hold_start_idx, anchor_rb, last_nav_c, note
+
+
 def _holding_anchor_start_idx(
     db: Session,
     sid: str,
     rb_positions: list[tuple[date, list[dict[str, Any]]]],
     full_refresh: bool,
 ) -> tuple[int, date | None]:
-    """
-    与净值增量一致：取 strategy_nav_daily 末净值日，锚定为「调仓日 ≤ 该日」的最近一期；
-    持仓仅对该期及之后拉 Wind，更早调仓期沿用上一行情日快照。
-    """
+    idx, anchor, _, _ = _holding_incremental_scope(db, sid, rb_positions, full_refresh)
+    return idx, anchor
+
+
+def _holding_rb_indices_need_wind(
+    rb_positions: list[tuple[date, list[dict[str, Any]]]],
+    trade_date: date,
+    full_refresh: bool,
+    hold_start_idx: int,
+) -> list[int]:
+    """增量：仅「锚定及之后、且截至行情日仍未结束」的调仓期拉 Wind；已结束期复制上一日。"""
     if full_refresh:
-        return 0, None
-    last_nav_c = _strategy_nav_max_trade_compact(db, sid)
-    if not last_nav_c or len(last_nav_c) < 8:
-        return 0, None
-    rb_sorted = [rb for rb, _ in rb_positions]
-    last_nav_d = datetime.strptime(last_nav_c[:8], "%Y%m%d").date()
-    return _nav_rb_idx_on_date(rb_sorted, last_nav_d)
+        return list(range(len(rb_positions)))
+    td_cmp = _compact_date(trade_date)
+    out: list[int] = []
+    for i, (_rb, _pos) in enumerate(rb_positions):
+        if i < hold_start_idx:
+            continue
+        if i + 1 < len(rb_positions):
+            pe = _compact_date(rb_positions[i + 1][0])
+            if pe <= td_cmp:
+                continue
+        out.append(i)
+    return out
+
+
+def _holding_union_codes_for_indices(
+    rb_positions: list[tuple[date, list[dict[str, Any]]]],
+    indices: list[int],
+) -> list[str]:
+    codes: set[str] = set()
+    for i in indices:
+        for p in rb_positions[i][1]:
+            if p.get("stock_code"):
+                codes.add(_wind_code_key(p["stock_code"]))
+    return sorted(codes)
+
+
+def _holding_eod_start_for_indices(
+    trade_date: date,
+    rb_positions: list[tuple[date, list[dict[str, Any]]]],
+    indices: list[int],
+    *,
+    full_refresh: bool,
+) -> str:
+    """单策略持仓 Wind 区间起点（取各待拉调仓期起点的最早 compact）。"""
+    if not indices:
+        return _compact_date(trade_date)
+    starts: list[str] = []
+    for i in indices:
+        rb = rb_positions[i][0]
+        if full_refresh:
+            starts.append(wind_bulk.bulk_eod_start_compact(trade_date, rb))
+        else:
+            starts.append(wind_bulk.holding_eod_start_incremental(trade_date, rb))
+    return min(starts)
 
 
 def _holding_prior_trade_date(db: Session, sid: str, trade_date: date) -> date | None:
@@ -887,8 +971,10 @@ def _build_holding_daily_row_from_wind(
     eod_series: list,
     latest_trade: str,
     period_end_compact: str | None = None,
+    desc_max_bars: int | None = None,
 ) -> dict[str, Any]:
     """由 Wind 行情 + 单股 EOD 序列生成 strategy_holding_daily 一行（不含 latest_weight）。"""
+    desc_n = int(desc_max_bars) if desc_max_bars is not None else 280
     scode = p["stock_code"]
     period_weight = float(p["holding_weight"] or 0.0)
     wk = _wind_code_key(scode)
@@ -925,7 +1011,7 @@ def _build_holding_daily_row_from_wind(
         period_end_px = wind_bulk.last_close_on_or_before(eod_series, asof_c)
         period_ret = _safe_return(period_end_px, period_start_close)
         day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
-        desc_closes = wind_bulk.closes_desc_from_asc(seg, 280)
+        desc_closes = wind_bulk.closes_desc_from_asc(seg, desc_n)
         px = (
             period_end_px
             if period_end_px is not None and period_end_px > 0
@@ -941,7 +1027,7 @@ def _build_holding_daily_row_from_wind(
         day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
         if day_ret is None:
             day_ret = _safe_return(latest_price, prev_close)
-        desc_closes = wind_bulk.closes_desc_from_asc(eod_series, 280)
+        desc_closes = wind_bulk.closes_desc_from_asc(eod_series, desc_n)
         latest_adj = desc_closes[0] if desc_closes else None
         px = latest_adj if (latest_adj is not None and latest_adj > 0) else latest_price
         period_ret = _safe_return(px, period_start_close)
@@ -1073,7 +1159,24 @@ def _run_update_try_build_work_item(
     stock_codes = sorted(code_keys)
     if not stock_codes:
         return None
-    start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
+    hold_start_idx, anchor_rb_hold, last_nav_c_scope, hold_scope_note = (
+        _holding_incremental_scope(db, sid, rb_positions, full_refresh)
+    )
+    wind_rb_indices = _holding_rb_indices_need_wind(
+        rb_positions, trade_date, full_refresh, hold_start_idx
+    )
+    n_rb_wind = len(wind_rb_indices)
+    wind_stock_codes = (
+        _holding_union_codes_for_indices(rb_positions, wind_rb_indices)
+        if wind_rb_indices
+        else stock_codes
+    )
+    if full_refresh or hold_start_idx <= 0 or anchor_rb_hold is None:
+        start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
+    else:
+        start_c = _holding_eod_start_for_indices(
+            trade_date, rb_positions, wind_rb_indices, full_refresh=False
+        )
     skip_holdings = False
     if (not full_refresh) and last_td is not None and last_td >= trade_date:
         rb_pos_row = db.execute(
@@ -1136,6 +1239,13 @@ def _run_update_try_build_work_item(
         "min_rb_date": min_rb_date,
         "start_c": start_c,
         "skip_holdings": skip_holdings,
+        "hold_start_idx": hold_start_idx,
+        "anchor_rb_hold": anchor_rb_hold,
+        "last_nav_c_scope": last_nav_c_scope,
+        "hold_scope_note": hold_scope_note,
+        "n_rb_wind": n_rb_wind,
+        "wind_rb_indices": wind_rb_indices,
+        "wind_stock_codes": wind_stock_codes,
     }
 
 
@@ -1214,7 +1324,7 @@ def _run_update_prefetch_wind_merged(
     union_bench: set[str] = set()
     global_st: str | None = None
     for w in work_items:
-        for c in w["stock_codes"]:
+        for c in w.get("wind_stock_codes") or w["stock_codes"]:
             union_codes.add(c)
         bc = str(w.get("bench_code") or "").strip().upper()
         if bc:
@@ -1874,8 +1984,14 @@ def run_update(
         src = "远程SQLServer(WindDB)"
         mode_text = "全量重算当日快照" if full_refresh else "增量（默认）"
         scope_text = f"指定策略={len(selected_set)}" if selected_set else "全部启用策略"
+        incr_rule = ""
+        if not full_refresh:
+            incr_rule = (
+                "；约定=以库末净值为基准、调仓日≤末净值日的最近一期为锚，"
+                "净值仅补末净值日之后、持仓仅锚定及之后拉 Wind（非从第 1 期重拉）"
+            )
         prog(
-            f"Wind源={src} 最新交易日={trade_date} 模式={mode_text} 范围={scope_text}，"
+            f"Wind源={src} 最新交易日={trade_date} 模式={mode_text} 范围={scope_text}{incr_rule}，"
             f"待处理策略数={len(configs)}"
         )
 
@@ -1922,17 +2038,33 @@ def run_update(
             rb_positions = wi["rb_positions"]
             stock_codes = wi["stock_codes"]
             start_c = wi["start_c"]
+            hold_start_idx = int(wi.get("hold_start_idx") or 0)
+            anchor_rb_hold = wi.get("anchor_rb_hold")
+            hold_scope_note = str(wi.get("hold_scope_note") or "")
+            wind_rb_indices: list[int] = list(wi.get("wind_rb_indices") or [])
+            n_rb_wind = int(wi.get("n_rb_wind") or len(wind_rb_indices))
+            wind_stock_codes: list[str] = list(
+                wi.get("wind_stock_codes") or stock_codes
+            )
+            holding_desc_bars = (
+                wind_bulk.holding_eod_desc_max_bars()
+                if not full_refresh and wind_rb_indices
+                else 280
+            )
             if skip_holdings:
                 prog(f"[{i_active}/{n_active}] 策略 {sid}：跳过持仓（已齐），仅补净值…")
             else:
-                prog(f"[{i_active}/{n_active}] 策略 {sid}：开始处理…")
+                prog(
+                    f"[{i_active}/{n_active}] 策略 {sid}：开始处理…"
+                    + (f" {hold_scope_note}" if hold_scope_note else "")
+                )
 
             if not skip_nav_rebuild:
                 try:
                     plans1 = _batch_nav_mysql_plans(db, [sid], "full")
                     pl1 = plans1.get(sid)
                     if pl1:
-                        last_nav_c = _strategy_nav_max_trade_compact(db, sid)
+                        last_nav_c = _last_nav_compact_for_update(db, sid)
                         if last_nav_c and _compact_date(latest_trade) <= last_nav_c:
                             prog(
                                 f"[{i_active}/{n_active}] {sid}：净值已至 {last_nav_c}，无需补算"
@@ -2004,27 +2136,30 @@ def run_update(
                 full_qu = wind_merged["quote"]
                 quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
             elif rb_chunked_eod:
-                prog(
-                    f"[{i_active}/{n_active}] {sid}：按 {n_rb} 个调仓期逐期拉 EOD…"
-                )
+                if n_rb_wind <= 0:
+                    prog(f"[{i_active}/{n_active}] {sid}：无待拉 Wind 的调仓期")
+                else:
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：持仓增量，"
+                        f"仅 {n_rb_wind} 期拉 EOD（非 {n_rb} 期全历史）…"
+                    )
             else:
+                eod_codes = wind_stock_codes if wind_stock_codes else stock_codes
                 prog(
-                    f"[{i_active}/{n_active}] {sid}：串行拉取 A 股 EOD {len(stock_codes)} 只"
+                    f"[{i_active}/{n_active}] {sid}：串行拉取 A 股 EOD {len(eod_codes)} 只"
                     f"{(' + 指数 1 只' if bench_code else '')} × 区间 {start_c}~{latest_trade} …"
                 )
                 wind, eod_by_code = wind_bulk.load_eod_by_code(
-                    wind, stock_codes, start_c, str(latest_trade), db
+                    wind, eod_codes, start_c, str(latest_trade), db
                 )
                 if bench_code:
                     wind, index_eod_by_code = wind_bulk.load_index_eod_by_code(
                         wind, [bench_code], start_c, str(latest_trade), db
                     )
-                wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
+                wind, quote_map = _fetch_wind_quote_map_batched(
+                    db, wind, eod_codes, latest_trade
+                )
 
-            prog(
-                f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入最新日持仓快照"
-                f"（各期按本区间 EOD 重算 1日/5日/本期等；净值仍走锚定增量）…"
-            )
             eod_local = eod_by_code if wind_merged is None and not rb_chunked_eod else None
             td_cmp = _compact_date(trade_date)
             for attempt in range(4):
@@ -2047,6 +2182,38 @@ def run_update(
                         db.rollback()
                     time.sleep(0.25 * (2**attempt))
             skip_rb = skip_update_rebalance_dates or set()
+            if hold_start_idx > 0 and anchor_rb_hold is not None and not full_refresh:
+                prior_td = _holding_prior_trade_date(db, sid, trade_date)
+                rb_copy: list[date] = []
+                for i_rb_c, (rb_c, _) in enumerate(rb_positions):
+                    if i_rb_c < hold_start_idx:
+                        rb_copy.append(rb_c)
+                    elif i_rb_c not in wind_rb_indices:
+                        rb_copy.append(rb_c)
+                if prior_td is not None and rb_copy:
+                    n_copy = _copy_holding_daily_rebalances(
+                        db,
+                        sid=sid,
+                        from_trade_date=prior_td,
+                        to_trade_date=trade_date,
+                        rebalance_dates=rb_copy,
+                        do_commit=do_commit,
+                    )
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：持仓 {len(rb_copy)} 期沿用 {prior_td}"
+                        f"（{n_copy} 条），仅 {n_rb_wind} 个开放期拉 Wind"
+                        f"（EOD 约 {wind_bulk.holding_eod_lookback_calendar_days()} 日回溯）"
+                    )
+                elif n_rb_wind:
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：持仓仅 {n_rb_wind} 个开放期拉 Wind"
+                        f"（锚定 {_compact_date(anchor_rb_hold)}，无上一日可沿用）"
+                    )
+            else:
+                prog(
+                    f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入持仓"
+                    f"（{'全量刷新' if full_refresh else '无末净值'}，逐期拉 Wind）…"
+                )
 
             def _flush_one_rebalance(
                 i_rb: int,
@@ -2054,6 +2221,7 @@ def run_update(
                 prepared_rows: list[dict[str, Any]],
                 total_weight: float,
                 rb_compact: str,
+                wind_i: int,
             ) -> None:
                 n_written = _flush_rebalance_holding_period(
                     db,
@@ -2066,8 +2234,8 @@ def run_update(
                     do_commit=do_commit,
                 )
                 prog(
-                    f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} "
-                    f"已写入 {n_written} 条"
+                    f"[{i_active}/{n_active}] {sid} Wind {wind_i}/{n_rb_wind} "
+                    f"调仓 {rebalance} 已写入 {n_written} 条"
                 )
                 if sync_job_id is not None and rb_compact:
                     _sync_mark_update_rb_done(sync_job_id, rb_compact)
@@ -2075,6 +2243,8 @@ def run_update(
             if rb_chunked_eod:
                 # 按调仓期：只拉该期成分股 EOD，凑齐一期即算权重并落库（峰值内存≈单期行数+一小批 K 线）
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                    if (i_rb - 1) not in wind_rb_indices:
+                        continue
                     next_rebalance = (
                         rb_positions[i_rb][0] if i_rb < len(rb_positions) else None
                     )
@@ -2111,17 +2281,26 @@ def run_update(
                         )
                         continue
                     # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
-                    period_start_c = wind_bulk.bulk_eod_start_compact(trade_date, rebalance)
+                    if full_refresh:
+                        period_start_c = wind_bulk.bulk_eod_start_compact(
+                            trade_date, rebalance
+                        )
+                    else:
+                        period_start_c = wind_bulk.holding_eod_start_incremental(
+                            trade_date, rebalance
+                        )
                     eod_load_end_c = period_end_c or str(latest_trade)
+                    wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     prog(
-                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} "
-                        f"拉 EOD+行情 {len(period_codes)} 只（{period_start_c}~{eod_load_end_c}）…"
+                        f"[{i_active}/{n_active}] {sid} Wind {wind_i}/{n_rb_wind} "
+                        f"调仓 {rebalance} EOD {len(period_codes)} 只"
+                        f"（{period_start_c}~{eod_load_end_c}）…"
                     )
                     if sync_job_id is not None:
                         _admin_sync_job_touch(
                             sync_job_id,
                             "update",
-                            f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
+                            f"[{i_active}/{n_active}] {sid} Wind {wind_i}/{n_rb_wind} "
                             f"调仓 {rebalance} EOD {len(period_codes)} 只…",
                             do_commit=True,
                         )
@@ -2144,6 +2323,7 @@ def run_update(
                                 eod_series=eod_part.get(wk, []),
                                 latest_trade=str(latest_trade),
                                 period_end_compact=period_end_c,
+                                desc_max_bars=holding_desc_bars,
                             )
                         )
                     quote_part.clear()
@@ -2151,11 +2331,18 @@ def run_update(
                     del eod_part
                     gc.collect()
                     _flush_one_rebalance(
-                        i_rb, rebalance, prepared_rows, total_weight, rb_compact
+                        i_rb,
+                        rebalance,
+                        prepared_rows,
+                        total_weight,
+                        rb_compact,
+                        wind_i,
                     )
                     prepared_rows.clear()
             else:
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                    if (i_rb - 1) not in wind_rb_indices:
+                        continue
                     if not positions:
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
@@ -2191,10 +2378,17 @@ def run_update(
                                 eod_series=eod_by_code.get(wk, []),
                                 latest_trade=str(latest_trade),
                                 period_end_compact=period_end_c,
+                                desc_max_bars=holding_desc_bars,
                             )
                         )
+                    wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     _flush_one_rebalance(
-                        i_rb, rebalance, prepared_rows, total_weight, rb_compact
+                        i_rb,
+                        rebalance,
+                        prepared_rows,
+                        total_weight,
+                        rb_compact,
+                        wind_i,
                     )
 
             if do_commit:
@@ -2926,7 +3120,9 @@ def _rebuild_nav_incremental_from_current_period(
     use_seg = bool(getattr(settings, "nav_rebuild_year_segments", True)) and (
         _wind_low_memory_mode() or len(period_codes) > 250
     )
-    eod_start_c = append_after_c
+    eod_start_c = wind_bulk.nav_incremental_eod_start(
+        append_after_c, rb_sorted, last_nav_d, latest_d, trade_days
+    )
     nav_persist_chunk = max(50, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
     nav_accum: list[dict[str, Any]] = []
     row_last = _nav_fetch_row_on_day(db, sid, append_after_c)
@@ -2945,8 +3141,8 @@ def _rebuild_nav_incremental_from_current_period(
         _admin_sync_job_touch(
             sync_job_id,
             "nav",
-            f"{sid}：末净值 {append_after_c} 起增量→{latest_trade_c}（{len(sim_days)} 日），"
-            f"成分 {len(period_codes)} 只…",
+            f"{sid}：末净值 {append_after_c} EOD自 {eod_start_c} 增量→{latest_trade_c}"
+            f"（{len(sim_days)} 日）成分 {len(period_codes)} 只…",
             db=db,
             do_commit=True,
         )
