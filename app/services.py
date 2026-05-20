@@ -2883,6 +2883,83 @@ def _nav_scale_break_detected(db: Session, sid: str) -> bool:
     return ratio < 0.85 or ratio > 1.15
 
 
+def _nav_shares_from_holding_snapshot(
+    db: Session,
+    sid: str,
+    trade_d: date,
+    rebalance: date,
+    prev_mv: float,
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    td_compact: str,
+    last_close_fill: dict[str, float],
+) -> dict[str, float] | None:
+    """
+    用末净值日 strategy_holding_daily 快照的 latest_weight 反推股数，
+    与当日 nav_unit 尺度一致（删库后增量勿仅用 strategy_positions 当前权重）。
+    """
+    if prev_mv <= 0:
+        return None
+    td_iso = trade_d.isoformat()
+    rb_iso = rebalance.isoformat()
+    rb_cmp = rb_iso.replace("-", "")
+    td_cmp = _compact_date(trade_d)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT stock_code, latest_weight, period_weight, latest_price
+            FROM strategy_holding_daily
+            WHERE strategy_id=:sid
+              AND rebalance_date IN (:rb_iso, :rb_cmp)
+              AND (
+                trade_date = :td_iso
+                OR {sql_date_compact_expr("trade_date")} = :td_cmp
+              )
+            """
+        ),
+        {
+            "sid": sid,
+            "rb_iso": rb_iso,
+            "rb_cmp": rb_cmp,
+            "td_iso": td_iso,
+            "td_cmp": td_cmp,
+        },
+    ).mappings().all()
+    if not rows:
+        return None
+    shares: dict[str, float] = {}
+    tw = 0.0
+    for r in rows:
+        try:
+            tw += max(float(r.get("latest_weight") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            pass
+    for r in rows:
+        sc = _wind_code_key(r["stock_code"])
+        if not sc:
+            continue
+        try:
+            w = float(r.get("latest_weight") or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+        if w <= 0:
+            try:
+                pw = float(r.get("period_weight") or 0.0)
+            except (TypeError, ValueError):
+                pw = 0.0
+            w = pw / tw if tw > 0 else 0.0
+        if w <= 0:
+            continue
+        try:
+            px = float(r.get("latest_price") or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px <= 0:
+            px = _adj_close_td_ff(day_map, sc, td_compact, last_close_fill) or 0.0
+        if px > 0:
+            shares[sc] = prev_mv * w / px
+    return shares if shares else None
+
+
 def _nav_init_state_from_last_row(
     db: Session,
     sid: str,
@@ -2918,25 +2995,35 @@ def _nav_init_state_from_last_row(
         except (TypeError, ValueError):
             bench_nav_acc = 1.0
     last_close_fill: dict[str, float] = {}
-    holdings0 = rb_map.get(current_rb, [])
-    shares = _nav_snap_shares_from_holdings(
-        holdings0, prev_mv, day_map, append_after_c, last_close_fill
+    shares = _nav_shares_from_holding_snapshot(
+        db,
+        sid,
+        last_nav_d,
+        current_rb,
+        prev_mv,
+        day_map,
+        append_after_c,
+        last_close_fill,
     )
-    mv_chk = 0.0
-    for sc2, sh in shares.items():
-        if sh <= 0:
-            continue
-        px = _adj_close_td_ff(day_map, sc2, append_after_c, last_close_fill)
-        if px is not None:
-            mv_chk += sh * px
-    # 以库内末净值 nav_unit 为尺度锚；勿用权重重算市值覆盖 prev_mv（删库后增量常见尺度断裂）
-    if mv_chk > 0 and prev_mv > 0:
-        drift = abs(mv_chk - prev_mv) / prev_mv
-        if drift > 1e-6:
-            scale = prev_mv / mv_chk
-            shares = {sc: sh * scale for sc, sh in shares.items() if sh > 0}
-    elif mv_chk > 0 and prev_mv <= 0:
-        prev_mv = mv_chk
+    if not shares:
+        holdings0 = rb_map.get(current_rb, [])
+        shares = _nav_snap_shares_from_holdings(
+            holdings0, prev_mv, day_map, append_after_c, last_close_fill
+        )
+        mv_chk = 0.0
+        for sc2, sh in shares.items():
+            if sh <= 0:
+                continue
+            px = _adj_close_td_ff(day_map, sc2, append_after_c, last_close_fill)
+            if px is not None:
+                mv_chk += sh * px
+        if mv_chk > 0 and prev_mv > 0:
+            drift = abs(mv_chk - prev_mv) / prev_mv
+            if drift > 1e-6:
+                scale = prev_mv / mv_chk
+                shares = {sc: sh * scale for sc, sh in shares.items() if sh > 0}
+        elif mv_chk > 0 and prev_mv <= 0:
+            prev_mv = mv_chk
     return rb_idx, current_rb, last_nav_d, shares, last_close_fill, prev_mv, bench_nav_acc
 
 
@@ -3265,6 +3352,25 @@ def _rebuild_nav_incremental_from_current_period(
             latest_trade_c,
             append_after_c,
         )
+        if _nav_scale_break_detected(db, sid):
+            good_c = _nav_last_good_trade_compact(db, sid) or append_after_c
+            db.execute(
+                text(
+                    f"""
+                    DELETE FROM strategy_nav_daily
+                    WHERE strategy_id=:sid
+                      AND {sql_date_compact_expr("trade_date")} > :good_c
+                    """
+                ),
+                {"sid": sid, "good_c": good_c},
+            )
+            db.commit()
+            _log.warning(
+                "nav incremental %s: scale break after write, deleted nav after %s",
+                sid,
+                good_c,
+            )
+            return False, wind
         return True, wind
 
     wind, eod_by_code = wind_bulk.load_eod_by_code(
@@ -3350,6 +3456,25 @@ def _rebuild_nav_incremental_from_current_period(
         latest_trade_c,
         append_after_c,
     )
+    if _nav_scale_break_detected(db, sid):
+        good_c = _nav_last_good_trade_compact(db, sid) or append_after_c
+        db.execute(
+            text(
+                f"""
+                DELETE FROM strategy_nav_daily
+                WHERE strategy_id=:sid
+                  AND {sql_date_compact_expr("trade_date")} > :good_c
+                """
+            ),
+            {"sid": sid, "good_c": good_c},
+        )
+        db.commit()
+        _log.warning(
+            "nav incremental %s: scale break after write, deleted nav after %s",
+            sid,
+            good_c,
+        )
+        return False, wind
     return True, wind
 
 

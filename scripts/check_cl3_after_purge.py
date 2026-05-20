@@ -23,7 +23,7 @@ from app.sql_dialect import sql_max_date_expr, sql_order_date_desc
 
 
 def main() -> int:
-    sid = "CL3"
+    sid = (sys.argv[1] if len(sys.argv) > 1 else "CL4").strip()
     with get_session() as db:
         print(f"=== {sid} 尺度断裂检测 ===")
         print(f"  scale_break_detected={_nav_scale_break_detected(db, sid)}")

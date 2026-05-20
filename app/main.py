@@ -1375,27 +1375,47 @@ def _nav_list_period_rebalance_date(
     return current_rb
 
 
-def _nav_period_start_nav_unit(
-    db: Session, strategy_id: str, period_rb: date
-) -> float | None:
-    """该调仓期在净值表中的期初单位净值（首条 rebalance_date 匹配行）。"""
-    rd_iso = period_rb.isoformat()
+def _nav_unit_last_before(db: Session, strategy_id: str, anchor_dt: date) -> float | None:
+    """严格早于 anchor_dt 的最近一条 nav_unit（与净值页 nav-metrics 本月/本年锚定一致）。"""
     row = db.execute(
         text(
             f"""
             SELECT nav_unit
             FROM strategy_nav_daily
             WHERE strategy_id=:sid
-              AND rebalance_date IN (:rd_iso, :rd_cmp)
+              AND {sql_date_compact_expr("trade_date")} < :acmp
+            ORDER BY {sql_order_date_desc("trade_date")}
+            LIMIT 1
+            """
+        ),
+        {"sid": strategy_id, "acmp": anchor_dt.strftime("%Y%m%d")},
+    ).mappings().first()
+    if not row or row.get("nav_unit") is None:
+        return None
+    try:
+        v = float(row["nav_unit"])
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _nav_period_start_nav_unit(
+    db: Session, strategy_id: str, period_rb: date
+) -> float | None:
+    """本期期初：调仓日（含）起首个交易日的 nav_unit（与页面说明一致）。"""
+    rb_cmp = period_rb.strftime("%Y%m%d")
+    row = db.execute(
+        text(
+            f"""
+            SELECT nav_unit
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("trade_date")} >= :rb_cmp
             ORDER BY {sql_order_date_asc("trade_date")}
             LIMIT 1
             """
         ),
-        {
-            "sid": strategy_id,
-            "rd_iso": rd_iso,
-            "rd_cmp": rd_iso.replace("-", ""),
-        },
+        {"sid": strategy_id, "rb_cmp": rb_cmp},
     ).mappings().first()
     if not row or row.get("nav_unit") is None:
         return None
@@ -1411,6 +1431,8 @@ def _nav_list_summary_from_desc_rows(
     max_rb: date | None,
     *,
     period_start_nav: float | None = None,
+    anchor_m_nav: float | None = None,
+    anchor_y_nav: float | None = None,
 ) -> tuple[float, float | None, float | None, float | None, float | None, float | None] | None:
     """
     rows_desc: 同一 strategy 的 nav 行，按 trade_date 降序（与 SQL ORDER BY trade_date DESC 一致）。
@@ -1426,16 +1448,18 @@ def _nav_list_summary_from_desc_rows(
     month_cut = last_td.replace(day=1)
     year_cut = date(last_td.year, 1, 1)
 
-    anchor_m_nav = None
-    anchor_y_nav = None
-    for r in rows_desc:
-        td = _nav_list_trade_date_as_date(r["trade_date"])
-        if td < month_cut and anchor_m_nav is None:
-            anchor_m_nav = float(r["nav_unit"])
-        if td < year_cut and anchor_y_nav is None:
-            anchor_y_nav = float(r["nav_unit"])
-        if anchor_m_nav is not None and anchor_y_nav is not None:
-            break
+    if anchor_m_nav is None:
+        for r in rows_desc:
+            td = _nav_list_trade_date_as_date(r["trade_date"])
+            if td < month_cut:
+                anchor_m_nav = float(r["nav_unit"])
+                break
+    if anchor_y_nav is None:
+        for r in rows_desc:
+            td = _nav_list_trade_date_as_date(r["trade_date"])
+            if td < year_cut:
+                anchor_y_nav = float(r["nav_unit"])
+                break
 
     dm = _nav_metric_denominator(anchor_m_nav)
     dy = _nav_metric_denominator(anchor_y_nav)
@@ -1470,8 +1494,8 @@ def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> 
     """
     与 _strategy_nav_list_summary 相同口径；供策略列表页使用。
 
-    一次读取 strategy_nav_daily（无 ORDER BY，避免大结果集 filesort），在内存中按策略排序并聚合；
-    max_rb 取净值行中 rebalance_date 的最大值（与导入后持仓期键一致，且避免再扫 strategy_positions）。
+    一次读取 strategy_nav_daily（无 ORDER BY），在内存中按策略排序并聚合；
+    本期锚定 strategy_positions 截至末净值日的调仓日 + 期初首个交易日 nav；月/年锚定与 nav-metrics 相同（SQL）。
     """
     ids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
     out: dict[str, dict[str, Any]] = {sid: dict(_NAV_LIST_SUMMARY_EMPTY) for sid in ids}
@@ -1504,8 +1528,14 @@ def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> 
         p0_nav = (
             _nav_period_start_nav_unit(db, sid, max_rb) if max_rb is not None else None
         )
+        anchor_m = _nav_unit_last_before(db, sid, month_cut)
+        anchor_y = _nav_unit_last_before(db, sid, year_cut)
         pack = _nav_list_summary_from_desc_rows(
-            rows, max_rb, period_start_nav=p0_nav
+            rows,
+            max_rb,
+            period_start_nav=p0_nav,
+            anchor_m_nav=anchor_m,
+            anchor_y_nav=anchor_y,
         )
         if pack is None:
             continue
