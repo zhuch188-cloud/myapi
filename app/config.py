@@ -93,10 +93,10 @@ class Settings(BaseSettings):
     strategy_excel_import_row_batch: int = 2500
     # 净值重建：每 N 个交易日落库一批（仅阶段2 nav_accum；不减小 day_map 峰值）
     nav_rebuild_persist_chunk: int = 400
-  # 低内存下分段拉 Wind EOD 算净值（避免全区间 day_map 一次驻留）
-  nav_rebuild_year_segments: bool = True
-  # 日常增量净值：自当前调仓期首交易日起拉 Wind，用该日库内净值+当期持仓重算股数后向前补（非从策略首日重放）
-  nav_incremental_from_current_period: bool = True
+    # 低内存下分段拉 Wind EOD 算净值（避免全区间 day_map 一次驻留）
+    nav_rebuild_year_segments: bool = True
+    # 日常增量净值：以库内最后净值日对应调仓期为锚，自该期首交易日起拉 Wind 并补之后各日
+    nav_incremental_from_current_period: bool = True
     # 净值 EOD 动态分段：最新一期成分股数 × 每段月数 <= budget（阶段2 开算前按 CL1 最新期成分重算）
     nav_rebuild_stock_month_budget: int = 300
     # 动态月数上限（0=不设顶，仅受 budget 约束）；对应环境变量 NAV_REBUILD_EOD_MONTHS_MAX
