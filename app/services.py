@@ -762,6 +762,100 @@ def _group_strategy_positions_by_rebalance(
     return rb_positions, rb_sorted[-1], rb_sorted[0]
 
 
+def _holding_anchor_start_idx(
+    db: Session,
+    sid: str,
+    rb_positions: list[tuple[date, list[dict[str, Any]]]],
+    full_refresh: bool,
+) -> tuple[int, date | None]:
+    """
+    与净值增量一致：取 strategy_nav_daily 末净值日，锚定为「调仓日 ≤ 该日」的最近一期；
+    持仓仅对该期及之后拉 Wind，更早调仓期沿用上一行情日快照。
+    """
+    if full_refresh:
+        return 0, None
+    last_nav_c = _strategy_nav_max_trade_compact(db, sid)
+    if not last_nav_c or len(last_nav_c) < 8:
+        return 0, None
+    rb_sorted = [rb for rb, _ in rb_positions]
+    last_nav_d = datetime.strptime(last_nav_c[:8], "%Y%m%d").date()
+    return _nav_rb_idx_on_date(rb_sorted, last_nav_d)
+
+
+def _holding_prior_trade_date(db: Session, sid: str, trade_date: date) -> date | None:
+    row = db.execute(
+        text(
+            f"""
+            SELECT {sql_max_date_expr("trade_date")} AS d
+            FROM strategy_holding_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("trade_date")} < :td_cmp
+            """
+        ),
+        {"sid": sid, "td_cmp": _compact_date(trade_date)},
+    ).mappings().first()
+    if not row or row.get("d") is None:
+        return None
+    return _row_sql_date(row["d"])
+
+
+def _copy_holding_daily_rebalances(
+    db: Session,
+    *,
+    sid: str,
+    from_trade_date: date,
+    to_trade_date: date,
+    rebalance_dates: list[date],
+    do_commit: bool,
+) -> int:
+    """将上一行情日、锚定调仓期之前的各期快照复制到本日（不调 Wind）。"""
+    rb_cmps = [_compact_date(rd) for rd in rebalance_dates]
+    rb_cmps = [c for c in rb_cmps if len(c) >= 8]
+    if not rb_cmps:
+        return 0
+    in_list = ",".join("'" + c.replace("'", "''") + "'" for c in rb_cmps)
+    from_cmp = _compact_date(from_trade_date)
+    to_td = to_trade_date
+    res = db.execute(
+        text(
+            f"""
+            INSERT INTO strategy_holding_daily (
+              strategy_id, trade_date, rebalance_date, stock_code, stock_name,
+              period_weight, latest_weight, latest_price, last_1d_pct, period_return,
+              ret_5d, ret_20d, ret_60d, ret_ytd, market_cap, industry_name, pe, pb
+            )
+            SELECT
+              strategy_id, :to_td, rebalance_date, stock_code, stock_name,
+              period_weight, latest_weight, latest_price, last_1d_pct, period_return,
+              ret_5d, ret_20d, ret_60d, ret_ytd, market_cap, industry_name, pe, pb
+            FROM strategy_holding_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("trade_date")} = :from_cmp
+              AND {sql_date_compact_expr("rebalance_date")} IN ({in_list})
+            ON CONFLICT(strategy_id, trade_date, rebalance_date, stock_code) DO UPDATE SET
+              stock_name=excluded.stock_name,
+              period_weight=excluded.period_weight,
+              latest_weight=excluded.latest_weight,
+              latest_price=excluded.latest_price,
+              last_1d_pct=excluded.last_1d_pct,
+              period_return=excluded.period_return,
+              ret_5d=excluded.ret_5d,
+              ret_20d=excluded.ret_20d,
+              ret_60d=excluded.ret_60d,
+              ret_ytd=excluded.ret_ytd,
+              market_cap=excluded.market_cap,
+              industry_name=excluded.industry_name,
+              pe=excluded.pe,
+              pb=excluded.pb
+            """
+        ),
+        {"sid": sid, "to_td": to_td, "from_cmp": from_cmp},
+    )
+    if do_commit:
+        db.commit()
+    return int(res.rowcount or 0)
+
+
 def _flush_strategy_holding_daily_batch(db: Session, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -967,6 +1061,20 @@ def _run_update_try_build_work_item(
         {"sid": sid},
     ).mappings().first()
     last_td = _row_sql_date(last_row["d"]) if last_row else None
+    rb_positions, latest_rb, min_rb_date = _group_strategy_positions_by_rebalance(db, sid)
+    if not rb_positions or latest_rb is None or min_rb_date is None:
+        return None
+    latest_rb_compact = _compact_date(latest_rb)
+    code_keys: set[str] = set()
+    for _, positions in rb_positions:
+        for p in positions:
+            if p.get("stock_code"):
+                code_keys.add(_wind_code_key(p["stock_code"]))
+    stock_codes = sorted(code_keys)
+    if not stock_codes:
+        return None
+    start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
+    skip_holdings = False
     if (not full_refresh) and last_td is not None and last_td >= trade_date:
         rb_pos_row = db.execute(
             text(
@@ -992,27 +1100,29 @@ def _run_update_try_build_work_item(
         dp = _row_sql_date(mx_pos)
         dh = _row_sql_date(mx_hold)
         if dp is not None and dh is not None and dp <= dh:
+            last_nav_c = _strategy_nav_max_trade_compact(db, sid)
+            td_nav_cmp = _compact_date(trade_date)
+            if (
+                last_nav_c
+                and len(last_nav_c) >= 8
+                and last_nav_c >= td_nav_cmp
+            ):
+                _job_progress(
+                    db,
+                    job_id,
+                    f"{sid}：增量跳过（行情日={trade_date} 持仓与净值均已齐）",
+                    do_commit=do_commit,
+                    sync_job_id=sync_job_id,
+                )
+                return None
             _job_progress(
                 db,
                 job_id,
-                f"{sid}：增量跳过（行情日={trade_date} 快照已含调仓至 {dh}）",
+                f"{sid}：持仓快照已齐，仅补算净值（行情日={trade_date}）",
                 do_commit=do_commit,
                 sync_job_id=sync_job_id,
             )
-            return None
-    rb_positions, latest_rb, min_rb_date = _group_strategy_positions_by_rebalance(db, sid)
-    if not rb_positions or latest_rb is None or min_rb_date is None:
-        return None
-    latest_rb_compact = _compact_date(latest_rb)
-    code_keys: set[str] = set()
-    for _, positions in rb_positions:
-        for p in positions:
-            if p.get("stock_code"):
-                code_keys.add(_wind_code_key(p["stock_code"]))
-    stock_codes = sorted(code_keys)
-    if not stock_codes:
-        return None
-    start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
+            skip_holdings = True
     return {
         "cfg": cfg,
         "sid": sid,
@@ -1025,6 +1135,7 @@ def _run_update_try_build_work_item(
         "stock_codes": stock_codes,
         "min_rb_date": min_rb_date,
         "start_c": start_c,
+        "skip_holdings": skip_holdings,
     }
 
 
@@ -1803,7 +1914,7 @@ def run_update(
                 continue
             i_active += 1
             sid = wi["sid"]
-            prog(f"[{i_active}/{n_active}] 策略 {sid}：开始处理…")
+            skip_holdings = bool(wi.get("skip_holdings"))
             bench_code = wi["bench_code"]
             latest_rb = wi["latest_rb"]
             latest_rb_compact = wi["latest_rb_compact"]
@@ -1811,6 +1922,70 @@ def run_update(
             rb_positions = wi["rb_positions"]
             stock_codes = wi["stock_codes"]
             start_c = wi["start_c"]
+            if skip_holdings:
+                prog(f"[{i_active}/{n_active}] 策略 {sid}：跳过持仓（已齐），仅补净值…")
+            else:
+                prog(f"[{i_active}/{n_active}] 策略 {sid}：开始处理…")
+
+            if not skip_nav_rebuild:
+                try:
+                    plans1 = _batch_nav_mysql_plans(db, [sid], "full")
+                    pl1 = plans1.get(sid)
+                    if pl1:
+                        last_nav_c = _strategy_nav_max_trade_compact(db, sid)
+                        if last_nav_c and _compact_date(latest_trade) <= last_nav_c:
+                            prog(
+                                f"[{i_active}/{n_active}] {sid}：净值已至 {last_nav_c}，无需补算"
+                            )
+                        else:
+                            lt_c = _compact_date(latest_trade)
+                            if last_nav_c and len(last_nav_c) >= 8:
+                                last_nav_d = datetime.strptime(
+                                    last_nav_c[:8], "%Y%m%d"
+                                ).date()
+                                rb_sorted_n = sorted(pl1["rb_map"].keys())
+                                _, anchor_rb_n = _nav_rb_idx_on_date(
+                                    rb_sorted_n, last_nav_d
+                                )
+                                wind, td_hint = wind_bulk.fetch_trade_date_compacts(
+                                    wind, db, _compact_date(anchor_rb_n), lt_c
+                                )
+                                p0 = _nav_first_trade_on_or_after(
+                                    anchor_rb_n, td_hint
+                                )
+                                nav_hint = (
+                                    f"锚定调仓 {_compact_date(anchor_rb_n)}"
+                                    f"（末净值 {last_nav_c}，期初交易日 {p0 or '?'}），"
+                                    f"补至 {lt_c}；不预拉全历史 EOD"
+                                )
+                            else:
+                                nav_hint = f"首建全量 {pl1['start_c']}~{lt_c}"
+                            prog(
+                                f"[{i_active}/{n_active}] {sid}：净值 {nav_hint}"
+                                f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
+                            )
+                            _, wind = _rebuild_nav_for_strategy(
+                                db,
+                                wind,
+                                sid,
+                                "incremental",
+                                latest_trade_c_cached=str(latest_trade),
+                                mysql_plan=pl1,
+                                wind_bundle=None,
+                                nav_full_rebuild=False,
+                            )
+                except Exception as ex_nav:
+                    _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：净值重算失败（已跳过）：{ex_nav}"[
+                            :6000
+                        ]
+                    )
+                if do_commit:
+                    db.commit()
+
+            if skip_holdings:
+                continue
 
             eod_by_code: dict[str, list] = {}
             index_eod_by_code: dict[str, list] = {}
@@ -1829,10 +2004,7 @@ def run_update(
                 full_qu = wind_merged["quote"]
                 quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
             elif rb_chunked_eod:
-                prog(
-                    f"[{i_active}/{n_active}] {sid}：低内存按调仓期串行 EOD"
-                    f"（{n_rb} 期 × 每期成分小批；全策略 {len(stock_codes)} 只去重）…"
-                )
+                pass  # 锚定说明在下方 hold_start_idx 计算后输出
             else:
                 prog(
                     f"[{i_active}/{n_active}] {sid}：串行拉取 A 股 EOD {len(stock_codes)} 只"
@@ -1847,21 +2019,53 @@ def run_update(
                     )
                 wind, quote_map = _fetch_wind_quote_map_batched(db, wind, stock_codes, latest_trade)
 
-            prog(f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期，准备写入…")
+            hold_start_idx, anchor_rb_hold = _holding_anchor_start_idx(
+                db, sid, rb_positions, full_refresh
+            )
+            n_rb_wind = n_rb - hold_start_idx
+            if hold_start_idx > 0 and anchor_rb_hold is not None:
+                prog(
+                    f"[{i_active}/{n_active}] {sid}：持仓与净值同锚定"
+                    f"（末净值对应调仓 {_compact_date(anchor_rb_hold)}），"
+                    f"仅 {n_rb_wind} 期拉 Wind，前 {hold_start_idx} 期沿用上一行情日"
+                )
+            else:
+                prog(
+                    f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入最新日持仓快照"
+                    f"（无末净值或全量刷新，自第一期起）…"
+                )
             eod_local = eod_by_code if wind_merged is None and not rb_chunked_eod else None
             td_cmp = _compact_date(trade_date)
+            anchor_cmp = (
+                _compact_date(anchor_rb_hold)
+                if hold_start_idx > 0 and anchor_rb_hold is not None
+                else None
+            )
             for attempt in range(4):
                 try:
-                    db.execute(
-                        text(
-                            f"""
-                            DELETE FROM strategy_holding_daily
-                            WHERE strategy_id = :sid
-                              AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                            """
-                        ),
-                        {"sid": sid, "td_cmp": td_cmp},
-                    )
+                    if anchor_cmp:
+                        db.execute(
+                            text(
+                                f"""
+                                DELETE FROM strategy_holding_daily
+                                WHERE strategy_id = :sid
+                                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
+                                  AND {sql_date_compact_expr("rebalance_date")} >= :anchor_cmp
+                                """
+                            ),
+                            {"sid": sid, "td_cmp": td_cmp, "anchor_cmp": anchor_cmp},
+                        )
+                    else:
+                        db.execute(
+                            text(
+                                f"""
+                                DELETE FROM strategy_holding_daily
+                                WHERE strategy_id = :sid
+                                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
+                                """
+                            ),
+                            {"sid": sid, "td_cmp": td_cmp},
+                        )
                     break
                 except OperationalError as oe:
                     if not _mysql_lock_contention(oe) or attempt >= 3 or not do_commit:
@@ -1870,6 +2074,29 @@ def run_update(
                         db.rollback()
                     time.sleep(0.25 * (2**attempt))
             skip_rb = skip_update_rebalance_dates or set()
+            if hold_start_idx > 0 and anchor_rb_hold is not None:
+                prior_td = _holding_prior_trade_date(db, sid, trade_date)
+                if prior_td is not None:
+                    rb_before = [rb for rb, _ in rb_positions[:hold_start_idx]]
+                    n_copy = _copy_holding_daily_rebalances(
+                        db,
+                        sid=sid,
+                        from_trade_date=prior_td,
+                        to_trade_date=trade_date,
+                        rebalance_dates=rb_before,
+                        do_commit=do_commit,
+                    )
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：已沿用 {prior_td} 快照"
+                        f"（锚定前 {hold_start_idx} 期，{n_copy} 条）"
+                    )
+                else:
+                    hold_start_idx = 0
+                    anchor_cmp = None
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：无上一行情日持仓，"
+                        f"改从第一期起拉 Wind"
+                    )
 
             def _flush_one_rebalance(
                 i_rb: int,
@@ -1898,6 +2125,8 @@ def run_update(
             if rb_chunked_eod:
                 # 按调仓期：只拉该期成分股 EOD，凑齐一期即算权重并落库（峰值内存≈单期行数+一小批 K 线）
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                    if i_rb - 1 < hold_start_idx:
+                        continue
                     next_rebalance = (
                         rb_positions[i_rb][0] if i_rb < len(rb_positions) else None
                     )
@@ -1979,6 +2208,8 @@ def run_update(
                     prepared_rows.clear()
             else:
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
+                    if i_rb - 1 < hold_start_idx:
+                        continue
                     if not positions:
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
@@ -2020,51 +2251,6 @@ def run_update(
                         i_rb, rebalance, prepared_rows, total_weight, rb_compact
                     )
 
-            if not skip_nav_rebuild:
-                try:
-                    plans1 = _batch_nav_mysql_plans(db, [sid], "full")
-                    pl1 = plans1.get(sid)
-                    if pl1:
-                        last_nav_c = _strategy_nav_max_trade_compact(db, sid)
-                        if last_nav_c and _compact_date(latest_trade) <= last_nav_c:
-                            prog(
-                                f"[{i_active}/{n_active}] {sid}：净值已至 {last_nav_c}，无需补算"
-                            )
-                        else:
-                            lt_c = _compact_date(latest_trade)
-                            last_nav_d = datetime.strptime(last_nav_c[:8], "%Y%m%d").date()
-                            rb_sorted_n = sorted(pl1["rb_map"].keys())
-                            _, anchor_rb_n = _nav_rb_idx_on_date(rb_sorted_n, last_nav_d)
-                            wind, td_hint = wind_bulk.fetch_trade_date_compacts(
-                                wind, db, _compact_date(anchor_rb_n), lt_c
-                            )
-                            p0 = _nav_first_trade_on_or_after(anchor_rb_n, td_hint)
-                            nav_hint = (
-                                f"锚定调仓 {_compact_date(anchor_rb_n)}"
-                                f"（末净值 {last_nav_c}，期初交易日 {p0 or '?'}），"
-                                f"补至 {lt_c}；不预拉全历史 EOD"
-                                if last_nav_c
-                                else f"首建全量 {pl1['start_c']}~{lt_c}"
-                            )
-                            prog(
-                                f"[{i_active}/{n_active}] {sid}：净值 {nav_hint}"
-                                f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
-                            )
-                            _, wind = _rebuild_nav_for_strategy(
-                                db,
-                                wind,
-                                sid,
-                                "incremental",
-                                latest_trade_c_cached=str(latest_trade),
-                                mysql_plan=pl1,
-                                wind_bundle=None,
-                                nav_full_rebuild=False,
-                            )
-                except Exception as ex_nav:
-                    _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
-                    prog(f"[{i_active}/{n_active}] {sid}：净值重算失败（已跳过）：{ex_nav}"[:6000])
-                finally:
-                    pass
             if do_commit:
                 db.commit()
             _release_run_update_strategy_memory(
@@ -3004,6 +3190,9 @@ def _rebuild_nav_for_strategy_yearly(
     bench_nav_acc: float | None = 1.0 if bench_code else None
     nav_accum: list[dict[str, Any]] = []
     td_i = 0
+    if not nav_full_rebuild and append_after_c:
+        last_nav_d_y = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
+        rb_idx, current_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d_y)
     bench_quads: list = []
     if bench_code:
 
@@ -3288,6 +3477,7 @@ def _rebuild_nav_for_strategy(
         return True, wind
 
     rb_sorted_pre = sorted(rb_map.keys())
+    yearly_start = start_c
     if not nav_full_rebuild and append_after_c and rb_sorted_pre:
         last_nav_d_pre = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
         _, anchor_rb_pre = _nav_rb_idx_on_date(rb_sorted_pre, last_nav_d_pre)
@@ -3309,9 +3499,19 @@ def _rebuild_nav_for_strategy(
         )
         if ok_inc:
             return True, wind
+        yearly_start = start_c
+        last_nav_d_fb = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
+        _, anchor_rb_fb = _nav_rb_idx_on_date(rb_sorted_pre, last_nav_d_fb)
+        wind, td_fb = wind_bulk.fetch_trade_date_compacts(
+            wind, db, _compact_date(anchor_rb_fb), latest_trade_c
+        )
+        p0_fb = _nav_first_trade_on_or_after(anchor_rb_fb, td_fb)
+        if p0_fb:
+            yearly_start = p0_fb
         _log.warning(
-            "nav incremental %s: fallback full replay from %s (check NAV_INCREMENTAL_FROM_CURRENT_PERIOD)",
+            "nav incremental %s: fallback segmented replay from %s (not strategy min_rb %s)",
             sid,
+            yearly_start,
             start_c,
         )
 
@@ -3333,7 +3533,7 @@ def _rebuild_nav_for_strategy(
             sid,
             rb_map,
             bench_code,
-            start_c,
+            yearly_start,
             latest_trade_c,
             ic0,
             sync_job_id=sync_job_id,
