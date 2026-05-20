@@ -2026,22 +2026,35 @@ def run_update(
                     plans1 = _batch_nav_mysql_plans(db, [sid], "full")
                     pl1 = plans1.get(sid)
                     if pl1:
-                        prog(
-                            f"[{i_active}/{n_active}] {sid}：固定股数全量重算净值"
-                            f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
-                        )
-                        wind, nav_wb = _load_wind_bundle_for_nav_plan(
-                            wind, db, pl1, str(latest_trade)
-                        )
-                        _, wind = _rebuild_nav_for_strategy(
-                            db,
-                            wind,
-                            sid,
-                            "full",
-                            latest_trade_c_cached=str(latest_trade),
-                            mysql_plan=pl1,
-                            wind_bundle=nav_wb,
-                        )
+                        last_nav_c = _strategy_nav_max_trade_compact(db, sid)
+                        if last_nav_c and _compact_date(latest_trade) <= last_nav_c:
+                            prog(
+                                f"[{i_active}/{n_active}] {sid}：净值已至 {last_nav_c}，无需补算"
+                            )
+                        else:
+                            lt_c = _compact_date(latest_trade)
+                            nav_hint = (
+                                f"末净值日 {last_nav_c} 对应调仓期起增量，补至 {lt_c}"
+                                if last_nav_c
+                                else f"首建 {pl1['start_c']}~{lt_c}"
+                            )
+                            prog(
+                                f"[{i_active}/{n_active}] {sid}：净值增量 {nav_hint}"
+                                f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
+                            )
+                            wind, nav_wb = _load_wind_bundle_for_nav_plan(
+                                wind, db, pl1, str(latest_trade)
+                            )
+                            _, wind = _rebuild_nav_for_strategy(
+                                db,
+                                wind,
+                                sid,
+                                "incremental",
+                                latest_trade_c_cached=str(latest_trade),
+                                mysql_plan=pl1,
+                                wind_bundle=nav_wb,
+                                nav_full_rebuild=False,
+                            )
                 except Exception as ex_nav:
                     _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
                     prog(f"[{i_active}/{n_active}] {sid}：净值重算失败（已跳过）：{ex_nav}"[:6000])
@@ -2126,6 +2139,37 @@ def _flush_strategy_nav_daily_batch(db: Session, acc: list[dict[str, Any]]) -> N
     for i in range(0, len(acc), _NAV_INSERT_CHUNK):
         chunk = acc[i : i + _NAV_INSERT_CHUNK]
         db.execute(_NAV_INSERT_SQL, chunk)
+
+
+def _strategy_nav_max_trade_compact(db: Session, sid: str) -> str | None:
+    """strategy_nav_daily 已有净值的最后交易日（YYYYMMDD compact）。"""
+    row = db.execute(
+        text(
+            f"""
+            SELECT {sql_max_date_expr("trade_date")} AS d
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": sid},
+    ).mappings().first()
+    if not row or row.get("d") is None:
+        return None
+    d = _row_sql_date(row["d"])
+    if d is None:
+        return None
+    c = _compact_date(d)
+    return c if len(c) >= 8 else None
+
+
+def _nav_persist_after_compact(db: Session, sid: str, nav_full_rebuild: bool) -> str | None:
+    """
+    增量净值：返回已有最后交易日 compact；仅写入该日之后的交易日。
+    全量模式返回 None（从首日到最新日均写入）。
+    """
+    if nav_full_rebuild:
+        return None
+    return _strategy_nav_max_trade_compact(db, sid)
 
 
 def _batch_nav_mysql_plans(db: Session, strategy_ids: list[str], _mode_l: str) -> dict[str, dict[str, Any]]:
@@ -2366,6 +2410,464 @@ def _step_benchmark_nav_acc(
     return float(bench_nav_acc), None, None
 
 
+def _nav_incremental_from_period_enabled() -> bool:
+    return bool(getattr(settings, "nav_incremental_from_current_period", True))
+
+
+def _nav_rb_idx_on_date(rb_sorted: list[date], td_date: date) -> tuple[int, date]:
+    """截至 asof 日（含）仍有效的最近一期调仓。"""
+    rb_idx = 0
+    current_rb = rb_sorted[0]
+    for i, rb_d in enumerate(rb_sorted):
+        if rb_d <= td_date:
+            rb_idx = i
+            current_rb = rb_d
+        else:
+            break
+    return rb_idx, current_rb
+
+
+def _nav_union_codes_between_rebalances(
+    rb_map: dict[date, list[tuple[str, float]]],
+    rb_sorted: list[date],
+    rb_from: date,
+    rb_to: date,
+) -> list[str]:
+    codes: set[str] = set()
+    for rb in rb_sorted:
+        if rb < rb_from:
+            continue
+        if rb > rb_to:
+            break
+        for c, _ in rb_map.get(rb, ()):
+            if c:
+                codes.add(str(c).strip().upper())
+    return sorted(codes)
+
+
+def _nav_first_trade_on_or_after(rb: date, trade_days: list[str]) -> str | None:
+    rb_c = _compact_date(rb)
+    for td in trade_days:
+        if td >= rb_c:
+            return td
+    return None
+
+
+def _nav_fetch_row_on_day(db: Session, sid: str, td_compact: str) -> Any | None:
+    return (
+        db.execute(
+            text(
+                f"""
+                SELECT nav_unit, benchmark_nav, rebalance_date
+                FROM strategy_nav_daily
+                WHERE strategy_id=:sid
+                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
+                LIMIT 1
+                """
+            ),
+            {"sid": sid, "td_cmp": td_compact},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _nav_snap_shares_from_holdings(
+    holdings: list[tuple[str, float]],
+    mv_pre: float,
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    td: str,
+    last_close_fill: dict[str, float],
+) -> dict[str, float]:
+    total_weight = sum(max(float(w or 0.0), 0.0) for _, w in holdings)
+    new_shares: dict[str, float] = {}
+    if total_weight <= 0 or mv_pre <= 0:
+        return new_shares
+    valid: list[tuple[str, float, float]] = []
+    for sc, w0 in holdings:
+        w0p = max(float(w0 or 0.0), 0.0)
+        if w0p <= 0:
+            continue
+        px = _adj_close_td_ff(day_map, sc, td, last_close_fill)
+        if px is None or px <= 0:
+            continue
+        valid.append((sc, w0p, px))
+    tw2 = sum(w for _, w, _ in valid)
+    if tw2 > 0:
+        for sc, w0p, px in valid:
+            new_shares[sc] = mv_pre * (w0p / tw2) / px
+    return new_shares
+
+
+def _nav_process_one_trade_day(
+    *,
+    td: str,
+    td_date: date,
+    rb_sorted: list[date],
+    rb_map: dict[date, list[tuple[str, float]]],
+    rb_idx: int,
+    current_rb: date,
+    prev_td_date: date | None,
+    shares: dict[str, float],
+    last_close_fill: dict[str, float],
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    ic0: float,
+    prev_mv: float | None,
+    bench_code: str,
+    bench_quads: list,
+    bench_day_map: dict[str, tuple[float | None, float | None]],
+    bench_nav_acc: float | None,
+) -> tuple[
+    int,
+    date,
+    date | None,
+    dict[str, float],
+    dict[str, float],
+    float | None,
+    float | None,
+    dict[str, Any],
+]:
+    rb_idx_at_start = rb_idx
+    while rb_idx + 1 < len(rb_sorted) and rb_sorted[rb_idx + 1] <= td_date:
+        rb_idx += 1
+        current_rb = rb_sorted[rb_idx]
+    snap_rebalance = (
+        (rb_idx != rb_idx_at_start)
+        or (td_date == current_rb)
+        or (
+            prev_td_date is not None
+            and prev_td_date < current_rb <= td_date
+        )
+        or (prev_td_date is None and current_rb <= td_date)
+    )
+    holdings = rb_map.get(current_rb, [])
+    if snap_rebalance:
+        if not shares:
+            mv_pre = ic0
+        else:
+            mv_pre = 0.0
+            for sc2, sh in list(shares.items()):
+                if sh <= 0:
+                    continue
+                px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
+                if px is not None:
+                    mv_pre += sh * px
+        shares = _nav_snap_shares_from_holdings(
+            holdings, mv_pre, day_map, td, last_close_fill
+        )
+    mv_eod = 0.0
+    for sc2, sh in shares.items():
+        if sh <= 0:
+            continue
+        px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
+        if px is not None:
+            mv_eod += sh * px
+    nav = mv_eod / ic0 if ic0 > 0 else 1.0
+    if prev_mv is not None and prev_mv > 0:
+        day_ret = mv_eod / prev_mv - 1.0
+    else:
+        day_ret = (mv_eod / ic0 - 1.0) if ic0 > 0 else 0.0
+    prev_mv = mv_eod
+    prev_td_date = td_date
+    bench_ret_ins = None
+    bench_nav_ins = None
+    if bench_code and bench_nav_acc is not None:
+        br = _bench_return_on_trade_day(
+            td, bench_quads=bench_quads, bench_day_map=bench_day_map
+        )
+        bench_nav_acc, bench_ret_ins, bench_nav_ins = _step_benchmark_nav_acc(
+            bench_nav_acc, br, allow_flat=True
+        )
+    row = {
+        "td": td_date,
+        "nav": nav,
+        "ret": day_ret,
+        "bret": bench_ret_ins,
+        "bnav": bench_nav_ins,
+        "rb": current_rb,
+    }
+    return (
+        rb_idx,
+        current_rb,
+        prev_td_date,
+        shares,
+        last_close_fill,
+        prev_mv,
+        bench_nav_acc,
+        row,
+    )
+
+
+def _rebuild_nav_incremental_from_current_period(
+    db: Session,
+    wind: Any,
+    sid: str,
+    rb_map: dict[date, list[tuple[str, float]]],
+    bench_code: str,
+    latest_trade_c: str,
+    ic0: float,
+    append_after_c: str,
+    trade_days: list[str],
+    *,
+    sync_job_id: int | None = None,
+) -> tuple[bool, Any]:
+    """
+    以库内最后净值日 anchor：取该日仍有效的最近调仓期，自该期首交易日起拉 Wind、
+    用该日（或期初）库内净值与该期持仓重算股数，模拟至最新日；仅落库 append_after_c 之后各日。
+    若之后又出现新调仓，模拟中会在调仓日按规则换仓。成功 (True, wind)，否则回退全历史重放。
+    """
+    if not _nav_incremental_from_period_enabled() or not append_after_c:
+        return False, wind
+    rb_sorted = sorted(rb_map.keys())
+    if not rb_sorted or not trade_days:
+        return False, wind
+    latest_d = datetime.strptime(latest_trade_c[:8], "%Y%m%d").date()
+    last_nav_d = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
+    anchor_rb_idx, anchor_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d)
+    _, current_rb = _nav_rb_idx_on_date(rb_sorted, latest_d)
+    period_start_td = _nav_first_trade_on_or_after(anchor_rb, trade_days)
+    if not period_start_td:
+        return False, wind
+
+    period_codes = _nav_union_codes_between_rebalances(
+        rb_map, rb_sorted, anchor_rb, current_rb
+    )
+    if not period_codes:
+        return False, wind
+
+    period_days = [d for d in trade_days if period_start_td <= d <= latest_trade_c]
+    if not period_days:
+        return False, wind
+
+    use_seg = bool(getattr(settings, "nav_rebuild_year_segments", True)) and (
+        _wind_low_memory_mode() or len(period_codes) > 250
+    )
+    period_start_c = period_start_td
+    nav_persist_chunk = max(50, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
+    nav_accum: list[dict[str, Any]] = []
+
+    bench_quads: list = []
+    bench_day_map: dict[str, tuple[float | None, float | None]] = {}
+    if bench_code:
+        wind, idx_all = wind_bulk.load_index_eod_by_code(
+            wind, [bench_code], period_start_c, latest_trade_c, db
+        )
+        bench_quads = _bench_quads_for_code(idx_all, bench_code)
+        bench_day_map = _index_eod_to_bench_day_map(idx_all, bench_code)
+        idx_all.clear()
+
+    row0 = _nav_fetch_row_on_day(db, sid, period_start_td)
+    bench_nav_acc: float | None = None
+    if bench_code:
+        if row0 and row0.get("benchmark_nav") is not None:
+            bench_nav_acc = float(row0["benchmark_nav"])
+        else:
+            bench_nav_acc = 1.0
+    mv_seed = ic0
+    if row0 and row0.get("nav_unit") is not None:
+        try:
+            mv_seed = float(row0["nav_unit"]) * ic0
+        except (TypeError, ValueError):
+            mv_seed = ic0
+
+    def _run_days_on_day_map(day_map: dict) -> bool:
+        nonlocal bench_nav_acc
+        last_close_fill: dict[str, float] = {}
+        holdings0 = rb_map.get(anchor_rb, [])
+        shares = _nav_snap_shares_from_holdings(
+            holdings0, mv_seed, day_map, period_start_td, last_close_fill
+        )
+        prev_mv: float | None = None
+        for sc2, sh in shares.items():
+            if sh <= 0:
+                continue
+            px = _adj_close_td_ff(day_map, sc2, period_start_td, last_close_fill)
+            if px is not None:
+                prev_mv = (prev_mv or 0.0) + sh * px
+        prev_td_date: date | None = datetime.strptime(period_start_td, "%Y%m%d").date()
+        sim_rb_idx = anchor_rb_idx
+        sim_current_rb = anchor_rb
+        for td in period_days:
+            td_date = datetime.strptime(td, "%Y%m%d").date()
+            (
+                sim_rb_idx,
+                sim_current_rb,
+                prev_td_date,
+                shares,
+                last_close_fill,
+                prev_mv,
+                bench_nav_acc,
+                row,
+            ) = _nav_process_one_trade_day(
+                td=td,
+                td_date=td_date,
+                rb_sorted=rb_sorted,
+                rb_map=rb_map,
+                rb_idx=sim_rb_idx,
+                current_rb=sim_current_rb,
+                prev_td_date=prev_td_date,
+                shares=shares,
+                last_close_fill=last_close_fill,
+                day_map=day_map,
+                ic0=ic0,
+                prev_mv=prev_mv,
+                bench_code=bench_code,
+                bench_quads=bench_quads,
+                bench_day_map=bench_day_map,
+                bench_nav_acc=bench_nav_acc,
+            )
+            if td > append_after_c:
+                nav_accum.append(
+                    {
+                        "sid": sid,
+                        "td": row["td"],
+                        "nav": row["nav"],
+                        "ret": row["ret"],
+                        "bret": row["bret"],
+                        "bnav": row["bnav"],
+                        "rb": row["rb"],
+                    }
+                )
+                if len(nav_accum) >= nav_persist_chunk:
+                    _flush_strategy_nav_daily_batch(db, nav_accum)
+                    nav_accum.clear()
+        return True
+
+    if sync_job_id is not None:
+        _admin_sync_job_touch(
+            sync_job_id,
+            "nav",
+            f"{sid}：锚定调仓 {_compact_date(anchor_rb)}（末净值 {append_after_c}）"
+            f" 增量 {period_start_td}→{latest_trade_c}，补 {append_after_c} 后，"
+            f"成分 {len(period_codes)} 只…",
+            db=db,
+            do_commit=True,
+        )
+
+    if use_seg:
+        latest_n = len(period_codes)
+        eod_step_months = resolve_nav_rebuild_eod_months(latest_n)
+        time_segs = _nav_eod_time_segments(
+            period_start_c, latest_trade_c, step_months=eod_step_months
+        )
+        last_close_fill: dict[str, float] = {}
+        shares: dict[str, float] = {}
+        prev_mv: float | None = None
+        prev_td_date: date | None = None
+        sim_rb_idx = anchor_rb_idx
+        sim_current_rb = anchor_rb
+        state_inited = False
+        for seg_st, seg_ed in time_segs:
+            seg_days = [d for d in period_days if seg_st <= d <= seg_ed]
+            if not seg_days:
+                continue
+            wind, day_map, seg_bench_dm = _load_segment_wind_maps(
+                wind, db, period_codes, seg_st, seg_ed, bench_code
+            )
+            if bench_code and seg_bench_dm:
+                bench_day_map.update(seg_bench_dm)
+            if not state_inited:
+                holdings0 = rb_map.get(anchor_rb, [])
+                shares = _nav_snap_shares_from_holdings(
+                    holdings0, mv_seed, day_map, period_start_td, last_close_fill
+                )
+                prev_mv = None
+                for sc2, sh in shares.items():
+                    if sh <= 0:
+                        continue
+                    px = _adj_close_td_ff(day_map, sc2, period_start_td, last_close_fill)
+                    if px is not None:
+                        prev_mv = (prev_mv or 0.0) + sh * px
+                prev_td_date = datetime.strptime(period_start_td, "%Y%m%d").date()
+                state_inited = True
+            for td in seg_days:
+                if td < period_start_td:
+                    continue
+                td_date = datetime.strptime(td, "%Y%m%d").date()
+                (
+                    sim_rb_idx,
+                    sim_current_rb,
+                    prev_td_date,
+                    shares,
+                    last_close_fill,
+                    prev_mv,
+                    bench_nav_acc,
+                    row,
+                ) = _nav_process_one_trade_day(
+                    td=td,
+                    td_date=td_date,
+                    rb_sorted=rb_sorted,
+                    rb_map=rb_map,
+                    rb_idx=sim_rb_idx,
+                    current_rb=sim_current_rb,
+                    prev_td_date=prev_td_date,
+                    shares=shares,
+                    last_close_fill=last_close_fill,
+                    day_map=day_map,
+                    ic0=ic0,
+                    prev_mv=prev_mv,
+                    bench_code=bench_code,
+                    bench_quads=bench_quads,
+                    bench_day_map=bench_day_map,
+                    bench_nav_acc=bench_nav_acc,
+                )
+                if td > append_after_c:
+                    nav_accum.append(
+                        {
+                            "sid": sid,
+                            "td": row["td"],
+                            "nav": row["nav"],
+                            "ret": row["ret"],
+                            "bret": row["bret"],
+                            "bnav": row["bnav"],
+                            "rb": row["rb"],
+                        }
+                    )
+                    if len(nav_accum) >= nav_persist_chunk:
+                        _flush_strategy_nav_daily_batch(db, nav_accum)
+                        nav_accum.clear()
+            day_map.clear()
+            if _wind_low_memory_mode():
+                gc.collect()
+        if not state_inited:
+            return False, wind
+        if nav_accum:
+            _flush_strategy_nav_daily_batch(db, nav_accum)
+            nav_accum.clear()
+        _log.info(
+            "nav incremental-from-period(seg) %s: %s..%s after %s",
+            sid,
+            period_start_td,
+            latest_trade_c,
+            append_after_c,
+        )
+        return True, wind
+
+    # non-segmented: one load for current period
+    wind, eod_by_code = wind_bulk.load_eod_by_code(
+        wind, period_codes, period_start_c, latest_trade_c, db
+    )
+    day_map = _eod_dict_to_day_map(eod_by_code)
+    eod_by_code.clear()
+    if not _run_days_on_day_map(day_map):
+        day_map.clear()
+        return False, wind
+    day_map.clear()
+    if nav_accum:
+        _flush_strategy_nav_daily_batch(db, nav_accum)
+        nav_accum.clear()
+    if _wind_low_memory_mode():
+        gc.collect()
+    _log.info(
+        "nav incremental-from-period %s: %s..%s persisted after %s",
+        sid,
+        period_start_td,
+        latest_trade_c,
+        append_after_c,
+    )
+    return True, wind
+
+
 def _rebuild_nav_for_strategy_yearly(
     db: Session,
     wind: Any,
@@ -2377,6 +2879,7 @@ def _rebuild_nav_for_strategy_yearly(
     ic0: float,
     *,
     sync_job_id: int | None = None,
+    nav_full_rebuild: bool = True,
 ) -> tuple[bool, Any]:
     """低内存：按时间分段 + 股票小批拉 EOD，避免全历史成分 day_map 一次占满内存。"""
     from app.db import SessionLocalFactory, turso_stream_lock, uses_remote_turso_only
@@ -2418,32 +2921,65 @@ def _rebuild_nav_for_strategy_yearly(
         latest_n * eod_step_months,
         len(time_segs),
     )
+    append_after_c = _nav_persist_after_compact(db, sid, nav_full_rebuild)
+    if append_after_c and append_after_c >= latest_trade_c:
+        _log.info("nav incremental %s: already through %s", sid, append_after_c)
+        if sync_job_id is not None:
+            _admin_sync_job_touch(
+                sync_job_id,
+                "nav",
+                f"阶段2/3 {sid}：净值已至 {append_after_c}，无需补算",
+                db=None if turso_remote else db,
+                do_commit=True,
+            )
+        return True, wind
+    if not nav_full_rebuild and append_after_c:
+        ok_inc, wind = _rebuild_nav_incremental_from_current_period(
+            db,
+            wind,
+            sid,
+            rb_map,
+            bench_code,
+            latest_trade_c,
+            ic0,
+            append_after_c,
+            trade_days_all,
+            sync_job_id=sync_job_id,
+        )
+        if ok_inc:
+            return True, wind
     if sync_job_id is not None:
+        nav_mode = (
+            f"增量自 {append_after_c} 后补至 {latest_trade_c}"
+            if append_after_c
+            else f"全量 {start_c}~{latest_trade_c}"
+        )
         _admin_sync_job_touch(
             sync_job_id,
             "nav",
-            f"阶段2/3 {sid}：动态分段 {eod_step_months} 月/段"
+            f"阶段2/3 {sid}：{nav_mode}；动态分段 {eod_step_months} 月/段"
             f"（最新期 {latest_n} 只×{eod_step_months}≤{budget}），"
-            f"共 {len(time_segs)} 段、历史成分约 {n_codes_union} 只"
-            f"（{start_c}~{latest_trade_c}）…",
+            f"共 {len(time_segs)} 段、历史成分约 {n_codes_union} 只…",
             db=None if turso_remote else db,
             do_commit=True,
         )
-    for attempt in range(4):
-        try:
+    if nav_full_rebuild:
+        for attempt in range(4):
+            try:
 
-            def _delete_nav(sess: Session) -> None:
-                sess.execute(
-                    text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid}
-                )
-                sess.commit()
+                def _delete_nav(sess: Session) -> None:
+                    sess.execute(
+                        text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"),
+                        {"sid": sid},
+                    )
+                    sess.commit()
 
-            _locked_db_op(_delete_nav)
-            break
-        except OperationalError as oe:
-            if not _mysql_lock_contention(oe) or attempt >= 3:
-                raise
-            time.sleep(0.25 * (2**attempt))
+                _locked_db_op(_delete_nav)
+                break
+            except OperationalError as oe:
+                if not _mysql_lock_contention(oe) or attempt >= 3:
+                    raise
+                time.sleep(0.25 * (2**attempt))
 
     rb_sorted = sorted(rb_map.keys())
     rb_idx = 0
@@ -2579,17 +3115,18 @@ def _rebuild_nav_for_strategy_yearly(
                 bench_nav_acc, bench_ret_ins, bench_nav_ins = _step_benchmark_nav_acc(
                     bench_nav_acc, br, allow_flat=True
                 )
-            nav_accum.append(
-                {
-                    "sid": sid,
-                    "td": td_date,
-                    "nav": nav,
-                    "ret": day_ret,
-                    "bret": bench_ret_ins,
-                    "bnav": bench_nav_ins,
-                    "rb": current_rb,
-                }
-            )
+            if append_after_c is None or td > append_after_c:
+                nav_accum.append(
+                    {
+                        "sid": sid,
+                        "td": td_date,
+                        "nav": nav,
+                        "ret": day_ret,
+                        "bret": bench_ret_ins,
+                        "bnav": bench_nav_ins,
+                        "rb": current_rb,
+                    }
+                )
             if len(nav_accum) >= nav_persist_chunk:
                 batch = nav_accum
 
@@ -2626,6 +3163,8 @@ def _rebuild_nav_for_strategy_yearly(
     shares.clear()
     last_close_fill.clear()
     gc.collect()
+    if append_after_c:
+        _log.info("nav incremental %s: appended after %s through %s", sid, append_after_c, latest_trade_c)
     return True, wind
 
 
@@ -2639,13 +3178,18 @@ def _rebuild_nav_for_strategy(
     mysql_plan: dict[str, Any] | None = None,
     wind_bundle: dict[str, Any] | None = None,
     sync_job_id: int | None = None,
+    nav_full_rebuild: bool = True,
 ) -> tuple[bool, Any]:
     """
     单策略净值重建。固定股数、调仓日按收盘复权价满仓再平衡。
     调仓自然日可为非交易日：在序列中首个交易日即按「当前调仓期」持仓用该日收盘价建仓（不跳过该期调仓）。
 
     nav_unit = 收盘组合市值 / 名义本金（settings.strategy_nav_initial_capital，默认 1 亿元）；
-    daily_ret = 当日市值 / 上一交易日市值 - 1。入参 _mode_l 仅保留与调用方签名兼容；每次均全量重写该策略净值表。
+    daily_ret = 当日市值 / 上一交易日市值 - 1。
+
+    nav_full_rebuild=True：删除该策略全部净值后从首日到最新 Wind 交易日重算。
+    nav_full_rebuild=False：保留已有净值，仅写入库中最后交易日之后、直至最新交易日的每一个交易日
+    （中间若缺多个交易日会逐日补齐；仍自首日模拟持仓状态，但不改历史已落库行）。
 
     mysql_plan / wind_bundle 由 rebuild_nav_series 批量预取时传入，避免重复查库与重复拉 Wind。
     """
@@ -2725,6 +3269,34 @@ def _rebuild_nav_for_strategy(
         if len(latest_trade_c) < 8:
             latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
+    append_after_c = _nav_persist_after_compact(db, sid, nav_full_rebuild)
+    if append_after_c and append_after_c >= latest_trade_c:
+        _log.info("nav incremental %s: already through %s", sid, append_after_c)
+        return True, wind
+
+    rb_sorted_pre = sorted(rb_map.keys())
+    if not nav_full_rebuild and append_after_c and rb_sorted_pre:
+        last_nav_d_pre = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
+        _, anchor_rb_pre = _nav_rb_idx_on_date(rb_sorted_pre, last_nav_d_pre)
+        period_sc = _compact_date(anchor_rb_pre)
+        wind, td_period = wind_bulk.fetch_trade_date_compacts(
+            wind, db, period_sc, latest_trade_c
+        )
+        ok_inc, wind = _rebuild_nav_incremental_from_current_period(
+            db,
+            wind,
+            sid,
+            rb_map,
+            bench_code,
+            latest_trade_c,
+            ic0,
+            append_after_c,
+            td_period,
+            sync_job_id=sync_job_id,
+        )
+        if ok_inc:
+            return True, wind
+
     n_codes = len(code_set)
     force_seg = n_codes > 250
     use_nav_segments = bool(getattr(settings, "nav_rebuild_year_segments", True))
@@ -2747,6 +3319,7 @@ def _rebuild_nav_for_strategy(
             latest_trade_c,
             ic0,
             sync_job_id=sync_job_id,
+            nav_full_rebuild=nav_full_rebuild,
         )
 
     codes_for_eod = sorted(code_set)
@@ -2786,14 +3359,17 @@ def _rebuild_nav_for_strategy(
     bench_nav_acc: float | None = None
     nav_accum: list[dict[str, Any]] = []
     nav_persist_chunk = max(100, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
-    for attempt in range(4):
-        try:
-            db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid})
-            break
-        except OperationalError as oe:
-            if not _mysql_lock_contention(oe) or attempt >= 3:
-                raise
-            time.sleep(0.25 * (2**attempt))
+    if nav_full_rebuild:
+        for attempt in range(4):
+            try:
+                db.execute(
+                    text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid}
+                )
+                break
+            except OperationalError as oe:
+                if not _mysql_lock_contention(oe) or attempt >= 3:
+                    raise
+                time.sleep(0.25 * (2**attempt))
     if bench_code:
         bench_nav_acc = 1.0
 
@@ -2874,17 +3450,18 @@ def _rebuild_nav_for_strategy(
             bench_nav_acc, bench_ret_ins, bench_nav_ins = _step_benchmark_nav_acc(
                 bench_nav_acc, br, allow_flat=True
             )
-        nav_accum.append(
-            {
-                "sid": sid,
-                "td": td_date,
-                "nav": nav,
-                "ret": day_ret,
-                "bret": bench_ret_ins,
-                "bnav": bench_nav_ins,
-                "rb": current_rb,
-            }
-        )
+        if append_after_c is None or td > append_after_c:
+            nav_accum.append(
+                {
+                    "sid": sid,
+                    "td": td_date,
+                    "nav": nav,
+                    "ret": day_ret,
+                    "bret": bench_ret_ins,
+                    "bnav": bench_nav_ins,
+                    "rb": current_rb,
+                }
+            )
         if len(nav_accum) >= nav_persist_chunk:
             _flush_strategy_nav_daily_batch(db, nav_accum)
             nav_accum.clear()
@@ -2898,6 +3475,8 @@ def _rebuild_nav_for_strategy(
         shares.clear()
         last_close_fill.clear()
         gc.collect()
+    if append_after_c:
+        _log.info("nav incremental %s: appended after %s through %s", sid, append_after_c, latest_trade_c)
     return True, wind
 
 
@@ -2916,7 +3495,7 @@ def rebuild_nav_series(
 
     低内存模式（wind_low_memory_mode）：按策略串行拉 Wind EOD/指数/日历，算完即释放，适合 Render 免费档。
     否则合并多策略一次性拉 EOD（本机大内存、减少 SQL Server 往返）。
-    mode 为 incremental/full 时均对涉及策略全量重写净值（名义本金见 settings.strategy_nav_initial_capital）。
+    导入后默认全量重写净值；日常 run_update 为自库中最后净值日起逐日补至最新交易日。
     """
     mode_l = str(mode or "incremental").strip().lower()
     if mode_l not in ("incremental", "full"):
