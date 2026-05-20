@@ -2021,7 +2021,6 @@ def run_update(
                     )
 
             if not skip_nav_rebuild:
-                nav_wb: dict[str, Any] | None = None
                 try:
                     plans1 = _batch_nav_mysql_plans(db, [sid], "full")
                     pl1 = plans1.get(sid)
@@ -2033,17 +2032,23 @@ def run_update(
                             )
                         else:
                             lt_c = _compact_date(latest_trade)
+                            last_nav_d = datetime.strptime(last_nav_c[:8], "%Y%m%d").date()
+                            rb_sorted_n = sorted(pl1["rb_map"].keys())
+                            _, anchor_rb_n = _nav_rb_idx_on_date(rb_sorted_n, last_nav_d)
+                            wind, td_hint = wind_bulk.fetch_trade_date_compacts(
+                                wind, db, _compact_date(anchor_rb_n), lt_c
+                            )
+                            p0 = _nav_first_trade_on_or_after(anchor_rb_n, td_hint)
                             nav_hint = (
-                                f"末净值日 {last_nav_c} 对应调仓期起增量，补至 {lt_c}"
+                                f"锚定调仓 {_compact_date(anchor_rb_n)}"
+                                f"（末净值 {last_nav_c}，期初交易日 {p0 or '?'}），"
+                                f"补至 {lt_c}；不预拉全历史 EOD"
                                 if last_nav_c
-                                else f"首建 {pl1['start_c']}~{lt_c}"
+                                else f"首建全量 {pl1['start_c']}~{lt_c}"
                             )
                             prog(
-                                f"[{i_active}/{n_active}] {sid}：净值增量 {nav_hint}"
+                                f"[{i_active}/{n_active}] {sid}：净值 {nav_hint}"
                                 f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
-                            )
-                            wind, nav_wb = _load_wind_bundle_for_nav_plan(
-                                wind, db, pl1, str(latest_trade)
                             )
                             _, wind = _rebuild_nav_for_strategy(
                                 db,
@@ -2052,15 +2057,14 @@ def run_update(
                                 "incremental",
                                 latest_trade_c_cached=str(latest_trade),
                                 mysql_plan=pl1,
-                                wind_bundle=nav_wb,
+                                wind_bundle=None,
                                 nav_full_rebuild=False,
                             )
                 except Exception as ex_nav:
                     _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
                     prog(f"[{i_active}/{n_active}] {sid}：净值重算失败（已跳过）：{ex_nav}"[:6000])
                 finally:
-                    _release_wind_memory(nav_wb)
-                    nav_wb = None
+                    pass
             if do_commit:
                 db.commit()
             _release_run_update_strategy_memory(
@@ -2616,7 +2620,11 @@ def _rebuild_nav_incremental_from_current_period(
     用该日（或期初）库内净值与该期持仓重算股数，模拟至最新日；仅落库 append_after_c 之后各日。
     若之后又出现新调仓，模拟中会在调仓日按规则换仓。成功 (True, wind)，否则回退全历史重放。
     """
-    if not _nav_incremental_from_period_enabled() or not append_after_c:
+    if not _nav_incremental_from_period_enabled():
+        _log.info("nav incremental %s: disabled (NAV_INCREMENTAL_FROM_CURRENT_PERIOD)", sid)
+        return False, wind
+    if not append_after_c:
+        _log.info("nav incremental %s: no existing nav rows, need full/first build", sid)
         return False, wind
     rb_sorted = sorted(rb_map.keys())
     if not rb_sorted or not trade_days:
@@ -2830,6 +2838,11 @@ def _rebuild_nav_incremental_from_current_period(
             if _wind_low_memory_mode():
                 gc.collect()
         if not state_inited:
+            _log.warning(
+                "nav incremental %s: segmented init failed period_start=%s",
+                sid,
+                period_start_td,
+            )
             return False, wind
         if nav_accum:
             _flush_strategy_nav_daily_batch(db, nav_accum)
@@ -3296,6 +3309,11 @@ def _rebuild_nav_for_strategy(
         )
         if ok_inc:
             return True, wind
+        _log.warning(
+            "nav incremental %s: fallback full replay from %s (check NAV_INCREMENTAL_FROM_CURRENT_PERIOD)",
+            sid,
+            start_c,
+        )
 
     n_codes = len(code_set)
     force_seg = n_codes > 250

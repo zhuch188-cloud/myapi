@@ -729,7 +729,7 @@
         if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
         try {
           msg.textContent = "正在更新最新交易日数据…";
-          const ret = await api(`/api/admin/update?full_refresh=true`, {
+          const ret = await api(`/api/admin/update`, {
             method: "POST",
             body: JSON.stringify({ strategy_ids: ids })
           });
