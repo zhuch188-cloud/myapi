@@ -7,6 +7,8 @@
   python scripts/purge_recent_nav_week.py --apply    # 执行删除
   python scripts/purge_recent_nav_week.py --days 7 --apply
   python scripts/purge_recent_nav_week.py --apply --strategy-id CL3
+  python scripts/purge_recent_nav_week.py --days 5 --strategy-id CS66   # 仅 CS66，先预览
+  python scripts/purge_recent_nav_week.py --days 5 --strategy-id CS66 --apply
 """
 
 from __future__ import annotations
@@ -59,6 +61,24 @@ def main() -> int:
         sid_clause = f" AND strategy_id IN ({quoted})"
 
     with get_session() as db:
+        if sid_filter:
+            for sid in sid_filter:
+                cfg = db.execute(
+                    text(
+                        "SELECT strategy_id, strategy_name, status FROM strategy_configs "
+                        "WHERE strategy_id=:sid"
+                    ),
+                    {"sid": sid},
+                ).mappings().first()
+                if not cfg:
+                    print(f"错误：strategy_configs 中不存在 strategy_id={sid!r}，已中止。")
+                    return 1
+                print(
+                    f"已确认策略: {cfg['strategy_id']} "
+                    f"({cfg.get('strategy_name') or ''}) status={cfg.get('status')}"
+                )
+            print()
+
         if fix_scale:
             strategies = sid_filter or [
                 str(r[0]).strip()
@@ -186,6 +206,60 @@ def main() -> int:
             print("按策略净值行数:")
             for r in by_sid:
                 print(f"  {r['strategy_id']}: {r['c']}")
+
+        if sid_filter:
+            for sid in sid_filter:
+                dates = db.execute(
+                    text(
+                        f"""
+                        SELECT DISTINCT {td_expr} AS d
+                        FROM strategy_nav_daily
+                        WHERE strategy_id=:sid AND {td_expr} >= :cutoff
+                        ORDER BY d
+                        """
+                    ),
+                    {"sid": sid, "cutoff": cutoff_cmp},
+                ).fetchall()
+                if dates:
+                    print(f"\n{sid} 将删净值交易日 ({len(dates)} 个):")
+                    print("  " + ", ".join(str(r[0]) for r in dates))
+                hold_dates = db.execute(
+                    text(
+                        f"""
+                        SELECT DISTINCT {td_expr} AS d
+                        FROM strategy_holding_daily
+                        WHERE strategy_id=:sid AND {td_expr} >= :cutoff
+                        ORDER BY d
+                        """
+                    ),
+                    {"sid": sid, "cutoff": cutoff_cmp},
+                ).fetchall()
+                if hold_dates:
+                    print(f"{sid} 将删持仓快照交易日 ({len(hold_dates)} 个):")
+                    print("  " + ", ".join(str(r[0]) for r in hold_dates))
+                anchor = db.execute(
+                    text(
+                        f"""
+                        SELECT trade_date, nav_unit, daily_ret, rebalance_date
+                        FROM strategy_nav_daily
+                        WHERE strategy_id=:sid AND {td_expr} < :cutoff
+                        ORDER BY {td_expr} DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"sid": sid, "cutoff": cutoff_cmp},
+                ).mappings().first()
+                if anchor:
+                    print(
+                        f"{sid} 删除后保留的末净值行: trade_date={anchor.get('trade_date')} "
+                        f"nav_unit={anchor.get('nav_unit')} rebalance_date={anchor.get('rebalance_date')}"
+                    )
+                else:
+                    print(f"{sid} 警告：cutoff 之前无净值行，删除后该策略净值将为空。")
+
+        if not sid_filter and args.apply:
+            print("\n错误：未指定 --strategy-id 时不允许 --apply（避免误删全部策略）。")
+            return 1
 
         if not args.apply:
             print("\n预览模式，未删除。确认后加 --apply 执行。")

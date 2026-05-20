@@ -162,6 +162,33 @@ def close_wind(wind: Any, mysql_db: Session) -> None:
         wind.close()
 
 
+def close_wind_safe(
+    wind: Any,
+    mysql_db: Session | None = None,
+    *,
+    timeout_sec: float = 8.0,
+) -> None:
+    """关闭 Wind 连接；超时则放弃等待，避免 SQL Server 僵连导致任务永久 RUNNING。"""
+    if wind is None:
+        return
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+    def _do_close() -> None:
+        close_wind(wind, mysql_db)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_do_close)
+            fut.result(timeout=max(1.0, float(timeout_sec)))
+    except FuturesTimeout:
+        logger.warning(
+            "Wind close timed out after %.0fs (connection may be stale); task continues",
+            timeout_sec,
+        )
+    except Exception as ex:
+        logger.warning("Wind close failed: %s", ex)
+
+
 def sql_max_trade_dt() -> str:
     t = _tbl("ashareeodprices")
     return f"SELECT MAX(TRADE_DT) AS d FROM {t}"

@@ -2437,9 +2437,7 @@ def run_update(
             _release_wind_memory(wind_merged)
             wind_merged = None
 
-        prog(
-            f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}），正在关闭 Wind 连接…"
-        )
+        done_msg = f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}）"
         db.execute(
             text(
                 f"""
@@ -2448,13 +2446,14 @@ def run_update(
                 WHERE id=:id
                 """
             ),
-            {
-                "m": f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}）",
-                "id": job_id,
-            },
+            {"m": done_msg, "id": job_id},
         )
         if do_commit:
             db.commit()
+        if sync_job_id is not None:
+            _admin_sync_job_touch(
+                sync_job_id, "holding_update", done_msg, db=db, do_commit=do_commit
+            )
     except Exception as ex:
         if do_commit:
             try:
@@ -2464,18 +2463,15 @@ def run_update(
         _mark_update_job_failed(db, job_id, _format_update_job_failure_message(ex), do_commit)
         raise
     finally:
+        _job_running = False
         if wind_merged is not None:
             _release_wind_memory(wind_merged)
             wind_merged = None
         if wind is not None:
-            try:
-                wind_sql.close_wind(wind, db)
-            except Exception:
-                pass
+            wind_sql.close_wind_safe(wind, db)
             wind = None
         work_items.clear()
         gc.collect()
-        _job_running = False
 
 
 # 净值日序列写入：逐条 INSERT 时 MySQL 往返次数 ≈ 交易日数；批量 executemany 可显著降低耗时
@@ -4945,6 +4941,7 @@ def execute_admin_sync_pipeline(
             sync_job_id=sync_job_id,
             skip_update_rebalance_dates=completed_update_rb,
         )
+        p("holding_update", "阶段3/3：持仓快照已完成，正在写入同步结果…", detached=True)
         return {
             "ok": True,
             "stage": "all_success",
