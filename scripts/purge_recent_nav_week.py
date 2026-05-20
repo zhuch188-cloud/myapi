@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 from sqlalchemy import text
 
 from app.db import get_session
+from app.services import _nav_last_good_trade_compact, _nav_scale_break_detected
 from app.sql_dialect import sql_date_compact_expr
 
 
@@ -40,9 +41,15 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=7, help="自库内最新 trade_date 起向前 N 个自然日（含末日）")
     ap.add_argument("--apply", action="store_true", help="执行删除；默认仅统计预览")
     ap.add_argument("--strategy-id", action="append", dest="strategy_ids", help="仅处理指定策略，可重复")
+    ap.add_argument(
+        "--fix-scale-break",
+        action="store_true",
+        help="删除末净值日之后、且与历史 nav_unit 尺度断裂的净值行（修复 -70% 假指标）",
+    )
     args = ap.parse_args()
     days = max(1, int(args.days))
     sid_filter = [str(x).strip() for x in (args.strategy_ids or []) if str(x).strip()]
+    fix_scale = bool(args.fix_scale_break)
 
     td_expr = sql_date_compact_expr("trade_date")
     sid_clause = ""
@@ -52,6 +59,58 @@ def main() -> int:
         sid_clause = f" AND strategy_id IN ({quoted})"
 
     with get_session() as db:
+        if fix_scale:
+            strategies = sid_filter or [
+                str(r[0]).strip()
+                for r in db.execute(
+                    text(
+                        "SELECT DISTINCT strategy_id FROM strategy_nav_daily ORDER BY strategy_id"
+                    )
+                ).fetchall()
+                if str(r[0] or "").strip()
+            ]
+            if not strategies:
+                print("无净值策略。")
+                return 0
+            print("=== 尺度断裂修复：删除末净值日之后错误尺度的净值行 ===\n")
+            total_del = 0
+            for sid in strategies:
+                if not _nav_scale_break_detected(db, sid):
+                    continue
+                ac = _nav_last_good_trade_compact(db, sid)
+                if not ac or len(ac) < 8:
+                    continue
+                cnt = db.execute(
+                    text(
+                        f"""
+                        SELECT COUNT(*) FROM strategy_nav_daily
+                        WHERE strategy_id=:sid AND {td_expr} > :ac
+                        """
+                    ),
+                    {"sid": sid, "ac": ac},
+                ).scalar()
+                cnt = int(cnt or 0)
+                if cnt <= 0:
+                    continue
+                print(f"  {sid}: 末净值日 {ac}，将删其后 {cnt} 行")
+                if args.apply:
+                    db.execute(
+                        text(
+                            f"""
+                            DELETE FROM strategy_nav_daily
+                            WHERE strategy_id=:sid AND {td_expr} > :ac
+                            """
+                        ),
+                        {"sid": sid, "ac": ac},
+                    )
+                    total_del += cnt
+            if args.apply:
+                db.commit()
+                print(f"\n已删除 {total_del} 行。请部署新代码后执行「仅更新」重算净值。")
+            else:
+                print("\n预览模式，未删除。加 --apply 执行。")
+            return 0
+
         mx = db.execute(
             text(
                 f"""
