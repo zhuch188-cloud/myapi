@@ -2022,17 +2022,37 @@ def run_update(
             hold_start_idx, anchor_rb_hold = _holding_anchor_start_idx(
                 db, sid, rb_positions, full_refresh
             )
+            last_nav_c_hold = _strategy_nav_max_trade_compact(db, sid)
             n_rb_wind = n_rb - hold_start_idx
             if hold_start_idx > 0 and anchor_rb_hold is not None:
                 prog(
                     f"[{i_active}/{n_active}] {sid}：持仓与净值同锚定"
-                    f"（末净值对应调仓 {_compact_date(anchor_rb_hold)}），"
-                    f"仅 {n_rb_wind} 期拉 Wind，前 {hold_start_idx} 期沿用上一行情日"
+                    f"（末净值 {last_nav_c_hold or '?'} → 调仓 {_compact_date(anchor_rb_hold)}），"
+                    f"仅 {n_rb_wind}/{n_rb} 期拉 Wind，前 {hold_start_idx} 期沿用上一行情日"
+                )
+                _log.info(
+                    "holding anchor %s: last_nav=%s anchor_rb=%s start_idx=%s wind_periods=%s",
+                    sid,
+                    last_nav_c_hold,
+                    _compact_date(anchor_rb_hold),
+                    hold_start_idx,
+                    n_rb_wind,
                 )
             else:
+                reason = (
+                    "全量刷新"
+                    if full_refresh
+                    else ("库内无净值" if not last_nav_c_hold else "锚定异常")
+                )
                 prog(
-                    f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入最新日持仓快照"
-                    f"（无末净值或全量刷新，自第一期起）…"
+                    f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入持仓"
+                    f"（{reason}，自第 1 期起拉 Wind）…"
+                )
+                _log.info(
+                    "holding no anchor %s: full_refresh=%s last_nav=%s",
+                    sid,
+                    full_refresh,
+                    last_nav_c_hold,
                 )
             eod_local = eod_by_code if wind_merged is None and not rb_chunked_eod else None
             td_cmp = _compact_date(trade_date)
@@ -2091,11 +2111,10 @@ def run_update(
                         f"（锚定前 {hold_start_idx} 期，{n_copy} 条）"
                     )
                 else:
-                    hold_start_idx = 0
-                    anchor_cmp = None
                     prog(
-                        f"[{i_active}/{n_active}] {sid}：无上一行情日持仓，"
-                        f"改从第一期起拉 Wind"
+                        f"[{i_active}/{n_active}] {sid}：无上一行情日可沿用"
+                        f"（锚定前 {hold_start_idx} 期本日留空），"
+                        f"自锚定调仓 {_compact_date(anchor_rb_hold)} 起拉 Wind"
                     )
 
             def _flush_one_rebalance(
@@ -2165,8 +2184,10 @@ def run_update(
                     # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
                     period_start_c = wind_bulk.bulk_eod_start_compact(trade_date, rebalance)
                     eod_load_end_c = period_end_c or str(latest_trade)
+                    wind_i = i_rb - hold_start_idx
                     prog(
-                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓日 {rebalance} "
+                        f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}]"
+                        f"（Wind {wind_i}/{n_rb_wind}）调仓日 {rebalance} "
                         f"拉 EOD+行情 {len(period_codes)} 只（{period_start_c}~{eod_load_end_c}）…"
                     )
                     if sync_job_id is not None:
