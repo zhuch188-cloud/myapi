@@ -315,6 +315,25 @@ def _apply_runtime_schema_migrations(conn) -> None:
     conn.execute(
         text(
             """
+            CREATE TABLE IF NOT EXISTS strategy_list_metrics (
+                strategy_id TEXT PRIMARY KEY,
+                latest_nav REAL NULL,
+                last_1d_return REAL NULL,
+                last_5d_return REAL NULL,
+                period_since_rebalance_return REAL NULL,
+                month_return REAL NULL,
+                year_return REAL NULL,
+                last_trade_date TEXT NULL,
+                stock_count_on_last_date INTEGER NULL,
+                period_rebalance_date TEXT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+            )
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
             CREATE TABLE IF NOT EXISTS client_feedback_submissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL CHECK (kind IN ('contact', 'feedback')),
@@ -813,6 +832,21 @@ _SCHEMA_STATEMENTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_nav_date ON strategy_nav_daily (strategy_id, trade_date)",
+    """
+    CREATE TABLE IF NOT EXISTS strategy_list_metrics (
+        strategy_id TEXT PRIMARY KEY,
+        latest_nav REAL NULL,
+        last_1d_return REAL NULL,
+        last_5d_return REAL NULL,
+        period_since_rebalance_return REAL NULL,
+        month_return REAL NULL,
+        year_return REAL NULL,
+        last_trade_date TEXT NULL,
+        stock_count_on_last_date INTEGER NULL,
+        period_rebalance_date TEXT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS data_import_definitions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

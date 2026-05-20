@@ -1909,6 +1909,16 @@ def import_strategy_files(
                 hint = "（可能与「数据更新」或其它导入并发，请错开执行或稍后重试）"
             errors.append(f"{sid} ({c['file_name']}): {ex}{hint}")
 
+    if completed:
+        try:
+            from app.strategy_list_metrics import refresh_strategy_list_metrics_cache
+
+            refresh_strategy_list_metrics_cache(
+                db, sorted(completed), do_commit=do_commit
+            )
+        except Exception:
+            _log.exception("strategy_list_metrics refresh after import failed")
+
     expected_done = total_targets
     resumable = len(completed) < expected_done
     return {
@@ -2457,6 +2467,14 @@ def run_update(
             wind_merged = None
 
         done_msg = f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}）"
+        try:
+            from app.strategy_list_metrics import refresh_strategy_list_metrics_cache
+
+            refresh_strategy_list_metrics_cache(
+                db, [w["sid"] for w in active], do_commit=False
+            )
+        except Exception:
+            _log.exception("strategy_list_metrics refresh after run_update failed")
         db.execute(
             text(
                 f"""
@@ -4638,6 +4656,15 @@ def rebuild_nav_series(
     _release_wind_memory(wind_bundle)
     wind_bundle = None
     gc.collect()
+    if db is not None and completed_nav:
+        try:
+            from app.strategy_list_metrics import refresh_strategy_list_metrics_cache
+
+            refresh_strategy_list_metrics_cache(
+                db, sorted(set(completed_nav)), do_commit=False
+            )
+        except Exception:
+            _log.exception("strategy_list_metrics refresh after rebuild_nav failed")
     if do_commit and db is not None:
         db.commit()
     return {

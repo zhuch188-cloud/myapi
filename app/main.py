@@ -1520,6 +1520,32 @@ def _nav_unit_last_before(db: Session, strategy_id: str, anchor_dt: date) -> flo
         return None
 
 
+def _nav_anchor_nav_unit_before_rows(rows_desc: list[Any], anchor_dt: date) -> float | None:
+    """rows_desc 按 trade_date 降序；取严格早于 anchor_dt 的最近一日 nav_unit（列表批量口径）。"""
+    for r in rows_desc:
+        td = _nav_list_trade_date_as_date(r["trade_date"])
+        if td is not None and td < anchor_dt:
+            try:
+                v = float(r["nav_unit"])
+                return v if v > 0 else None
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _nav_period_start_nav_from_rows(rows_asc: list[Any], period_rb: date) -> float | None:
+    """本期期初：调仓日（含）起首个交易日的 nav_unit（与页面说明一致）。"""
+    for r in rows_asc:
+        td = _nav_list_trade_date_as_date(r["trade_date"])
+        if td is not None and td >= period_rb:
+            try:
+                v = float(r["nav_unit"])
+                return v if v > 0 else None
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def _nav_period_start_nav_unit(
     db: Session, strategy_id: str, period_rb: date
 ) -> float | None:
@@ -1552,12 +1578,13 @@ def _nav_list_summary_from_desc_rows(
     max_rb: date | None,
     *,
     period_start_nav: float | None = None,
-    anchor_m_nav: float | None = None,
-    anchor_y_nav: float | None = None,
 ) -> tuple[float, float | None, float | None, float | None, float | None, float | None] | None:
     """
     rows_desc: 同一 strategy 的 nav 行，按 trade_date 降序（与 SQL ORDER BY trade_date DESC 一致）。
     返回 (last_nav, last_1d, last_5d_ret, period_ret, month_ret, year_ret)；无数据返回 None。
+
+    本期：末净值 / 调仓日（含）起首个交易日净值 - 1。
+    本月/本年：末净值 / 严格早于月初、年初的最近交易日净值 - 1（与 nav-metrics 一致）。
     """
     if not rows_desc:
         return None
@@ -1566,22 +1593,13 @@ def _nav_list_summary_from_desc_rows(
     last_1d_return = _safe_float(top.get("daily_ret"))
 
     last_td = _nav_list_trade_date_as_date(top["trade_date"])
+    if last_td is None:
+        return None
     month_cut = last_td.replace(day=1)
     year_cut = date(last_td.year, 1, 1)
 
-    if anchor_m_nav is None:
-        for r in rows_desc:
-            td = _nav_list_trade_date_as_date(r["trade_date"])
-            if td < month_cut:
-                anchor_m_nav = float(r["nav_unit"])
-                break
-    if anchor_y_nav is None:
-        for r in rows_desc:
-            td = _nav_list_trade_date_as_date(r["trade_date"])
-            if td < year_cut:
-                anchor_y_nav = float(r["nav_unit"])
-                break
-
+    anchor_m_nav = _nav_anchor_nav_unit_before_rows(rows_desc, month_cut)
+    anchor_y_nav = _nav_anchor_nav_unit_before_rows(rows_desc, year_cut)
     dm = _nav_metric_denominator(anchor_m_nav)
     dy = _nav_metric_denominator(anchor_y_nav)
     month_ret = last_nav / dm - 1.0
@@ -1597,14 +1615,8 @@ def _nav_list_summary_from_desc_rows(
     if max_rb is not None:
         p0 = period_start_nav
         if p0 is None or p0 <= 0:
-            for r in reversed(rows_desc):
-                td = _nav_list_trade_date_as_date(r["trade_date"])
-                if td >= max_rb:
-                    try:
-                        p0 = float(r["nav_unit"])
-                    except (TypeError, ValueError):
-                        p0 = None
-                    break
+            rows_asc = list(reversed(rows_desc))
+            p0 = _nav_period_start_nav_from_rows(rows_asc, max_rb)
         if p0 is not None and p0 > 0:
             period_ret = last_nav / p0 - 1.0
 
@@ -1643,22 +1655,26 @@ def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> 
         rows = by_sid.get(sid, [])
         if not rows:
             continue
-        rows.sort(key=lambda r: _nav_list_trade_date_as_date(r["trade_date"]), reverse=True)
+        rows.sort(
+            key=lambda r: _nav_list_trade_date_as_date(r["trade_date"]) or date.min,
+            reverse=True,
+        )
         last_td = _nav_list_trade_date_as_date(rows[0]["trade_date"])
-        month_cut = last_td.replace(day=1)
-        year_cut = date(last_td.year, 1, 1)
+        if last_td is None:
+            continue
+        rows_asc = list(reversed(rows))
         max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
         p0_nav = (
-            _nav_period_start_nav_unit(db, sid, max_rb) if max_rb is not None else None
+            _nav_period_start_nav_from_rows(rows_asc, max_rb)
+            if max_rb is not None
+            else None
         )
-        anchor_m = _nav_unit_last_before(db, sid, month_cut)
-        anchor_y = _nav_unit_last_before(db, sid, year_cut)
+        if p0_nav is None and max_rb is not None:
+            p0_nav = _nav_period_start_nav_unit(db, sid, max_rb)
         pack = _nav_list_summary_from_desc_rows(
             rows,
             max_rb,
             period_start_nav=p0_nav,
-            anchor_m_nav=anchor_m,
-            anchor_y_nav=anchor_y,
         )
         if pack is None:
             continue
@@ -2579,17 +2595,56 @@ def public_feedback_submit(
 
 @app.get("/api/strategies")
 def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_session)):
+    from app.strategy_list_metrics import (
+        ensure_strategy_list_metrics_for_list,
+        metrics_fields_from_row,
+    )
+
     rows = db.execute(
         text(
             """
-            SELECT strategy_id, strategy_name, benchmark_code, benchmark_name, strategy_intro,
-                   strategy_category, rebalance_frequency
-            FROM strategy_configs
-            WHERE is_visible=1 AND status='enabled'
-            ORDER BY updated_at DESC
+            SELECT c.strategy_id, c.strategy_name, c.benchmark_code, c.benchmark_name,
+                   c.strategy_intro, c.strategy_category, c.rebalance_frequency,
+                   m.latest_nav, m.last_1d_return, m.last_5d_return,
+                   m.period_since_rebalance_return, m.month_return, m.year_return,
+                   m.last_trade_date, m.stock_count_on_last_date
+            FROM strategy_configs c
+            LEFT JOIN strategy_list_metrics m ON m.strategy_id = c.strategy_id
+            WHERE c.is_visible=1 AND c.status='enabled'
+            ORDER BY c.updated_at DESC
             """
         )
     ).mappings().all()
+    sids = [str(r["strategy_id"]) for r in rows]
+    metrics_by_sid: dict[str, dict] = {}
+    for r in rows:
+        sid = str(r["strategy_id"])
+        metrics_by_sid[sid] = {
+            "latest_nav": r.get("latest_nav"),
+            "last_1d_return": r.get("last_1d_return"),
+            "last_5d_return": r.get("last_5d_return"),
+            "period_since_rebalance_return": r.get("period_since_rebalance_return"),
+            "month_return": r.get("month_return"),
+            "year_return": r.get("year_return"),
+            "last_trade_date": r.get("last_trade_date"),
+            "stock_count_on_last_date": r.get("stock_count_on_last_date"),
+        }
+    if ensure_strategy_list_metrics_for_list(db, sids, do_commit=True) and sids:
+        quoted = ",".join("'" + s.replace("'", "''") + "'" for s in sids)
+        metric_rows = db.execute(
+            text(
+                f"""
+                SELECT strategy_id, latest_nav, last_1d_return, last_5d_return,
+                       period_since_rebalance_return, month_return, year_return,
+                       last_trade_date, stock_count_on_last_date
+                FROM strategy_list_metrics
+                WHERE strategy_id IN ({quoted})
+                """
+            )
+        ).mappings().all()
+        for mr in metric_rows:
+            metrics_by_sid[str(mr["strategy_id"])] = dict(mr)
+
     username = user["username"]
     follow_rows = db.execute(
         text(
@@ -2600,22 +2655,25 @@ def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_se
         {"u": username},
     ).mappings().all()
     followed_set = {str(r["strategy_id"]) for r in follow_rows}
-    sids = [str(r["strategy_id"]) for r in rows]
-    summaries = _batch_strategy_nav_list_summaries(db, sids)
     items = []
     for r in rows:
         d = dict(r)
-        sid = d["strategy_id"]
+        sid = str(d["strategy_id"])
+        for k in (
+            "latest_nav",
+            "last_1d_return",
+            "last_5d_return",
+            "period_since_rebalance_return",
+            "month_return",
+            "year_return",
+            "last_trade_date",
+            "stock_count_on_last_date",
+        ):
+            d.pop(k, None)
         d["is_followed"] = sid in followed_set
         d["display_category"] = _display_strategy_category(d.get("strategy_category"))
-        d.update(summaries.get(str(sid), dict(_NAV_LIST_SUMMARY_EMPTY)))
+        d.update(metrics_fields_from_row(metrics_by_sid.get(sid)))
         items.append(d)
-    nav_meta = _batch_nav_last_date_stock_count(db, [str(x["strategy_id"]) for x in items])
-    for d in items:
-        sid = str(d["strategy_id"])
-        m = nav_meta.get(sid) or {}
-        d["last_trade_date"] = m.get("last_trade_date")
-        d["stock_count_on_last_date"] = m.get("stock_count")
     followed = [x for x in items if x["is_followed"]]
     return {"items": items, "followed": followed, "role": user["role"]}
 
@@ -3513,16 +3571,16 @@ def strategy_nav_metrics(
     def _anchor_nav(anchor_dt: date) -> float | None:
         row = db.execute(
             text(
-                """
+                f"""
                 SELECT nav_unit
                 FROM strategy_nav_daily
                 WHERE strategy_id=:sid
-                  AND trade_date < :anchor
-                ORDER BY trade_date DESC
+                  AND {sql_date_compact_expr("trade_date")} < :acmp
+                ORDER BY {sql_order_date_desc("trade_date")}
                 LIMIT 1
                 """
             ),
-            {"sid": strategy_id, "anchor": anchor_dt},
+            {"sid": strategy_id, "acmp": anchor_dt.strftime("%Y%m%d")},
         ).mappings().first()
         if not row or row.get("nav_unit") is None:
             return None
