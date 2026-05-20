@@ -1486,38 +1486,51 @@ def _sync_save_checkpoint(
         db.commit()
 
 
-def _sync_mark_update_rb_done(sync_job_id: int, rb_compact: str) -> None:
+def _sync_mark_update_rb_done(
+    sync_job_id: int,
+    rb_compact: str,
+    *,
+    db: Session | None = None,
+    do_commit: bool = True,
+) -> None:
     """阶段3 每写完一个调仓期，落库断点，避免 OOM/重启后从第一期重拉 EOD。"""
-    from app.db import SessionLocalFactory, turso_stream_lock
-
     rb_key = str(rb_compact or "").strip().replace("-", "")[:8]
     if not rb_key:
         return
+
+    def _apply(sess: Session) -> None:
+        row = (
+            sess.execute(
+                text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                {"id": sync_job_id},
+            )
+            .mappings()
+            .first()
+        )
+        cp = _sync_load_checkpoint(row.get("checkpoint_json") if row else None)
+        done = set(cp.get("completed_update_rb") or [])
+        done.add(rb_key)
+        _sync_save_checkpoint(
+            sess,
+            sync_job_id,
+            completed_import=list(cp.get("completed_import") or []),
+            completed_nav=list(cp.get("completed_nav") or []),
+            completed_update_rb=sorted(done),
+            stage="update",
+            do_commit=do_commit,
+        )
+
+    if db is not None:
+        _apply(db)
+        return
+    from app.db import SessionLocalFactory, turso_stream_lock
+
     with turso_stream_lock():
-        db = SessionLocalFactory()
+        own = SessionLocalFactory()
         try:
-            row = (
-                db.execute(
-                    text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
-                    {"id": sync_job_id},
-                )
-                .mappings()
-                .first()
-            )
-            cp = _sync_load_checkpoint(row.get("checkpoint_json") if row else None)
-            done = set(cp.get("completed_update_rb") or [])
-            done.add(rb_key)
-            _sync_save_checkpoint(
-                db,
-                sync_job_id,
-                completed_import=list(cp.get("completed_import") or []),
-                completed_nav=list(cp.get("completed_nav") or []),
-                completed_update_rb=sorted(done),
-                stage="update",
-                do_commit=True,
-            )
+            _apply(own)
         finally:
-            db.close()
+            own.close()
 
 
 def _effective_eod_chunk_size(n_stocks: int) -> int:
@@ -2246,7 +2259,12 @@ def run_update(
                     f"调仓 {rebalance} 已写入 {n_written} 条"
                 )
                 if sync_job_id is not None and rb_compact:
-                    _sync_mark_update_rb_done(sync_job_id, rb_compact)
+                    _sync_mark_update_rb_done(
+                        sync_job_id,
+                        rb_compact,
+                        db=db,
+                        do_commit=False,
+                    )
 
             if rb_chunked_eod:
                 # 按调仓期：只拉该期成分股 EOD，凑齐一期即算权重并落库（峰值内存≈单期行数+一小批 K 线）
@@ -2342,6 +2360,11 @@ def run_update(
                         wind_i,
                     )
                     prepared_rows.clear()
+                if sync_job_id is not None and do_commit:
+                    db.commit()
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：{n_rb_wind} 个调仓期持仓已落库，正在收尾…"
+                    )
             else:
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
                     if (i_rb - 1) not in wind_rb_indices:
@@ -2393,8 +2416,15 @@ def run_update(
                         rb_compact,
                         wind_i,
                     )
+                if sync_job_id is not None and do_commit:
+                    db.commit()
+                    prog(
+                        f"[{i_active}/{n_active}] {sid}：{n_rb_wind} 个调仓期持仓已落库，正在收尾…"
+                    )
 
             if do_commit:
+                if sync_job_id is None:
+                    prog(f"[{i_active}/{n_active}] {sid}：持仓处理完成")
                 db.commit()
             _release_run_update_strategy_memory(
                 eod_by_code=eod_by_code,
@@ -2407,6 +2437,9 @@ def run_update(
             _release_wind_memory(wind_merged)
             wind_merged = None
 
+        prog(
+            f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}），正在关闭 Wind 连接…"
+        )
         db.execute(
             text(
                 f"""
@@ -2925,7 +2958,34 @@ def _nav_shares_from_holding_snapshot(
         },
     ).mappings().all()
     if not rows:
-        return None
+        prior = db.execute(
+            text(
+                f"""
+                SELECT stock_code, latest_weight, period_weight, latest_price
+                FROM strategy_holding_daily
+                WHERE strategy_id=:sid
+                  AND rebalance_date IN (:rb_iso, :rb_cmp)
+                  AND {sql_date_compact_expr("trade_date")} <= :td_cmp
+                ORDER BY {sql_order_date_desc("trade_date")}
+                """
+            ),
+            {
+                "sid": sid,
+                "rb_iso": rb_iso,
+                "rb_cmp": rb_cmp,
+                "td_cmp": td_cmp,
+            },
+        ).mappings().all()
+        if not prior:
+            return None
+        seen: set[str] = set()
+        rows = []
+        for r in prior:
+            sc = _wind_code_key(r.get("stock_code"))
+            if not sc or sc in seen:
+                continue
+            seen.add(sc)
+            rows.append(r)
     shares: dict[str, float] = {}
     tw = 0.0
     for r in rows:
@@ -3025,6 +3085,38 @@ def _nav_init_state_from_last_row(
         elif mv_chk > 0 and prev_mv <= 0:
             prev_mv = mv_chk
     return rb_idx, current_rb, last_nav_d, shares, last_close_fill, prev_mv, bench_nav_acc
+
+
+def _nav_init_matches_last_row(
+    row_last: Any | None,
+    shares: dict[str, float],
+    day_map: dict,
+    append_after_c: str,
+    last_close_fill: dict[str, float],
+    ic0: float,
+    *,
+    tol: float = 0.03,
+) -> bool:
+    """增量初始化后，组合市值折算的 nav_unit 须与库内末净值日一致，否则勿写入（防删库后断尺）。"""
+    if not row_last or ic0 <= 0 or not shares:
+        return bool(shares)
+    try:
+        nu_db = float(row_last.get("nav_unit") or 0)
+    except (TypeError, ValueError):
+        return True
+    if nu_db <= 0:
+        return True
+    mv = 0.0
+    for sc, sh in shares.items():
+        if sh <= 0:
+            continue
+        px = _adj_close_td_ff(day_map, sc, append_after_c, last_close_fill)
+        if px is not None:
+            mv += sh * px
+    if mv <= 0:
+        return False
+    nu_calc = mv / ic0
+    return abs(nu_calc - nu_db) / nu_db <= tol
 
 
 def _nav_fetch_row_on_day(db: Session, sid: str, td_compact: str) -> Any | None:
@@ -3293,6 +3385,16 @@ def _rebuild_nav_incremental_from_current_period(
                     row_last,
                     bench_code,
                 )
+                if not _nav_init_matches_last_row(
+                    row_last, shares, day_map, append_after_c, last_close_fill, ic0
+                ):
+                    _log.warning(
+                        "nav incremental %s: init nav mismatch on %s "
+                        "(no holding snapshot on/before that day?); abort",
+                        sid,
+                        append_after_c,
+                    )
+                    return False, wind
                 state_inited = True
             for td in seg_days:
                 td_date = datetime.strptime(td, "%Y%m%d").date()
@@ -3400,6 +3502,17 @@ def _rebuild_nav_incremental_from_current_period(
         row_last,
         bench_code,
     )
+    if not _nav_init_matches_last_row(
+        row_last, shares, day_map, append_after_c, last_close_fill, ic0
+    ):
+        _log.warning(
+            "nav incremental %s: init nav mismatch on %s "
+            "(no holding snapshot on/before that day?); abort",
+            sid,
+            append_after_c,
+        )
+        day_map.clear()
+        return False, wind
     for td in sim_days:
         td_date = datetime.strptime(td, "%Y%m%d").date()
         (
