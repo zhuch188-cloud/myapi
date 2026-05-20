@@ -2929,7 +2929,13 @@ def _nav_init_state_from_last_row(
         px = _adj_close_td_ff(day_map, sc2, append_after_c, last_close_fill)
         if px is not None:
             mv_chk += sh * px
-    if mv_chk > 0:
+    # 以库内末净值 nav_unit 为尺度锚；勿用权重重算市值覆盖 prev_mv（删库后增量常见尺度断裂）
+    if mv_chk > 0 and prev_mv > 0:
+        drift = abs(mv_chk - prev_mv) / prev_mv
+        if drift > 1e-6:
+            scale = prev_mv / mv_chk
+            shares = {sc: sh * scale for sc, sh in shares.items() if sh > 0}
+    elif mv_chk > 0 and prev_mv <= 0:
         prev_mv = mv_chk
     return rb_idx, current_rb, last_nav_d, shares, last_close_fill, prev_mv, bench_nav_acc
 

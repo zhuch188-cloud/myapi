@@ -19,7 +19,7 @@ from app.sql_dialect import sql_max_date_expr, sql_order_date_desc
 
 
 def main() -> int:
-    sid = "CL2"
+    sid = (sys.argv[1] if len(sys.argv) > 1 else "CL3").strip()
     with get_session() as db:
         nav_rows = db.execute(
             text(
