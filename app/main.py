@@ -38,6 +38,7 @@ from app.update_lock import strategy_update_mutex
 from app.sql_dialect import (
     list_table_columns,
     quote_ident as _sql_quote_ident,
+    normalize_sql_date_text,
     sql_curdate,
     sql_date_compact_expr,
     sql_hours_ago,
@@ -1402,6 +1403,11 @@ def _display_strategy_category(raw: object | None) -> str:
     return s if s else "其他"
 
 
+def _api_trade_date_iso(val: object | None) -> str | None:
+    """API 展示用 YYYY-MM-DD（兼容 MAX 返回的 YYYYMMDD compact）。"""
+    return normalize_sql_date_text(val)
+
+
 def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> dict[str, dict]:
     """净值表最后交易日 + 该日「当前调仓期」持仓股票数（与净值行 rebalance_date 一致，否则取该日最大 rebalance_date）。"""
     if not strategy_ids:
@@ -2738,9 +2744,18 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
             """
         )
     ).mappings().first()
-    latest_td = td_row["d"] if td_row else None
+    latest_td = _api_trade_date_iso(td_row["d"]) if td_row else None
     if latest_td is None:
-        return {"latest_trade_date": None, "followed_top": [], "categories": [], "category_tops": {}}
+        m_row = db.execute(
+            text(
+                f"""
+                SELECT MAX(last_trade_date) AS d
+                FROM strategy_list_metrics
+                WHERE strategy_id IN ({quoted_visible})
+                """
+            )
+        ).mappings().first()
+        latest_td = _api_trade_date_iso(m_row["d"]) if m_row else None
 
     def _build_top(strategy_ids: list[str], lim: int) -> list[dict]:
         """每个策略：最新 trade_date + 该日 MAX(rebalance_date) 的持仓（与 strategy_holdings 默认本期一致）。"""
@@ -2753,6 +2768,8 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
             ph.append(f":{k}")
             binds[k] = sid
         in_clause = ",".join(ph)
+        td_cmp = sql_date_compact_expr("h.trade_date")
+        rb_cmp = sql_date_compact_expr("h.rebalance_date")
         rows = db.execute(
             text(
                 f"""
@@ -2763,15 +2780,15 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
                     FROM strategy_holding_daily
                     WHERE strategy_id IN ({in_clause})
                     GROUP BY strategy_id
-                ) lt ON lt.strategy_id = h.strategy_id AND h.trade_date = lt.td
+                ) lt ON lt.strategy_id = h.strategy_id AND {td_cmp} = lt.td
                 INNER JOIN (
                     SELECT strategy_id, trade_date, {sql_max_date_expr("rebalance_date")} AS rb
                     FROM strategy_holding_daily
                     WHERE strategy_id IN ({in_clause})
                     GROUP BY strategy_id, trade_date
                 ) lr ON lr.strategy_id = h.strategy_id
-                    AND lr.trade_date = h.trade_date
-                    AND h.rebalance_date = lr.rb
+                    AND {td_cmp} = {sql_date_compact_expr("lr.trade_date")}
+                    AND {rb_cmp} = lr.rb
                 WHERE h.strategy_id IN ({in_clause})
                 """
             ),
@@ -2838,7 +2855,7 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
         category_tops[cat] = _build_top(by_category[cat], 10)
 
     return {
-        "latest_trade_date": str(latest_td),
+        "latest_trade_date": latest_td,
         "followed_top": _build_top(followed_ids, 10),
         "categories": category_order,
         "category_tops": category_tops,
