@@ -56,7 +56,7 @@ def refresh_strategy_list_metrics_cache(
     from app.main import (
         _NAV_LIST_SUMMARY_EMPTY,
         _batch_nav_last_date_stock_count,
-        _batch_strategy_nav_list_summaries,
+        _strategy_nav_list_summary_bounded,
         _nav_list_period_rebalance_date,
     )
 
@@ -66,7 +66,9 @@ def refresh_strategy_list_metrics_cache(
     if not ids:
         return 0
 
-    summaries = _batch_strategy_nav_list_summaries(db, ids)
+    summaries: dict[str, dict[str, Any]] = {}
+    for sid in ids:
+        summaries[sid] = _strategy_nav_list_summary_bounded(db, sid)
     nav_meta = _batch_nav_last_date_stock_count(db, ids)
     now_expr = sql_now()
     upsert = text(

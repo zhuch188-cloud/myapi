@@ -2107,23 +2107,9 @@ def run_update(
                         else:
                             lt_c = _compact_date(latest_trade)
                             if last_nav_c and len(last_nav_c) >= 8:
-                                last_nav_d = datetime.strptime(
-                                    last_nav_c[:8], "%Y%m%d"
-                                ).date()
-                                rb_sorted_n = sorted(pl1["rb_map"].keys())
-                                _, anchor_rb_n = _nav_rb_idx_on_date(
-                                    rb_sorted_n, last_nav_d
-                                )
-                                wind, td_hint = wind_bulk.fetch_trade_date_compacts(
-                                    wind, db, _compact_date(anchor_rb_n), lt_c
-                                )
-                                p0 = _nav_first_trade_on_or_after(
-                                    anchor_rb_n, td_hint
-                                )
                                 nav_hint = (
-                                    f"锚定调仓 {_compact_date(anchor_rb_n)}"
-                                    f"（末净值 {last_nav_c}，期初交易日 {p0 or '?'}），"
-                                    f"补至 {lt_c}；不预拉全历史 EOD"
+                                    f"末净值 {last_nav_c}（nav×本金 bootstrap），"
+                                    f"仅补写之后交易日至 {lt_c}；不回放全历史"
                                 )
                             else:
                                 nav_hint = f"首建全量 {pl1['start_c']}~{lt_c}"
@@ -2844,6 +2830,31 @@ def _nav_union_codes_between_rebalances(
     return sorted(codes)
 
 
+def _nav_codes_for_incremental(
+    rb_map: dict[date, list[tuple[str, float]]],
+    rb_sorted: list[date],
+    anchor_rb: date,
+    current_rb: date,
+    last_nav_d: date,
+    latest_d: date,
+) -> list[str]:
+    """
+    增量 Wind 成分：默认仅当前调仓期；末净值日与最新日之间若有新调仓才合并多期。
+    减少 EOD 拉取股票数与 Turso 无关但缩短 Wind/SQL 窗口。
+    """
+    has_new_rb = any(last_nav_d < rb <= latest_d for rb in rb_sorted)
+    if not has_new_rb:
+        codes: set[str] = set()
+        for c, _ in rb_map.get(current_rb, ()):
+            if c:
+                codes.add(str(c).strip().upper())
+        if codes:
+            return sorted(codes)
+    return _nav_union_codes_between_rebalances(
+        rb_map, rb_sorted, anchor_rb, current_rb
+    )
+
+
 def _nav_first_trade_on_or_after(rb: date, trade_days: list[str]) -> str | None:
     rb_c = _compact_date(rb)
     for td in trade_days:
@@ -3148,7 +3159,9 @@ def _nav_init_state_from_last_row(
     """用库内末净值日持仓与市值初始化，仅用于模拟 append_after_c 之后的交易日。"""
     last_nav_d = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
     rb_idx, current_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d)
-    prev_mv = _nav_notional_from_row(row_last, ic0) or ic0
+    prev_mv = _nav_notional_from_row(row_last, ic0)
+    if not prev_mv or prev_mv <= 0:
+        prev_mv = None
     bench_nav_acc: float | None = 1.0 if bench_code else None
     if bench_code and row_last and row_last.get("benchmark_nav") is not None:
         try:
@@ -3168,6 +3181,8 @@ def _nav_init_state_from_last_row(
     )
     if not shares:
         holdings0 = rb_map.get(current_rb, [])
+        if prev_mv is None or prev_mv <= 0:
+            return rb_idx, current_rb, last_nav_d, {}, last_close_fill, None, bench_nav_acc
         shares = _nav_snap_shares_from_holdings(
             holdings0, prev_mv, day_map, append_after_c, last_close_fill
         )
@@ -3372,8 +3387,8 @@ def _rebuild_nav_incremental_from_current_period(
     sync_job_id: int | None = None,
 ) -> tuple[bool, Any]:
     """
-    以库内末净值日初始化股数/市值，仅模拟并落库 append_after_c 之后的交易日（换仓逻辑同全量）。
-    不再从锚定期初 nav≈1 重放至末净值日，避免与历史 nav_unit（如 3.x）尺度断裂导致列表 -70% 假指标。
+    以库内末净值日 nav×本金 初始化股数，仅模拟并落库 append_after_c 之后的交易日。
+    锚定末净值日前最近调仓期；Wind/EOD 窗口为 append 日～最新日（其间有新调仓才扩展成分）。
     """
     if not _nav_incremental_from_period_enabled():
         _log.info("nav incremental %s: disabled (NAV_INCREMENTAL_FROM_CURRENT_PERIOD)", sid)
@@ -3393,14 +3408,17 @@ def _rebuild_nav_incremental_from_current_period(
     if not sim_days:
         return True, wind
 
-    period_codes = _nav_union_codes_between_rebalances(
-        rb_map, rb_sorted, anchor_rb, current_rb
+    period_codes = _nav_codes_for_incremental(
+        rb_map, rb_sorted, anchor_rb, current_rb, last_nav_d, latest_d
     )
     if not period_codes:
         return False, wind
 
-    use_seg = bool(getattr(settings, "nav_rebuild_year_segments", True)) and (
-        _wind_low_memory_mode() or len(period_codes) > 250
+    inc_max_days = max(1, int(getattr(settings, "nav_incremental_max_sim_days", 31) or 31))
+    use_seg = (
+        len(sim_days) > inc_max_days
+        and bool(getattr(settings, "nav_rebuild_year_segments", True))
+        and (_wind_low_memory_mode() or len(period_codes) > 250)
     )
     eod_start_c = wind_bulk.nav_incremental_eod_start(
         append_after_c, rb_sorted, last_nav_d, latest_d, trade_days
@@ -3423,8 +3441,9 @@ def _rebuild_nav_incremental_from_current_period(
         _admin_sync_job_touch(
             sync_job_id,
             "nav",
-            f"{sid}：末净值 {append_after_c} EOD自 {eod_start_c} 增量→{latest_trade_c}"
-            f"（{len(sim_days)} 日）成分 {len(period_codes)} 只…",
+            f"{sid}：锚定调仓 {_compact_date(anchor_rb)} 末净值 {append_after_c} "
+            f"EOD {eod_start_c}→{latest_trade_c} 补 {len(sim_days)} 日 "
+            f"成分 {len(period_codes)} 只…",
             db=db,
             do_commit=True,
         )
@@ -3478,6 +3497,9 @@ def _rebuild_nav_incremental_from_current_period(
                     day_map,
                     row_last,
                     bench_code,
+                )
+                prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
+                    append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
                 )
                 if not _nav_init_matches_last_row(
                     row_last, shares, day_map, append_after_c, last_close_fill, ic0
@@ -3598,6 +3620,9 @@ def _rebuild_nav_incremental_from_current_period(
         day_map,
         row_last,
         bench_code,
+    )
+    prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
+        append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
     )
     if not _nav_init_matches_last_row(
         row_last, shares, day_map, append_after_c, last_close_fill, ic0
@@ -3898,6 +3923,8 @@ def _rebuild_nav_for_strategy_yearly(
                 )
 
         for td in seg_days:
+            if not nav_full_rebuild and append_after_c and td <= append_after_c:
+                continue
             td_i += 1
             if sync_job_id is not None and td_i % 40 == 0:
                 _admin_sync_job_touch(
@@ -3998,6 +4025,13 @@ def _rebuild_nav_for_strategy_yearly(
     shares.clear()
     last_close_fill.clear()
     gc.collect()
+    if not nav_full_rebuild and append_after_c and not nav_bootstrapped:
+        _log.warning(
+            "nav incremental %s: yearly replay never bootstrapped from %s (nav×本金)",
+            sid,
+            append_after_c,
+        )
+        return False, wind
     if append_after_c:
         _log.info("nav incremental %s: appended after %s through %s", sid, append_after_c, latest_trade_c)
     nav_max_c = _strategy_nav_max_trade_compact(db, sid)
@@ -4032,8 +4066,9 @@ def _rebuild_nav_for_strategy(
     daily_ret = 当日市值 / 上一交易日市值 - 1。
 
     nav_full_rebuild=True：删除该策略全部净值后从首日到最新 Wind 交易日重算。
-    nav_full_rebuild=False：保留已有净值，仅写入库中最后交易日之后、直至最新交易日的每一个交易日
-    （中间若缺多个交易日会逐日补齐；仍自首日模拟持仓状态，但不改历史已落库行）。
+    nav_full_rebuild=False：保留已有净值，以末净值日 nav×本金 bootstrap，
+    锚定「末净值日前最近调仓期」，仅 Wind 拉 append 日～最新日、仅落库之后各日；
+    失败时不回退全量/分段重放（Turso 读取与 Wind 窗口均最小化）。
 
     mysql_plan / wind_bundle 由 rebuild_nav_series 批量预取时传入，避免重复查库与重复拉 Wind。
     """
@@ -4119,7 +4154,6 @@ def _rebuild_nav_for_strategy(
         return True, wind
 
     rb_sorted_pre = sorted(rb_map.keys())
-    yearly_start = start_c
     if not nav_full_rebuild and append_after_c and rb_sorted_pre:
         if _nav_scale_break_detected(db, sid):
             good_c = _nav_last_good_trade_compact(db, sid) or append_after_c
@@ -4140,11 +4174,8 @@ def _rebuild_nav_for_strategy(
                 sid,
                 good_c,
             )
-        last_nav_d_pre = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
-        _, anchor_rb_pre = _nav_rb_idx_on_date(rb_sorted_pre, last_nav_d_pre)
-        period_sc = _compact_date(anchor_rb_pre)
         wind, td_period = wind_bulk.fetch_trade_date_compacts(
-            wind, db, period_sc, latest_trade_c
+            wind, db, append_after_c, latest_trade_c
         )
         ok_inc, wind = _rebuild_nav_incremental_from_current_period(
             db,
@@ -4160,22 +4191,14 @@ def _rebuild_nav_for_strategy(
         )
         if ok_inc:
             return True, wind
-        yearly_start = start_c
-        last_nav_d_fb = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
-        _, anchor_rb_fb = _nav_rb_idx_on_date(rb_sorted_pre, last_nav_d_fb)
-        wind, td_fb = wind_bulk.fetch_trade_date_compacts(
-            wind, db, _compact_date(anchor_rb_fb), latest_trade_c
-        )
-        p0_fb = _nav_first_trade_on_or_after(anchor_rb_fb, td_fb)
-        if p0_fb:
-            yearly_start = p0_fb
         _log.warning(
-            "nav incremental %s: fallback segmented replay from %s (not strategy min_rb %s)",
+            "nav incremental %s: failed after append %s; no full replay (Turso/Wind 增量专用)",
             sid,
-            yearly_start,
-            start_c,
+            append_after_c,
         )
+        return False, wind
 
+    yearly_start = start_c
     n_codes = len(code_set)
     force_seg = n_codes > 250
     use_nav_segments = bool(getattr(settings, "nav_rebuild_year_segments", True))
@@ -4259,6 +4282,7 @@ def _rebuild_nav_for_strategy(
     shares: dict[str, float] = {}
     last_close_fill: dict[str, float] = {}
     prev_mv: float | None = None
+    nav_bootstrapped = False
     if not nav_full_rebuild and append_after_c:
         boot = _nav_bootstrap_state_from_append_row(
             db,
@@ -4280,12 +4304,22 @@ def _rebuild_nav_for_strategy(
                 prev_mv,
                 bench_nav_acc,
             ) = boot
+            nav_bootstrapped = True
             _log.info(
                 "nav %s: bootstrapped sim state from %s (nav×本金)",
                 sid,
                 append_after_c,
             )
+        else:
+            _log.warning(
+                "nav incremental %s: bootstrap from %s failed (nav×本金); abort non-yearly replay",
+                sid,
+                append_after_c,
+            )
+            return False, wind
     for i_td, td in enumerate(trade_days):
+        if not nav_full_rebuild and append_after_c and td <= append_after_c:
+            continue
         rb_idx_at_start = rb_idx
         td_date = datetime.strptime(td, "%Y%m%d").date()
         while rb_idx + 1 < len(rb_sorted) and rb_sorted[rb_idx + 1] <= td_date:

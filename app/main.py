@@ -1629,77 +1629,100 @@ def _nav_list_summary_from_desc_rows(
     return last_nav, last_1d_return, last_5d_return, period_ret, month_ret, year_ret
 
 
+def _strategy_nav_list_summary_bounded(db: Session, strategy_id: str) -> dict[str, Any]:
+    """
+    单策略列表指标：仅 indexed 点查（末行 / 月年锚 / 本期期初 / 第6行），不扫全表 nav 序列。
+    供 strategy_list_metrics 刷新与日常增量后更新，降低 Turso 读取量。
+    """
+    sid = str(strategy_id).strip()
+    if not sid:
+        return dict(_NAV_LIST_SUMMARY_EMPTY)
+    top = db.execute(
+        text(
+            f"""
+            SELECT trade_date, nav_unit, daily_ret
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+            ORDER BY {sql_order_date_desc("trade_date")}
+            LIMIT 1
+            """
+        ),
+        {"sid": sid},
+    ).mappings().first()
+    if not top:
+        return dict(_NAV_LIST_SUMMARY_EMPTY)
+    try:
+        last_nav = float(top["nav_unit"])
+    except (TypeError, ValueError):
+        return dict(_NAV_LIST_SUMMARY_EMPTY)
+    if last_nav <= 0:
+        return dict(_NAV_LIST_SUMMARY_EMPTY)
+    last_1d_return = _safe_float(top.get("daily_ret"))
+    last_td = _nav_list_trade_date_as_date(top["trade_date"])
+    if last_td is None:
+        return dict(_NAV_LIST_SUMMARY_EMPTY)
+
+    row5 = db.execute(
+        text(
+            f"""
+            SELECT nav_unit
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+            ORDER BY {sql_order_date_desc("trade_date")}
+            LIMIT 1 OFFSET 5
+            """
+        ),
+        {"sid": sid},
+    ).mappings().first()
+    last_5d_return = None
+    if row5 and row5.get("nav_unit") is not None:
+        try:
+            n5 = float(row5["nav_unit"])
+            if n5 > 0:
+                last_5d_return = last_nav / n5 - 1.0
+        except (TypeError, ValueError):
+            pass
+
+    month_cut = last_td.replace(day=1)
+    year_cut = date(last_td.year, 1, 1)
+    anchor_m_nav = _nav_unit_last_before(db, sid, month_cut)
+    anchor_y_nav = _nav_unit_last_before(db, sid, year_cut)
+    dm = _nav_metric_denominator(anchor_m_nav)
+    dy = _nav_metric_denominator(anchor_y_nav)
+    month_ret = last_nav / dm - 1.0
+    year_ret = last_nav / dy - 1.0
+
+    max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
+    period_ret = None
+    if max_rb is not None:
+        p0 = _nav_period_start_nav_unit(db, sid, max_rb)
+        if p0 is not None and p0 > 0:
+            period_ret = last_nav / p0 - 1.0
+
+    return {
+        "latest_nav": _round_nav_unit(last_nav),
+        "last_1d_return": last_1d_return,
+        "last_5d_return": last_5d_return,
+        "period_since_rebalance_return": period_ret,
+        "month_return": month_ret,
+        "year_return": year_ret,
+    }
+
+
 def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> dict[str, dict[str, Any]]:
     """
-    与 _strategy_nav_list_summary 相同口径；供策略列表页使用。
-
-    一次读取 strategy_nav_daily（无 ORDER BY），在内存中按策略排序并聚合；
-    本期锚定 strategy_positions 截至末净值日的调仓日 + 期初首个交易日 nav；月/年锚定与 nav-metrics 相同（SQL）。
+    策略列表页汇总；每策略 bounded 点查，避免 WHERE strategy_id IN (...) 扫全历史 nav 行。
     """
     ids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
     out: dict[str, dict[str, Any]] = {sid: dict(_NAV_LIST_SUMMARY_EMPTY) for sid in ids}
-    if not ids:
-        return out
-    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in ids)
-
-    nav_rows = db.execute(
-        text(
-            f"""
-            SELECT strategy_id, trade_date, nav_unit, daily_ret, rebalance_date
-            FROM strategy_nav_daily
-            WHERE strategy_id IN ({quoted})
-            """
-        )
-    ).mappings().all()
-
-    by_sid: defaultdict[str, list[Any]] = defaultdict(list)
-    for row in nav_rows:
-        sid = str(row["strategy_id"]).strip()
-        by_sid[sid].append(row)
-
     for sid in ids:
-        rows = by_sid.get(sid, [])
-        if not rows:
-            continue
-        rows.sort(
-            key=lambda r: _nav_list_trade_date_as_date(r["trade_date"]) or date.min,
-            reverse=True,
-        )
-        last_td = _nav_list_trade_date_as_date(rows[0]["trade_date"])
-        if last_td is None:
-            continue
-        rows_asc = list(reversed(rows))
-        max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
-        p0_nav = (
-            _nav_period_start_nav_from_rows(rows_asc, max_rb)
-            if max_rb is not None
-            else None
-        )
-        if p0_nav is None and max_rb is not None:
-            p0_nav = _nav_period_start_nav_unit(db, sid, max_rb)
-        pack = _nav_list_summary_from_desc_rows(
-            rows,
-            max_rb,
-            period_start_nav=p0_nav,
-        )
-        if pack is None:
-            continue
-        last_nav, last_1d_return, last_5d_return, period_ret, month_ret, year_ret = pack
-        out[sid] = {
-            "latest_nav": _round_nav_unit(last_nav),
-            "last_1d_return": last_1d_return,
-            "last_5d_return": last_5d_return,
-            "period_since_rebalance_return": period_ret,
-            "month_return": month_ret,
-            "year_return": year_ret,
-        }
+        out[sid] = _strategy_nav_list_summary_bounded(db, sid)
     return out
 
 
 def _strategy_nav_list_summary(db: Session, strategy_id: str) -> dict:
     """最新净值、本期（最近调仓日以来）、1日/5日（净值序列相邻交易日）、本月、本年收益；口径与净值页 nav-metrics 中月/年一致。"""
-    m = _batch_strategy_nav_list_summaries(db, [strategy_id])
-    return m.get(str(strategy_id).strip(), dict(_NAV_LIST_SUMMARY_EMPTY))
+    return _strategy_nav_list_summary_bounded(db, strategy_id)
 
 
 def _require_visible_strategy(db: Session, strategy_id: str) -> dict:

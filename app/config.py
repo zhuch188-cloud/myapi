@@ -95,8 +95,10 @@ class Settings(BaseSettings):
     nav_rebuild_persist_chunk: int = 400
     # 低内存下分段拉 Wind EOD 算净值（避免全区间 day_map 一次驻留）
     nav_rebuild_year_segments: bool = True
-    # 日常增量净值：以库内最后净值日对应调仓期为锚，自该期首交易日起拉 Wind 并补之后各日
+    # 日常增量净值：末净值日×本金 bootstrap，仅补写之后交易日；失败不回退全量重放
     nav_incremental_from_current_period: bool = True
+    # 增量模拟交易日数 ≤ 该值时不分段拉 EOD（仅拉 append 日～最新日）
+    nav_incremental_max_sim_days: int = 31
     # 日常增量持仓：开放调仓期 EOD 自行情日向前日历天数（默认 110，覆盖约 60 个交易日）
     holding_eod_lookback_calendar_days: int = 110
     # 持仓 5/20/60 日指标从 EOD 序列取的最近 K 线根数（日常增量默认 65）

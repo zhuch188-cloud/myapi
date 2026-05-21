@@ -24,9 +24,14 @@ if str(ROOT) not in sys.path:
 
 from sqlalchemy import text
 
-from app.db import get_session
+from app.db import SessionLocalFactory, init_database
 from app.services import _nav_last_good_trade_compact, _nav_scale_break_detected
 from app.sql_dialect import sql_date_compact_expr
+
+
+def _open_db():
+    init_database()
+    return SessionLocalFactory()
 
 
 def _compact_to_date(c: str) -> date:
@@ -60,7 +65,8 @@ def main() -> int:
         quoted = ",".join("'" + s.replace("'", "''") + "'" for s in sid_filter)
         sid_clause = f" AND strategy_id IN ({quoted})"
 
-    with get_session() as db:
+    db = _open_db()
+    try:
         if sid_filter:
             for sid in sid_filter:
                 cfg = db.execute(
@@ -285,6 +291,8 @@ def main() -> int:
         )
         db.commit()
         print("\n已提交删除。请在管理端对受影响策略执行「仅更新最新交易日」或全量重算净值。")
+    finally:
+        db.close()
     return 0
 
 
