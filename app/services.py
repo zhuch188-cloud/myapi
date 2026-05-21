@@ -2171,6 +2171,15 @@ def run_update(
                     db.commit()
 
             if skip_holdings:
+                try:
+                    from app.strategy_list_metrics import refresh_strategy_list_metrics_one
+
+                    refresh_strategy_list_metrics_one(db, sid, do_commit=do_commit)
+                except Exception:
+                    _log.exception(
+                        "strategy_list_metrics refresh failed sid=%s (skip_holdings)",
+                        sid,
+                    )
                 continue
 
             eod_by_code: dict[str, list] = {}

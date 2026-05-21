@@ -1538,10 +1538,10 @@ def _nav_rolling_window_returns(
     last_nav: float | None = None,
 ) -> dict[str, float | None]:
     """
-    滚动窗口收益（与策略列表、净值页 nav-metrics 共用）：
-    - last_5d_return / week_return：末净值相对 asof 前第 5 个交易日；
-    - month_return：末净值 / 严格早于当月 1 日的最近交易日净值 - 1；
-    - year_return：末净值 / 严格早于当年 1 月 1 日的最近交易日净值 - 1。
+    滚动窗口收益（策略列表快照用库内最新末日；净值页传入 asof 则按查询区间末日）：
+    - last_5d_return：asof 相对前第 5 个交易日；
+    - month_return：asof 净值 / 严格早于 asof 当月 1 日的最近交易日净值 - 1；
+    - year_return：asof 净值 / 严格早于 asof 当年 1 月 1 日的最近交易日净值 - 1。
     """
     sid = str(strategy_id).strip()
     out: dict[str, float | None] = {
@@ -1699,7 +1699,7 @@ def _nav_list_summary_from_desc_rows(
 
     本期：末净值 / 调仓日（含）起首个交易日净值 - 1。
     本月/本年：末净值 / 严格早于月初、年初的最近交易日净值 - 1（与 nav-metrics 一致）；无锚定时为 None（不用 1.0 兜底）。
-    5日：末净值 / 前第 5 个交易日净值 - 1；nav-metrics「近5交易日」与此相同。
+    5日：末净值 / 前第 5 个交易日净值 - 1（仅策略列表快照；净值页按查询区间末日另算）。
     """
     if not rows_desc:
         return None
@@ -1811,7 +1811,7 @@ def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> 
 
 
 def _strategy_nav_list_summary(db: Session, strategy_id: str) -> dict:
-    """最新净值、本期（最近调仓日以来）、1日/5日（净值序列相邻交易日）、本月、本年收益；口径与净值页 nav-metrics 中月/年一致。"""
+    """策略列表快照专用：库内最新净值日的 1日/5日/本期/本月/本年。"""
     return _strategy_nav_list_summary_bounded(db, strategy_id)
 
 
@@ -2828,16 +2828,20 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
     ).mappings().first()
     latest_td = _api_trade_date_iso(td_row["d"]) if td_row else None
     if latest_td is None:
-        m_row = db.execute(
+        n_row = db.execute(
             text(
                 f"""
-                SELECT MAX(last_trade_date) AS d
-                FROM strategy_list_metrics
-                WHERE strategy_id IN ({quoted_visible})
+                SELECT MAX(z.td) AS d
+                FROM (
+                    SELECT {sql_max_date_expr("trade_date")} AS td
+                    FROM strategy_nav_daily
+                    WHERE strategy_id IN ({quoted_visible})
+                    GROUP BY strategy_id
+                ) z
                 """
             )
         ).mappings().first()
-        latest_td = _api_trade_date_iso(m_row["d"]) if m_row else None
+        latest_td = _api_trade_date_iso(n_row["d"]) if n_row else None
 
     def _build_top(strategy_ids: list[str], lim: int) -> list[dict]:
         """每个策略：最新 trade_date + 该日 MAX(rebalance_date) 的持仓（与 strategy_holdings 默认本期一致）。"""
@@ -3665,32 +3669,14 @@ def strategy_nav_metrics(
     if win_day_pairs:
         win_rate = sum(1 for dr, br in win_day_pairs if dr >= br) / len(win_day_pairs)
 
-    # 近5交易日/本月/本年：与策略列表一致，按库内最新净值日计算，不受图表 start/end 筛选影响
-    rolling = _nav_rolling_window_returns(db, strategy_id)
+    # 5日/本月/本年：按当前查询区间末日即时计算（不读 strategy_list_metrics）
+    as_of_td = _nav_list_trade_date_as_date(last["trade_date"])
+    rolling = _nav_rolling_window_returns(
+        db, strategy_id, last_td=as_of_td, last_nav=last_nav
+    )
     week_ret = rolling["last_5d_return"]
     month_ret = rolling["month_return"]
     year_ret = rolling["year_return"]
-    latest_row = (
-        db.execute(
-            text(
-                f"""
-                SELECT trade_date
-                FROM strategy_nav_daily
-                WHERE strategy_id=:sid
-                ORDER BY {sql_order_date_desc("trade_date")}
-                LIMIT 1
-                """
-            ),
-            {"sid": strategy_id},
-        )
-        .mappings()
-        .first()
-    )
-    as_of_td = (
-        _nav_list_trade_date_as_date(latest_row["trade_date"])
-        if latest_row
-        else None
-    )
 
     return {
         "ok": True,

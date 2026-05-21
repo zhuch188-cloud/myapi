@@ -1,4 +1,4 @@
-"""策略列表指标快照 strategy_list_metrics：一行一策略（PK=strategy_id），行数=终端列表可见策略数；仅在数据更新成功后全量重算写入。"""
+"""策略列表页专用快照 strategy_list_metrics（/api/strategies 只读）；净值页等指标不在此表。"""
 
 from __future__ import annotations
 
