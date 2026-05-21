@@ -2132,7 +2132,9 @@ def run_update(
                             lt_c = _compact_date(latest_trade)
                             if not ok_nav:
                                 raise RuntimeError(
-                                    f"{sid} 净值重建未完成（请查看服务端日志）"
+                                    f"{sid} 净值重建未完成（增量初始化失败："
+                                    "末净值日 Wind 行情缺失，或持仓快照与净值尺度不一致；"
+                                    "可先全量更新净值，或确认末净值日有持仓快照）"
                                 )
                             if nav_max_c and lt_c and nav_max_c < lt_c:
                                 raise RuntimeError(
@@ -2634,6 +2636,31 @@ def _eod_dict_to_day_map(
             dct[_compact_date(d)] = (clv, pcv)
         day_map[c] = dct
     return day_map
+
+
+def _eod_day_map_has_trade(
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    td_compact: str,
+    codes: list[str] | None = None,
+) -> bool:
+    """day_map 按 wind_code 索引；检查指定 compact 交易日是否至少有一只成分有有效收盘价。"""
+    td = str(td_compact or "").strip()[:8]
+    if not td or not day_map:
+        return False
+
+    def _ok(dct: dict[str, tuple[float | None, float | None]] | None) -> bool:
+        if not dct or td not in dct:
+            return False
+        cl, _ = dct[td]
+        return cl is not None and not (isinstance(cl, float) and cl != cl) and cl > 0
+
+    if codes:
+        for raw in codes:
+            c = str(raw or "").strip().upper()
+            if c and _ok(day_map.get(c)):
+                return True
+        return False
+    return any(_ok(dct) for dct in day_map.values())
 
 
 def _latest_rebalance_stock_count(rb_map: dict[date, list[tuple[str, float]]]) -> int:
@@ -3186,6 +3213,7 @@ def _nav_init_state_from_last_row(
         shares = _nav_snap_shares_from_holdings(
             holdings0, prev_mv, day_map, append_after_c, last_close_fill
         )
+    if shares:
         mv_chk = 0.0
         for sc2, sh in shares.items():
             if sh <= 0:
@@ -3193,13 +3221,14 @@ def _nav_init_state_from_last_row(
             px = _adj_close_td_ff(day_map, sc2, append_after_c, last_close_fill)
             if px is not None:
                 mv_chk += sh * px
-        if mv_chk > 0 and prev_mv > 0:
-            drift = abs(mv_chk - prev_mv) / prev_mv
-            if drift > 1e-6:
-                scale = prev_mv / mv_chk
-                shares = {sc: sh * scale for sc, sh in shares.items() if sh > 0}
-        elif mv_chk > 0 and prev_mv <= 0:
-            prev_mv = mv_chk
+        if mv_chk > 0:
+            if prev_mv is None or prev_mv <= 0:
+                prev_mv = mv_chk
+            else:
+                drift = abs(mv_chk - prev_mv) / prev_mv
+                if drift > 1e-6:
+                    scale = prev_mv / mv_chk
+                    shares = {sc: sh * scale for sc, sh in shares.items() if sh > 0}
     return rb_idx, current_rb, last_nav_d, shares, last_close_fill, prev_mv, bench_nav_acc
 
 
@@ -3472,9 +3501,9 @@ def _rebuild_nav_incremental_from_current_period(
             if bench_code and seg_bench_dm:
                 bench_day_map.update(seg_bench_dm)
             if not state_inited:
-                if append_after_c not in day_map and append_after_c not in seg_days:
+                if not _eod_day_map_has_trade(day_map, append_after_c, period_codes):
                     _log.warning(
-                        "nav incremental %s: append day %s missing in first segment",
+                        "nav incremental %s: append day %s missing EOD in segment",
                         sid,
                         append_after_c,
                     )
@@ -3599,7 +3628,7 @@ def _rebuild_nav_incremental_from_current_period(
     )
     day_map = _eod_dict_to_day_map(eod_by_code)
     eod_by_code.clear()
-    if append_after_c not in day_map:
+    if not _eod_day_map_has_trade(day_map, append_after_c, period_codes):
         day_map.clear()
         return False, wind
     (
