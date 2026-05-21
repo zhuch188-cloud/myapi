@@ -1502,6 +1502,34 @@ def _nav_list_period_rebalance_date(
     return current_rb
 
 
+def _nav_unit_trading_days_offset(
+    db: Session, strategy_id: str, asof: date, offset: int
+) -> float | None:
+    """asof（含）及之前第 offset 个交易日的 nav_unit；offset=5 与列表「5日」一致。"""
+    if offset < 0:
+        return None
+    row = db.execute(
+        text(
+            f"""
+            SELECT nav_unit
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("trade_date")} <= :acmp
+            ORDER BY {sql_order_date_desc("trade_date")}
+            LIMIT 1 OFFSET :off
+            """
+        ),
+        {"sid": strategy_id, "acmp": asof.strftime("%Y%m%d"), "off": int(offset)},
+    ).mappings().first()
+    if not row or row.get("nav_unit") is None:
+        return None
+    try:
+        v = float(row["nav_unit"])
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _nav_unit_last_before(db: Session, strategy_id: str, anchor_dt: date) -> float | None:
     """严格早于 anchor_dt 的最近一条 nav_unit（与净值页 nav-metrics 本月/本年锚定一致）。"""
     row = db.execute(
@@ -1540,7 +1568,20 @@ def _nav_anchor_nav_unit_before_rows(rows_desc: list[Any], anchor_dt: date) -> f
 
 
 def _nav_period_start_nav_from_rows(rows_asc: list[Any], period_rb: date) -> float | None:
-    """本期期初：调仓日（含）起首个交易日的 nav_unit（与页面说明一致）。"""
+    """本期期初：与净值页调仓期锚定一致（该 rebalance_date 首期首条净值）。"""
+    rb_key = period_rb.isoformat()[:10]
+    for r in rows_asc:
+        rb_raw = r.get("rebalance_date")
+        if rb_raw is None:
+            continue
+        if str(rb_raw).strip()[:10] != rb_key:
+            continue
+        try:
+            v = float(r["nav_unit"])
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            continue
     for r in rows_asc:
         td = _nav_list_trade_date_as_date(r["trade_date"])
         if td is not None and td >= period_rb:
@@ -1555,7 +1596,13 @@ def _nav_period_start_nav_from_rows(rows_asc: list[Any], period_rb: date) -> flo
 def _nav_period_start_nav_unit(
     db: Session, strategy_id: str, period_rb: date
 ) -> float | None:
-    """本期期初：调仓日（含）起首个交易日的 nav_unit（与页面说明一致）。"""
+    """本期期初：与净值页「本期」累计锚定一致（调仓期首条净值行）。"""
+    sd = period_rb.isoformat()
+    rk = _resolve_nav_rebalance_period_key(db, strategy_id, sd)
+    if rk:
+        nu, _ = _anchor_from_rebalance_period(db, strategy_id, rk)
+        if nu is not None and nu > 0:
+            return float(nu)
     rb_cmp = period_rb.strftime("%Y%m%d")
     row = db.execute(
         text(
@@ -1590,7 +1637,8 @@ def _nav_list_summary_from_desc_rows(
     返回 (last_nav, last_1d, last_5d_ret, period_ret, month_ret, year_ret)；无数据返回 None。
 
     本期：末净值 / 调仓日（含）起首个交易日净值 - 1。
-    本月/本年：末净值 / 严格早于月初、年初的最近交易日净值 - 1（与 nav-metrics 一致）。
+    本月/本年：末净值 / 严格早于月初、年初的最近交易日净值 - 1（与 nav-metrics 一致）；无锚定时为 None（不用 1.0 兜底）。
+    5日：末净值 / 前第 5 个交易日净值 - 1；nav-metrics「近5交易日」与此相同。
     """
     if not rows_desc:
         return None
@@ -1606,10 +1654,16 @@ def _nav_list_summary_from_desc_rows(
 
     anchor_m_nav = _nav_anchor_nav_unit_before_rows(rows_desc, month_cut)
     anchor_y_nav = _nav_anchor_nav_unit_before_rows(rows_desc, year_cut)
-    dm = _nav_metric_denominator(anchor_m_nav)
-    dy = _nav_metric_denominator(anchor_y_nav)
-    month_ret = last_nav / dm - 1.0
-    year_ret = last_nav / dy - 1.0
+    month_ret = (
+        last_nav / anchor_m_nav - 1.0
+        if anchor_m_nav is not None and anchor_m_nav > 0
+        else None
+    )
+    year_ret = (
+        last_nav / anchor_y_nav - 1.0
+        if anchor_y_nav is not None and anchor_y_nav > 0
+        else None
+    )
 
     last_5d_return = None
     if len(rows_desc) > 5:
@@ -1687,10 +1741,16 @@ def _strategy_nav_list_summary_bounded(db: Session, strategy_id: str) -> dict[st
     year_cut = date(last_td.year, 1, 1)
     anchor_m_nav = _nav_unit_last_before(db, sid, month_cut)
     anchor_y_nav = _nav_unit_last_before(db, sid, year_cut)
-    dm = _nav_metric_denominator(anchor_m_nav)
-    dy = _nav_metric_denominator(anchor_y_nav)
-    month_ret = last_nav / dm - 1.0
-    year_ret = last_nav / dy - 1.0
+    month_ret = (
+        last_nav / anchor_m_nav - 1.0
+        if anchor_m_nav is not None and anchor_m_nav > 0
+        else None
+    )
+    year_ret = (
+        last_nav / anchor_y_nav - 1.0
+        if anchor_y_nav is not None and anchor_y_nav > 0
+        else None
+    )
 
     max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
     period_ret = None
@@ -3630,18 +3690,17 @@ def strategy_nav_metrics(
     month_ret = None
     year_ret = None
     if end_td is not None and last_nav is not None and last_nav > 0:
-        week_start = end_td - timedelta(days=end_td.weekday())
         m_start = end_td.replace(day=1)
         y_start = end_td.replace(month=1, day=1)
-        base_w = _anchor_nav(week_start)
+        base_w = _nav_unit_trading_days_offset(db, strategy_id, end_td, 5)
         base_m = _anchor_nav(m_start)
         base_y = _anchor_nav(y_start)
-        dw = _nav_metric_denominator(base_w)
-        dm = _nav_metric_denominator(base_m)
-        dy = _nav_metric_denominator(base_y)
-        week_ret = last_nav / dw - 1.0
-        month_ret = last_nav / dm - 1.0
-        year_ret = last_nav / dy - 1.0
+        if base_w is not None and base_w > 0:
+            week_ret = last_nav / base_w - 1.0
+        if base_m is not None and base_m > 0:
+            month_ret = last_nav / base_m - 1.0
+        if base_y is not None and base_y > 0:
+            year_ret = last_nav / base_y - 1.0
 
     return {
         "ok": True,

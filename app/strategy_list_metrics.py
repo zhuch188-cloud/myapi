@@ -135,19 +135,46 @@ def refresh_strategy_list_metrics_cache(
 def ensure_strategy_list_metrics_for_list(
     db: Session, strategy_ids: list[str], *, do_commit: bool = True
 ) -> bool:
-    """列表接口：对尚无快照行的策略补算一次（部署后首次访问）。返回是否发生了补算。"""
+    """
+    列表接口：补算尚无快照的策略；若快照末日与净值表 MAX(trade_date) 不一致则重算（口径变更或更新后）。
+    返回是否发生了补算。
+    """
+    from app.main import _batch_nav_last_date_stock_count
+
     ids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
     if not ids:
         return False
     cached = _metrics_ids_with_cache(db, ids)
     missing = [s for s in ids if s not in cached]
-    if not missing:
+    nav_meta = _batch_nav_last_date_stock_count(db, ids)
+    stale: list[str] = []
+    if cached:
+        quoted = ",".join("'" + s.replace("'", "''") + "'" for s in cached)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT strategy_id, last_trade_date
+                FROM strategy_list_metrics
+                WHERE strategy_id IN ({quoted})
+                """
+            )
+        ).mappings().all()
+        for r in rows:
+            sid = str(r["strategy_id"]).strip()
+            m_td = str(r.get("last_trade_date") or "").strip()[:10]
+            n_td = str((nav_meta.get(sid) or {}).get("last_trade_date") or "").strip()[:10]
+            if n_td and m_td != n_td:
+                stale.append(sid)
+    to_refresh = list(dict.fromkeys(missing + stale))
+    if not to_refresh:
         return False
     try:
-        refresh_strategy_list_metrics_cache(db, missing, do_commit=do_commit)
+        refresh_strategy_list_metrics_cache(db, to_refresh, do_commit=do_commit)
         return True
     except Exception:
-        _log.exception("ensure strategy_list_metrics failed missing=%s", missing[:20])
+        _log.exception(
+            "ensure strategy_list_metrics failed ids=%s", to_refresh[:20]
+        )
         return False
 
 
