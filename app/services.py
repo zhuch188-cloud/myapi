@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import gc
 import json
@@ -767,6 +767,26 @@ def _last_nav_compact_for_update(db: Session, sid: str) -> str | None:
     return _nav_last_good_trade_compact(db, sid) or _strategy_nav_max_trade_compact(
         db, sid
     )
+
+
+def _needs_holding_snapshot_before_nav_incremental(
+    db: Session,
+    sid: str,
+    rb_positions: list[tuple[date, list[Any]]],
+) -> bool:
+    """
+    末净值存在但缺「锚定调仓期」持仓快照时，须先写持仓再跑增量净值。
+    否则 bootstrap 只能用 strategy_positions 静态权重，与已漂移的 nav_unit 尺度不一致。
+    """
+    last_nav_c = _last_nav_compact_for_update(db, sid)
+    if not last_nav_c or len(last_nav_c) < 8:
+        return False
+    rb_sorted = [d for d, _ in rb_positions if d is not None]
+    if not rb_sorted:
+        return False
+    last_nav_d = datetime.strptime(last_nav_c[:8], "%Y%m%d").date()
+    _, anchor_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d)
+    return not _nav_holding_snapshot_on_day(db, sid, anchor_rb, last_nav_c)
 
 
 def _holding_incremental_scope(
@@ -2132,9 +2152,9 @@ def run_update(
                             lt_c = _compact_date(latest_trade)
                             if not ok_nav:
                                 raise RuntimeError(
-                                    f"{sid} 净值重建未完成（增量初始化失败："
-                                    "末净值日 Wind 行情缺失，或持仓快照与净值尺度不一致；"
-                                    "可先全量更新净值，或确认末净值日有持仓快照）"
+                                    f"{sid} 净值重建未完成（增量与自动全量回退均失败："
+                                    "请确认 Wind 可用；或勾选「全量重算净值」后重试；"
+                                    "末净值日缺持仓快照时须先更新持仓）"
                                 )
                             if nav_max_c and lt_c and nav_max_c < lt_c:
                                 raise RuntimeError(
@@ -4363,11 +4383,29 @@ def _rebuild_nav_for_strategy(
         if ok_inc:
             return True, wind
         _log.warning(
-            "nav incremental %s: failed after append %s; no full replay (Turso/Wind 增量专用)",
+            "nav incremental %s: failed after append %s; fallback to full nav rebuild",
             sid,
             append_after_c,
         )
-        return False, wind
+        if sync_job_id is not None:
+            _admin_sync_job_touch(
+                sync_job_id,
+                "nav",
+                f"{sid}：增量净值 bootstrap 失败，改为全量重算净值（删库后从首日复算）…",
+                db=db,
+                do_commit=True,
+            )
+        return _rebuild_nav_for_strategy(
+            db,
+            wind,
+            sid,
+            _mode_l,
+            latest_trade_c_cached=latest_trade_c_cached,
+            mysql_plan=mysql_plan,
+            wind_bundle=wind_bundle,
+            sync_job_id=sync_job_id,
+            nav_full_rebuild=True,
+        )
 
     yearly_start = start_c
     n_codes = len(code_set)

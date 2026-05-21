@@ -153,6 +153,10 @@
           <button class="secondary" onclick="importSelected('incremental')">仅增量导入 Excel（勾选）</button>
           <button class="secondary" onclick="importSelected('full')">仅全量导入 Excel（勾选）</button>
           <button class="secondary" onclick="updateLatestSelected()">仅更新最新交易日（勾选）</button>
+          <label class="muted" style="font-size:12px;margin-left:8px;">
+            <input type="checkbox" id="chkUpdateFullRefresh" />
+            全量重算净值（删库后从首日复算；增量 bootstrap 失败时建议勾选）
+          </label>
           <button class="secondary" onclick="deleteSelected()">删除策略（勾选）</button>
           <span id="selectedInfo" class="muted">已勾选 0 个</span>
           <span id="jobMsg" class="muted"></span>
@@ -729,10 +733,14 @@
         if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
         try {
           msg.textContent = "正在更新最新交易日数据…";
-          const ret = await api(`/api/admin/update`, {
+          const fullRefresh = !!document.getElementById("chkUpdateFullRefresh")?.checked;
+          const ret = await api(
+            `/api/admin/update?full_refresh=${fullRefresh ? "true" : "false"}`,
+            {
             method: "POST",
             body: JSON.stringify({ strategy_ids: ids })
-          });
+            }
+          );
           const targetId = ret.job_id;
           if (targetId == null) {
             msg.textContent = "接口未返回 job_id，请升级后端";
