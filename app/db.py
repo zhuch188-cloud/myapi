@@ -264,7 +264,17 @@ def create_app_engine():
     return eng
 
 
+def _sqlite_table_exists(conn, table: str) -> bool:
+    row = conn.execute(
+        text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:t LIMIT 1"),
+        {"t": table},
+    ).first()
+    return row is not None
+
+
 def _sqlite_table_columns(conn, table: str) -> set[str]:
+    if not _sqlite_table_exists(conn, table):
+        return set()
     rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
     return {str(r[1]) for r in rows}
 
@@ -283,7 +293,6 @@ def _apply_runtime_schema_migrations(conn) -> None:
     _sqlite_add_column_if_missing(conn, "admin_sync_jobs", "checkpoint_json", "TEXT NULL")
     _sqlite_add_column_if_missing(conn, "admin_sync_jobs", "progress_at", "TEXT NULL")
     _sqlite_add_column_if_missing(conn, "strategy_update_jobs", "progress_at", "TEXT NULL")
-    _sqlite_add_column_if_missing(conn, "strategy_import_jobs", "progress_at", "TEXT NULL")
     conn.execute(
         text(
             """
@@ -300,7 +309,8 @@ def _apply_runtime_schema_migrations(conn) -> None:
                 triggered_by TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
                 started_at TEXT NULL,
-                finished_at TEXT NULL
+                finished_at TEXT NULL,
+                progress_at TEXT NULL
             )
             """
         )
@@ -315,6 +325,7 @@ def _apply_runtime_schema_migrations(conn) -> None:
             "CREATE INDEX IF NOT EXISTS idx_strategy_import_created ON strategy_import_jobs (created_at)"
         )
     )
+    _sqlite_add_column_if_missing(conn, "strategy_import_jobs", "progress_at", "TEXT NULL")
     conn.execute(
         text(
             """
@@ -819,6 +830,42 @@ _SCHEMA_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_admin_sync_status ON admin_sync_jobs (status)",
     "CREATE INDEX IF NOT EXISTS idx_admin_sync_created ON admin_sync_jobs (created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS strategy_import_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL DEFAULT 'QUEUED',
+        import_mode TEXT NOT NULL,
+        strategy_ids_json TEXT NOT NULL,
+        completed_strategy_ids_json TEXT NOT NULL DEFAULT '[]',
+        imported_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        errors_json TEXT NULL,
+        message TEXT NULL,
+        triggered_by TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        started_at TEXT NULL,
+        finished_at TEXT NULL,
+        progress_at TEXT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_strategy_import_status ON strategy_import_jobs (status)",
+    "CREATE INDEX IF NOT EXISTS idx_strategy_import_created ON strategy_import_jobs (created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS client_feedback_submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (kind IN ('contact', 'feedback')),
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        contact_info TEXT NULL,
+        user_id INTEGER NULL,
+        username TEXT NULL,
+        is_public_guest INTEGER NOT NULL DEFAULT 0,
+        client_ip TEXT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_client_fb_kind_created "
+    "ON client_feedback_submissions (kind, created_at)",
     """
     CREATE TABLE IF NOT EXISTS strategy_nav_daily (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
