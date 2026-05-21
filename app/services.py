@@ -3160,8 +3160,95 @@ def _nav_shares_from_holding_snapshot(
         if px is None or px <= 0:
             px = _adj_close_td_ff(day_map, sc, td_compact, last_close_fill) or 0.0
         if px > 0:
+            last_close_fill[sc] = float(px)
             shares[sc] = prev_mv * w / px
     return shares if shares else None
+
+
+def _nav_holding_snapshot_on_day(
+    db: Session, sid: str, rebalance: date, td_compact: str
+) -> bool:
+    """末净值日是否有该调仓期的 strategy_holding_daily 快照（可不用 Wind 复权价做 bootstrap）。"""
+    td = str(td_compact or "").strip()[:8]
+    if not td or len(td) < 8:
+        return False
+    rb_iso = rebalance.isoformat()
+    rb_cmp = rb_iso.replace("-", "")
+    td_iso = datetime.strptime(td, "%Y%m%d").date().isoformat()
+    n = int(
+        db.execute(
+            text(
+                f"""
+                SELECT COUNT(*) FROM strategy_holding_daily
+                WHERE strategy_id=:sid
+                  AND rebalance_date IN (:rb_iso, :rb_cmp)
+                  AND (
+                    trade_date = :td_iso
+                    OR {sql_date_compact_expr("trade_date")} = :td_cmp
+                  )
+                """
+            ),
+            {
+                "sid": sid,
+                "rb_iso": rb_iso,
+                "rb_cmp": rb_cmp,
+                "td_iso": td_iso,
+                "td_cmp": td,
+            },
+        ).scalar()
+        or 0
+    )
+    return n > 0
+
+
+def _nav_incremental_eod_ready(
+    db: Session,
+    sid: str,
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    append_after_c: str,
+    rb_on_last_nav: date,
+    period_codes: list[str],
+    sim_days: list[str],
+) -> tuple[bool, str]:
+    """
+    增量净值 Wind 窗口校验：
+    - 末净值日：有 EOD 或有持仓快照即可 bootstrap；
+    - 待补写首日：必须有 EOD（否则无法模拟下一交易日）。
+    """
+    has_snap = _nav_holding_snapshot_on_day(db, sid, rb_on_last_nav, append_after_c)
+    has_append_eod = _eod_day_map_has_trade(day_map, append_after_c, period_codes)
+    if not has_append_eod and not has_snap:
+        return False, f"末净值日 {append_after_c} 无 Wind 行情且无持仓快照"
+    if sim_days:
+        first_sim = sim_days[0]
+        if not _eod_day_map_has_trade(day_map, first_sim, period_codes):
+            return False, f"待补写首日 {first_sim} 无 Wind 行情"
+    return True, ""
+
+
+def _nav_rescale_shares_to_notional(
+    shares: dict[str, float],
+    target_mv: float,
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    td_compact: str,
+    last_close_fill: dict[str, float],
+) -> dict[str, float]:
+    """按可用收盘价（Wind 或快照价 last_close_fill）把股数缩放到目标组合市值。"""
+    if target_mv <= 0 or not shares:
+        return shares
+    mv = 0.0
+    for sc, sh in shares.items():
+        if sh is None or sh <= 0:
+            continue
+        px = _adj_close_td_ff(day_map, sc, td_compact, last_close_fill)
+        if px is not None:
+            mv += sh * px
+    if mv <= 0:
+        return shares
+    scale = target_mv / mv
+    if abs(scale - 1.0) <= 1e-9:
+        return shares
+    return {sc: sh * scale for sc, sh in shares.items() if sh and sh > 0}
 
 
 def _nav_init_state_from_last_row(
@@ -3215,22 +3302,10 @@ def _nav_init_state_from_last_row(
         shares = _nav_snap_shares_from_holdings(
             holdings0, prev_mv, day_map, append_after_c, last_close_fill
         )
-    if shares:
-        mv_chk = 0.0
-        for sc2, sh in shares.items():
-            if sh is None or sh <= 0:
-                continue
-            px = _adj_close_td_ff(day_map, sc2, append_after_c, last_close_fill)
-            if px is not None:
-                mv_chk += sh * px
-        if mv_chk > 0:
-            if prev_mv is None or prev_mv <= 0:
-                prev_mv = mv_chk
-            else:
-                drift = abs(mv_chk - prev_mv) / prev_mv
-                if drift > 1e-6:
-                    scale = prev_mv / mv_chk
-                    shares = {sc: sh * scale for sc, sh in shares.items() if sh > 0}
+    if shares and prev_mv is not None and prev_mv > 0:
+        shares = _nav_rescale_shares_to_notional(
+            shares, prev_mv, day_map, append_after_c, last_close_fill
+        )
     return rb_idx, current_rb, last_nav_d, shares, last_close_fill, prev_mv, bench_nav_acc
 
 
@@ -3264,6 +3339,39 @@ def _nav_init_matches_last_row(
         return False
     nu_calc = mv / ic0
     return abs(nu_calc - nu_db) / nu_db <= tol
+
+
+def _nav_init_mismatch_detail(
+    row_last: Any | None,
+    shares: dict[str, float],
+    day_map: dict,
+    append_after_c: str,
+    last_close_fill: dict[str, float],
+    ic0: float,
+) -> str:
+    if not row_last or not shares or ic0 <= 0:
+        return "empty row/shares"
+    try:
+        nu_db = float(row_last.get("nav_unit") or 0)
+    except (TypeError, ValueError):
+        return "nav_unit invalid"
+    mv = 0.0
+    priced = 0
+    for sc, sh in shares.items():
+        if sh is None or sh <= 0:
+            continue
+        px = _adj_close_td_ff(day_map, sc, append_after_c, last_close_fill)
+        if px is not None:
+            mv += sh * px
+            priced += 1
+    if mv <= 0:
+        return f"nu_db={nu_db:.6f} priced_stocks=0/{len(shares)}"
+    nu_calc = mv / ic0
+    rel = abs(nu_calc - nu_db) / nu_db if nu_db > 0 else 0.0
+    return (
+        f"nu_db={nu_db:.6f} nu_calc={nu_calc:.6f} rel_err={rel:.4f} "
+        f"priced={priced}/{len(shares)}"
+    )
 
 
 def _nav_fetch_row_on_day(db: Session, sid: str, td_compact: str) -> Any | None:
@@ -3503,12 +3611,17 @@ def _rebuild_nav_incremental_from_current_period(
             if bench_code and seg_bench_dm:
                 bench_day_map.update(seg_bench_dm)
             if not state_inited:
-                if not _eod_day_map_has_trade(day_map, append_after_c, period_codes):
-                    _log.warning(
-                        "nav incremental %s: append day %s missing EOD in segment",
-                        sid,
-                        append_after_c,
-                    )
+                ok_eod, eod_reason = _nav_incremental_eod_ready(
+                    db,
+                    sid,
+                    day_map,
+                    append_after_c,
+                    anchor_rb,
+                    period_codes,
+                    sim_days,
+                )
+                if not ok_eod:
+                    _log.warning("nav incremental %s: %s", sid, eod_reason)
                     return False, wind
                 (
                     sim_rb_idx,
@@ -3532,14 +3645,25 @@ def _rebuild_nav_incremental_from_current_period(
                 prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
                     append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
                 )
+                if shares and prev_mv is not None and prev_mv > 0:
+                    shares = _nav_rescale_shares_to_notional(
+                        shares, prev_mv, day_map, append_after_c, last_close_fill
+                    )
                 if not _nav_init_matches_last_row(
                     row_last, shares, day_map, append_after_c, last_close_fill, ic0
                 ):
                     _log.warning(
-                        "nav incremental %s: init nav mismatch on %s "
-                        "(no holding snapshot on/before that day?); abort",
+                        "nav incremental %s: init nav mismatch on %s (%s)",
                         sid,
                         append_after_c,
+                        _nav_init_mismatch_detail(
+                            row_last,
+                            shares,
+                            day_map,
+                            append_after_c,
+                            last_close_fill,
+                            ic0,
+                        ),
                     )
                     return False, wind
                 state_inited = True
@@ -3630,7 +3754,17 @@ def _rebuild_nav_incremental_from_current_period(
     )
     day_map = _eod_dict_to_day_map(eod_by_code)
     eod_by_code.clear()
-    if not _eod_day_map_has_trade(day_map, append_after_c, period_codes):
+    ok_eod, eod_reason = _nav_incremental_eod_ready(
+        db,
+        sid,
+        day_map,
+        append_after_c,
+        anchor_rb,
+        period_codes,
+        sim_days,
+    )
+    if not ok_eod:
+        _log.warning("nav incremental %s: %s", sid, eod_reason)
         day_map.clear()
         return False, wind
     (
@@ -3655,14 +3789,20 @@ def _rebuild_nav_incremental_from_current_period(
     prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
         append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
     )
+    if shares and prev_mv is not None and prev_mv > 0:
+        shares = _nav_rescale_shares_to_notional(
+            shares, prev_mv, day_map, append_after_c, last_close_fill
+        )
     if not _nav_init_matches_last_row(
         row_last, shares, day_map, append_after_c, last_close_fill, ic0
     ):
         _log.warning(
-            "nav incremental %s: init nav mismatch on %s "
-            "(no holding snapshot on/before that day?); abort",
+            "nav incremental %s: init nav mismatch on %s (%s)",
             sid,
             append_after_c,
+            _nav_init_mismatch_detail(
+                row_last, shares, day_map, append_after_c, last_close_fill, ic0
+            ),
         )
         day_map.clear()
         return False, wind
