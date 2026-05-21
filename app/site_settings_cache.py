@@ -39,6 +39,11 @@ def patch_key(key: str, value: str) -> None:
         _snapshot[str(key)] = str(value).strip()
 
 
+def snapshot_dict() -> dict[str, str]:
+    with _lock:
+        return dict(_snapshot) if _snapshot is not None else {}
+
+
 def has_snapshot() -> bool:
     with _lock:
         return _snapshot is not None

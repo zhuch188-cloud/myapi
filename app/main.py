@@ -1719,51 +1719,13 @@ def _require_visible_strategy(db: Session, strategy_id: str) -> dict:
 
 
 _SCHEDULED_UPDATE_MAX_ATTEMPTS = 5
-"""每日定时任务内，单次调度最多执行更新次数（含首次）；失败后间隔几秒再试，避免瞬时故障。"""
-_SCHEDULED_UPDATE_RETRY_SLEEP_SEC = 8
+"""兼容旧引用；运行时以 site_settings / 环境变量为准。"""
 
 
 def _scheduled_update():
-    from app.db import SessionLocalFactory
-    import logging
+    from app.scheduled_update_config import run_update_with_retries
 
-    import app.services as _svc
-
-    log = logging.getLogger(__name__)
-    if not wind_sql.use_remote_sqlserver():
-        log.warning("Skip scheduled update: Wind SQL Server not configured or unavailable")
-        return
-    if _svc._job_running:
-        log.info("Skip scheduled update: run_update already active (manual sync/update in progress)")
-        return
-
-    last_exc: BaseException | None = None
-    for attempt in range(1, _SCHEDULED_UPDATE_MAX_ATTEMPTS + 1):
-        db = SessionLocalFactory()
-        try:
-            run_update(db, "SCHEDULED", "system")
-            if attempt > 1:
-                log.info("Scheduled update succeeded on attempt %s/%s", attempt, _SCHEDULED_UPDATE_MAX_ATTEMPTS)
-            return
-        except Exception as ex:
-            last_exc = ex
-            log.warning(
-                "Scheduled update attempt %s/%s failed: %s",
-                attempt,
-                _SCHEDULED_UPDATE_MAX_ATTEMPTS,
-                ex,
-                exc_info=attempt >= _SCHEDULED_UPDATE_MAX_ATTEMPTS,
-            )
-        finally:
-            db.close()
-        if attempt < _SCHEDULED_UPDATE_MAX_ATTEMPTS:
-            time.sleep(_SCHEDULED_UPDATE_RETRY_SLEEP_SEC)
-
-    log.error(
-        "Scheduled update exhausted %s attempts; last error: %s",
-        _SCHEDULED_UPDATE_MAX_ATTEMPTS,
-        last_exc,
-    )
+    run_update_with_retries("SCHEDULED", "system", log_prefix="Scheduled update")
 
 
 @app.get("/health/live")
@@ -5421,6 +5383,105 @@ def admin_access_overview(
         "client_allow_register": _client_register_allowed(db),
         "client_contact_enabled": _client_contact_enabled(db),
         "client_feedback_enabled": _client_feedback_enabled(db),
+    }
+
+
+@app.get("/api/admin/scheduled-update-settings")
+def admin_get_scheduled_update_settings(
+    user=Depends(require_roles("admin", "editor")),
+):
+    from app.scheduled_update_config import (
+        next_daily_update_run_iso,
+        scheduled_update_config_payload,
+    )
+
+    return {
+        "ok": True,
+        **scheduled_update_config_payload(
+            next_run_at=next_daily_update_run_iso(scheduler),
+        ),
+    }
+
+
+@app.post("/api/admin/scheduled-update-settings")
+def admin_save_scheduled_update_settings(
+    payload: dict,
+    request: Request,
+    user=Depends(require_roles("admin")),
+    db: Session = Depends(get_session),
+):
+    from app.boot import reschedule_daily_update_job
+    from app.scheduled_update_config import (
+        DAILY_JOB_CRON_KEY,
+        RESTART_AUTO_UPDATE_KEY,
+        SCHEDULED_UPDATE_MAX_ATTEMPTS_KEY,
+        SCHEDULED_UPDATE_RETRY_SLEEP_KEY,
+        build_daily_job_cron,
+        next_daily_update_run_iso,
+        restart_auto_update_enabled,
+        scheduled_update_config_payload,
+    )
+
+    p = payload or {}
+    detail_audit: dict[str, Any] = {}
+    if any(k in p for k in ("hour", "minute", "weekdays", "daily_job_cron")):
+        if "daily_job_cron" in p and str(p.get("daily_job_cron") or "").strip():
+            cron = str(p["daily_job_cron"]).strip()
+        else:
+            wd_raw = p.get("weekdays")
+            weekdays: list[int] = []
+            if isinstance(wd_raw, list):
+                for x in wd_raw:
+                    try:
+                        weekdays.append(int(x))
+                    except (TypeError, ValueError):
+                        pass
+            if not weekdays:
+                weekdays = list(range(5))
+            cron = build_daily_job_cron(
+                p.get("minute", 0),
+                p.get("hour", 17),
+                weekdays,
+            )
+        _site_setting_upsert(db, DAILY_JOB_CRON_KEY, cron)
+        detail_audit["daily_job_cron"] = cron
+    if "max_attempts" in p:
+        try:
+            n = max(1, min(20, int(p.get("max_attempts") or 5)))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="max_attempts invalid")
+        _site_setting_upsert(db, SCHEDULED_UPDATE_MAX_ATTEMPTS_KEY, str(n))
+        detail_audit["max_attempts"] = n
+    if "retry_sleep_sec" in p:
+        try:
+            sec = max(1, min(600, int(p.get("retry_sleep_sec") or 8)))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="retry_sleep_sec invalid")
+        _site_setting_upsert(db, SCHEDULED_UPDATE_RETRY_SLEEP_KEY, str(sec))
+        detail_audit["retry_sleep_sec"] = sec
+    if "restart_auto_update" in p:
+        raw_ra = p.get("restart_auto_update")
+        if isinstance(raw_ra, str):
+            ra_on = raw_ra.strip().lower() not in ("0", "false", "no", "off", "")
+        else:
+            ra_on = bool(raw_ra)
+        _site_setting_upsert(db, RESTART_AUTO_UPDATE_KEY, "1" if ra_on else "0")
+        detail_audit["restart_auto_update"] = ra_on
+    if detail_audit:
+        _audit_log(
+            db,
+            action="admin_scheduled_update_settings",
+            actor_user_id=user.get("id"),
+            detail=detail_audit,
+            request=request,
+        )
+        db.commit()
+        reschedule_daily_update_job(scheduler, _scheduled_update)
+    return {
+        "ok": True,
+        **scheduled_update_config_payload(
+            next_run_at=next_daily_update_run_iso(scheduler),
+        ),
     }
 
 

@@ -209,6 +209,18 @@ def refresh_strategy_list_metrics_one(
     refresh_strategy_list_metrics_cache(db, [sid], do_commit=do_commit)
 
 
+def refresh_strategy_list_metrics_safe(
+    db: Session, strategy_id: str, *, do_commit: bool = False
+) -> None:
+    """写快照失败只记日志，不中断 run_update。"""
+    try:
+        refresh_strategy_list_metrics_one(db, strategy_id, do_commit=do_commit)
+    except Exception:
+        _log.exception(
+            "strategy_list_metrics refresh failed sid=%s", strategy_id
+        )
+
+
 def prune_strategy_list_metrics_orphans(db: Session, *, do_commit: bool = True) -> int:
     """全量任务收尾：删除已不在列表中的策略快照行（不重复重算指标）。"""
     ids = _enabled_visible_strategy_ids(db)

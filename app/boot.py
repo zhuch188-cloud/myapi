@@ -7,14 +7,17 @@ import threading
 from typing import Any, Callable
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import text
 
-from app.config import settings
 from app.db import init_database
+from app.scheduled_update_config import (
+    daily_job_cron_value,
+    register_daily_update_job,
+    resume_interrupted_update_after_restart,
+)
 from app.sql_dialect import sql_now
-from app.timeutil import BEIJING_TZ
 from app import wind_sql
+from app.bg_threads import spawn_daemon
 
 _log = logging.getLogger(__name__)
 _lock = threading.Lock()
@@ -30,27 +33,34 @@ def boot_error() -> str | None:
     return str(err) if err else None
 
 
-def _clear_stale_jobs() -> None:
+def _clear_stale_jobs() -> bool:
+    """清理僵尸任务；若曾存在 RUNNING 的 strategy_update_jobs 则返回 True。"""
     from app.db import SessionLocalFactory, turso_stream_lock
 
     if SessionLocalFactory is None:
-        return
+        return False
     with turso_stream_lock():
         db = SessionLocalFactory()
         try:
-            _clear_stale_jobs_on_session(db)
+            return _clear_stale_jobs_on_session(db)
         finally:
             db.close()
 
 
-def _clear_stale_jobs_on_session(db) -> None:
+def _clear_stale_jobs_on_session(db) -> bool:
+    had_running_update = (
+        db.execute(
+            text("SELECT 1 FROM strategy_update_jobs WHERE status='RUNNING' LIMIT 1")
+        ).first()
+        is not None
+    )
     try:
         db.execute(
             text(
                 f"""
                 UPDATE strategy_update_jobs
                 SET status='FAILED', finished_at={sql_now()},
-                    message='stale RUNNING cleared on server startup'
+                    message='stale RUNNING cleared on server startup（重启后将自动重新执行更新）'
                 WHERE status='RUNNING'
                 """
             )
@@ -99,26 +109,23 @@ def _clear_stale_jobs_on_session(db) -> None:
     except Exception:
         db.rollback()
         raise
+    return had_running_update
 
 
 def _start_scheduler(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None]) -> None:
-    cron_raw = (settings.daily_job_cron or "").split()
-    if len(cron_raw) != 5:
+    cron = daily_job_cron_value()
+    if not register_daily_update_job(scheduler, scheduled_fn, cron):
         _log.warning(
-            "DAILY_JOB_CRON 格式无效（需 5 段：分 时 日 月 星期），已跳过定时任务: %r",
-            settings.daily_job_cron,
+            "定时任务 Cron 无效（需 5 段：分 时 日 月 星期，且日/月为 *）：%r",
+            cron,
         )
-        return
-    trigger = CronTrigger(
-        minute=cron_raw[0],
-        hour=cron_raw[1],
-        day=cron_raw[2],
-        month=cron_raw[3],
-        day_of_week=cron_raw[4],
-        timezone=BEIJING_TZ,
-    )
-    scheduler.add_job(scheduled_fn, trigger=trigger, id="daily_update", replace_existing=True)
-    scheduler.start()
+
+
+def reschedule_daily_update_job(
+    scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None]
+) -> bool:
+    """保存仪表盘配置后热更新 APScheduler（无需重启进程）。"""
+    return register_daily_update_job(scheduler, scheduled_fn, daily_job_cron_value())
 
 
 def _boot_worker(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None]) -> None:
@@ -129,7 +136,7 @@ def _boot_worker(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None
             wind_sql.init_wind_backend()
         except Exception as e:
             _log.warning("Wind 初始化异常（已忽略）: %s", e)
-        _clear_stale_jobs()
+        interrupted_update = _clear_stale_jobs()
         import app.services as _svc
         from app.db import SessionLocalFactory, turso_stream_lock
         from app.site_settings_cache import reload_from_session
@@ -144,6 +151,9 @@ def _boot_worker(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None
         _start_scheduler(scheduler, scheduled_fn)
         _state["ready"] = True
         _log.info("后台启动：数据库与调度器已就绪")
+        if interrupted_update:
+            _log.info("检测到重启前未完成的更新任务，将自动续跑 run_update")
+            spawn_daemon("restart-resume-update", resume_interrupted_update_after_restart)
     except Exception as e:
         _state["error"] = str(e)
         _log.critical(

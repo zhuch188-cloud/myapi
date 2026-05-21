@@ -531,6 +531,38 @@ def init_database() -> None:
                 """
             )
         )
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO site_settings (setting_key, setting_value)
+                VALUES ('daily_job_cron', '0 17 * * 0-4')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO site_settings (setting_key, setting_value)
+                VALUES ('scheduled_update_max_attempts', '5')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO site_settings (setting_key, setting_value)
+                VALUES ('scheduled_update_retry_sleep_sec', '8')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO site_settings (setting_key, setting_value)
+                VALUES ('restart_auto_update_enabled', '1')
+                """
+            )
+        )
         _def_path = (settings.supplement_company_excel_path or "").strip() or str(
             Path(settings.strategy_root_dir) / "数据" / "公司资料.xlsx"
         )

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import gc
 import json
@@ -1241,10 +1241,13 @@ def _run_update_try_build_work_item(
                 _job_progress(
                     db,
                     job_id,
-                    f"{sid}：增量跳过（行情日={trade_date} 持仓与净值均已齐）",
+                    f"{sid}：增量跳过（行情日={trade_date} 持仓与净值均已齐），刷新列表指标快照…",
                     do_commit=do_commit,
                     sync_job_id=sync_job_id,
                 )
+                from app.strategy_list_metrics import refresh_strategy_list_metrics_safe
+
+                refresh_strategy_list_metrics_safe(db, sid, do_commit=do_commit)
                 return None
             _job_progress(
                 db,
@@ -2171,15 +2174,9 @@ def run_update(
                     db.commit()
 
             if skip_holdings:
-                try:
-                    from app.strategy_list_metrics import refresh_strategy_list_metrics_one
+                from app.strategy_list_metrics import refresh_strategy_list_metrics_safe
 
-                    refresh_strategy_list_metrics_one(db, sid, do_commit=do_commit)
-                except Exception:
-                    _log.exception(
-                        "strategy_list_metrics refresh failed sid=%s (skip_holdings)",
-                        sid,
-                    )
+                refresh_strategy_list_metrics_safe(db, sid, do_commit=do_commit)
                 _release_run_update_strategy_memory(
                     eod_by_code={},
                     index_eod_by_code={},
@@ -2474,12 +2471,9 @@ def run_update(
                 if sync_job_id is None:
                     prog(f"[{i_active}/{n_active}] {sid}：持仓处理完成")
                 db.commit()
-            try:
-                from app.strategy_list_metrics import refresh_strategy_list_metrics_one
+            from app.strategy_list_metrics import refresh_strategy_list_metrics_safe
 
-                refresh_strategy_list_metrics_one(db, sid, do_commit=do_commit)
-            except Exception:
-                _log.exception("strategy_list_metrics refresh failed sid=%s", sid)
+            refresh_strategy_list_metrics_safe(db, sid, do_commit=do_commit)
             _release_run_update_strategy_memory(
                 eod_by_code=eod_by_code,
                 index_eod_by_code=index_eod_by_code,

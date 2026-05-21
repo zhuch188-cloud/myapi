@@ -100,6 +100,37 @@
       </div>
 
       <div class="card">
+        <h4 style="margin:0 0 8px;">自动数据更新（定时任务）</h4>
+        <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.5;">
+          在设定时间自动执行与「持仓与更新」相同的 <code>run_update</code>（需 Wind 可用）。
+          <strong>重试</strong>在单次定时触发或<strong>重启自动续跑</strong>内连续进行（次数与间隔见下）。
+          若更新进行中服务<strong>重启</strong>：该任务会标为失败，并在启动约 15 秒后<strong>自动重新执行更新</strong>（可下方关闭）；错过的 Cron 定时点仍不补跑。
+        </p>
+        <div class="row" style="align-items:flex-end;flex-wrap:wrap;gap:12px 20px;">
+          <label style="font-size:14px;">执行时间（北京时间）<br />
+            <input type="time" id="schedTime" style="margin-top:4px;padding:8px 10px;border:1px solid #ccd3de;border-radius:8px;" />
+          </label>
+          <div>
+            <div class="muted" style="font-size:12px;margin-bottom:4px;">星期（APScheduler：周一=0）</div>
+            <div class="row" id="schedWeekdays" style="gap:8px;"></div>
+          </div>
+          <label style="font-size:14px;">失败重试次数<br />
+            <input type="number" id="schedMaxAttempts" min="1" max="20" style="width:72px;margin-top:4px;padding:8px;border:1px solid #ccd3de;border-radius:8px;" />
+          </label>
+          <label style="font-size:14px;">重试间隔（秒）<br />
+            <input type="number" id="schedRetrySleep" min="1" max="600" style="width:88px;margin-top:4px;padding:8px;border:1px solid #ccd3de;border-radius:8px;" />
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer;padding-bottom:8px;">
+            <input type="checkbox" id="schedRestartAuto" checked />
+            重启后自动续跑被中断的更新
+          </label>
+          <button type="button" class="secondary" onclick="saveScheduledUpdateSettings()">保存定时设置</button>
+        </div>
+        <p class="muted" id="schedMeta" style="margin:10px 0 0;font-size:12px;line-height:1.5;"></p>
+        <span id="schedMsg" class="muted"></span>
+      </div>
+
+      <div class="card">
         <h4 style="margin:0 0 8px;">前台访客访问</h4>
         <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.45;">
           勾选「须先显示登录页」时，未登录用户打开策略展示会先进入登录页（默认）。取消勾选后，同一浏览器可通过设备静默获得会话并直接进入策略列表（后台仍会创建或绑定 viewer 账号，便于统计与需登录的接口）。
@@ -186,6 +217,69 @@
         const fail = w.fail ?? 0;
         return `${ok} / ${fail}`;
       }
+      const SCHED_WD_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+      function renderSchedWeekdays(selected) {
+        const box = document.getElementById("schedWeekdays");
+        if (!box) return;
+        const sel = new Set((selected || []).map(x => Number(x)));
+        box.innerHTML = SCHED_WD_LABELS.map((lab, i) =>
+          `<label style="font-size:13px;display:flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" class="sched-wd" value="${i}" ${sel.has(i) ? "checked" : ""} />${lab}
+          </label>`
+        ).join("");
+      }
+      function applyScheduledSettings(s) {
+        if (!s) return;
+        const h = String(s.hour ?? 17).padStart(2, "0");
+        const m = String(s.minute ?? 0).padStart(2, "0");
+        const tEl = document.getElementById("schedTime");
+        if (tEl) tEl.value = `${h}:${m}`;
+        renderSchedWeekdays(s.weekdays || [0, 1, 2, 3, 4]);
+        const aEl = document.getElementById("schedMaxAttempts");
+        if (aEl) aEl.value = String(s.max_attempts ?? 5);
+        const rEl = document.getElementById("schedRetrySleep");
+        if (rEl) rEl.value = String(s.retry_sleep_sec ?? 8);
+        const raEl = document.getElementById("schedRestartAuto");
+        if (raEl) raEl.checked = s.restart_auto_update !== false;
+        const meta = document.getElementById("schedMeta");
+        if (meta) {
+          const parts = [
+            s.cron_label ? `当前：${s.cron_label}` : "",
+            s.daily_job_cron ? `Cron：${s.daily_job_cron}` : "",
+            s.next_run_at ? `下次执行：${s.next_run_at}` : "下次执行：调度器未就绪",
+          ].filter(Boolean);
+          meta.textContent = parts.join(" · ");
+        }
+      }
+      async function saveScheduledUpdateSettings() {
+        const el = document.getElementById("schedMsg");
+        el.textContent = "";
+        try {
+          const timeVal = (document.getElementById("schedTime").value || "17:00").split(":");
+          const hour = parseInt(timeVal[0], 10);
+          const minute = parseInt(timeVal[1], 10);
+          const weekdays = Array.from(document.querySelectorAll(".sched-wd:checked")).map(x => parseInt(x.value, 10));
+          const maxAttempts = parseInt(document.getElementById("schedMaxAttempts").value, 10);
+          const retrySleep = parseInt(document.getElementById("schedRetrySleep").value, 10);
+          const restartAuto = document.getElementById("schedRestartAuto").checked;
+          const data = await api("/api/admin/scheduled-update-settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              hour,
+              minute,
+              weekdays,
+              max_attempts: maxAttempts,
+              retry_sleep_sec: retrySleep,
+              restart_auto_update: restartAuto,
+            }),
+          });
+          applyScheduledSettings(data);
+          el.textContent = "已保存（调度器已热更新，无需重启）";
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
       async function runSystemInit() {
         const el = document.getElementById("systemInitMsg");
         const pwdEl = document.getElementById("systemInitAdminPwd");
@@ -240,10 +334,11 @@
         const hint = document.getElementById("hint");
         try {
           hint.textContent = "加载中...";
-          const [cfg, jobs, access] = await Promise.all([
+          const [cfg, jobs, access, sched] = await Promise.all([
             api("/api/admin/strategies"),
             api("/api/admin/update-jobs"),
             api("/api/admin/access-overview"),
+            api("/api/admin/scheduled-update-settings"),
           ]);
           const items = cfg.items || [];
           const jobItems = (jobs.items || []).slice(0, 10);
@@ -291,6 +386,8 @@
           document.getElementById("clientContactEnabledChk").checked = access.client_contact_enabled !== false;
           document.getElementById("clientFeedbackEnabledChk").checked = !!access.client_feedback_enabled;
           document.getElementById("clientAccessMsg").textContent = "";
+          applyScheduledSettings(sched);
+          document.getElementById("schedMsg").textContent = "";
 
           hint.textContent = `刷新时间：${new Date().toLocaleString()}`;
         } catch (e) {

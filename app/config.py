@@ -45,7 +45,14 @@ class Settings(BaseSettings):
     # RUNNING 超过该分钟数且 progress_at 未更新，视为僵死，可续传
     supplement_import_stale_running_minutes: int = 12
     # 定时数据更新：分 时 日 月 星期（APScheduler：星期一=0，周一至周五为 0-4；触发时区见 app.timeutil.BEIJING_TZ）
+    # 可在后台首页仪表盘覆盖写入 site_settings；未配置时用此默认值
     daily_job_cron: str = "0 17 * * 0-4"
+    # 单次定时触发内失败后的重试次数（含首次）；间隔见 scheduled_update_retry_sleep_sec
+    scheduled_update_max_attempts: int = 5
+    scheduled_update_retry_sleep_sec: int = 8
+    # 服务重启前若有进行中的 strategy_update_jobs，启动后延迟 N 秒自动重新 run_update
+    restart_auto_update_enabled: bool = True
+    restart_auto_update_delay_sec: int = 15
     # 火山方舟（豆包等）：个股 AI 摘要等使用。ARK_MODEL 为控制台「推理接入点」ID（ep-xxx）或模型名
     ark_api_key: str = ""
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
