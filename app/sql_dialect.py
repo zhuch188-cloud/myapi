@@ -117,14 +117,16 @@ def list_table_column_names_lower(db: Session, table: str) -> set[str]:
 
 
 def _looks_like_date_only_string(s: str) -> bool:
+    """
+    是否将绑定参数规范为 YYYY-MM-DD（写入日期列）。
+    纯 8 位 YYYYMMDD 用于与 sql_date_compact_expr 比较，不得转为 ISO，
+    否则 '20260430' 与 '2026-05-01' 字典序比较会失真（本月/本年/5日锚定错误）。
+    """
     t = s.strip()
     if not t or len(t) > 32:
         return False
     head = t[:10]
-    compact = head.replace("-", "").replace("/", "")[:8]
-    if len(compact) == 8 and compact.isdigit():
-        return True
-    return len(head) == 10 and head[4:5] == "-" and head[7:8] == "-"
+    return len(head) >= 10 and head[4:5] in "-/" and head[7:8] in "-/"
 
 
 def coerce_bind_value(v: Any) -> Any:
