@@ -2917,7 +2917,7 @@ def _nav_mv_pre_for_rebalance_snap(
     if shares:
         mv = 0.0
         for sc2, sh in list(shares.items()):
-            if sh <= 0:
+            if sh is None or sh <= 0:
                 continue
             px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
             if px is not None:
@@ -3074,7 +3074,7 @@ def _nav_shares_from_holding_snapshot(
     用末净值日 strategy_holding_daily 快照的 latest_weight 反推股数，
     与当日 nav_unit 尺度一致（删库后增量勿仅用 strategy_positions 当前权重）。
     """
-    if prev_mv <= 0:
+    if prev_mv is None or prev_mv <= 0:
         return None
     td_iso = trade_d.isoformat()
     rb_iso = rebalance.isoformat()
@@ -3157,7 +3157,7 @@ def _nav_shares_from_holding_snapshot(
             px = float(r.get("latest_price") or 0.0)
         except (TypeError, ValueError):
             px = 0.0
-        if px <= 0:
+        if px is None or px <= 0:
             px = _adj_close_td_ff(day_map, sc, td_compact, last_close_fill) or 0.0
         if px > 0:
             shares[sc] = prev_mv * w / px
@@ -3196,16 +3196,18 @@ def _nav_init_state_from_last_row(
         except (TypeError, ValueError):
             bench_nav_acc = 1.0
     last_close_fill: dict[str, float] = {}
-    shares = _nav_shares_from_holding_snapshot(
-        db,
-        sid,
-        last_nav_d,
-        current_rb,
-        prev_mv,
-        day_map,
-        append_after_c,
-        last_close_fill,
-    )
+    shares: dict[str, float] | None = None
+    if prev_mv is not None and prev_mv > 0:
+        shares = _nav_shares_from_holding_snapshot(
+            db,
+            sid,
+            last_nav_d,
+            current_rb,
+            prev_mv,
+            day_map,
+            append_after_c,
+            last_close_fill,
+        )
     if not shares:
         holdings0 = rb_map.get(current_rb, [])
         if prev_mv is None or prev_mv <= 0:
@@ -3216,7 +3218,7 @@ def _nav_init_state_from_last_row(
     if shares:
         mv_chk = 0.0
         for sc2, sh in shares.items():
-            if sh <= 0:
+            if sh is None or sh <= 0:
                 continue
             px = _adj_close_td_ff(day_map, sc2, append_after_c, last_close_fill)
             if px is not None:
@@ -3253,7 +3255,7 @@ def _nav_init_matches_last_row(
         return True
     mv = 0.0
     for sc, sh in shares.items():
-        if sh <= 0:
+        if sh is None or sh <= 0:
             continue
         px = _adj_close_td_ff(day_map, sc, append_after_c, last_close_fill)
         if px is not None:
@@ -3361,7 +3363,7 @@ def _nav_process_one_trade_day(
         )
     mv_eod = 0.0
     for sc2, sh in shares.items():
-        if sh <= 0:
+        if sh is None or sh <= 0:
             continue
         px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
         if px is not None:
@@ -3987,7 +3989,7 @@ def _rebuild_nav_for_strategy_yearly(
                 )
             mv_eod = 0.0
             for sc2, sh in shares.items():
-                if sh <= 0:
+                if sh is None or sh <= 0:
                     continue
                 px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
                 if px is not None:
@@ -4375,7 +4377,7 @@ def _rebuild_nav_for_strategy(
             )
         mv_eod = 0.0
         for sc2, sh in shares.items():
-            if sh <= 0:
+            if sh is None or sh <= 0:
                 continue
             px = _adj_close_td_ff(day_map, sc2, td, last_close_fill)
             if px is not None:
