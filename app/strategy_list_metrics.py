@@ -131,7 +131,7 @@ def _upsert_metrics_rows(
 def load_strategy_list_metrics_batch(
     db: Session, strategy_ids: list[str]
 ) -> dict[str, dict[str, Any]]:
-    """单次查询读取列表展示用快照（/api/strategies 专用，不扫净值表）。"""
+    """单次查询读取快照（仅 /api/strategies，不扫净值表）。"""
     ids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
     if not ids:
         return {}
@@ -164,10 +164,8 @@ def refresh_strategy_list_metrics_cache(
     按列表口径重算并 UPSERT 快照。日常由 refresh_strategy_list_metrics_one 逐策略调用；
     strategy_ids 为空时刷新全部可见策略（仅脚本/手工补数，run_update 不再在末尾全量重算）。
     """
-    from app.main import (
-        _batch_nav_last_date_stock_count,
-        _strategy_nav_list_summary_bounded,
-    )
+    from app.main import _batch_nav_last_date_stock_count
+    from app.nav_list_metrics_calc import compute_strategy_list_metrics_snapshot
 
     ids = [str(x).strip() for x in (strategy_ids or []) if str(x or "").strip()]
     if not ids:
@@ -177,7 +175,18 @@ def refresh_strategy_list_metrics_cache(
 
     summaries: dict[str, dict[str, Any]] = {}
     for sid in ids:
-        summaries[sid] = _strategy_nav_list_summary_bounded(db, sid)
+        summaries[sid] = compute_strategy_list_metrics_snapshot(db, sid)
+        if len(ids) == 1:
+            s = summaries[sid]
+            _log.info(
+                "strategy_list_metrics refresh sid=%s nav=%s 5d=%s month=%s year=%s period=%s",
+                sid,
+                s.get("latest_nav"),
+                s.get("last_5d_return"),
+                s.get("month_return"),
+                s.get("year_return"),
+                s.get("period_since_rebalance_return"),
+            )
     nav_meta = _batch_nav_last_date_stock_count(db, ids)
     n = _upsert_metrics_rows(db, ids, summaries, nav_meta, do_commit=False)
     full_refresh = strategy_ids is None or not [

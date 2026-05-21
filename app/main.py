@@ -1422,11 +1422,12 @@ def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> di
                 SELECT nd.strategy_id, nd.trade_date AS td, nd.rebalance_date AS nav_rb
                 FROM strategy_nav_daily nd
                 INNER JOIN (
-                    SELECT strategy_id, MAX(trade_date) AS mx
+                    SELECT strategy_id, {sql_max_date_expr("trade_date")} AS mx
                     FROM strategy_nav_daily
                     WHERE strategy_id IN ({quoted})
                     GROUP BY strategy_id
-                ) mm ON mm.strategy_id = nd.strategy_id AND nd.trade_date = mm.mx
+                ) mm ON mm.strategy_id = nd.strategy_id
+                    AND {sql_date_compact_expr("nd.trade_date")} = mm.mx
             ) n
             LEFT JOIN strategy_holding_daily h
               ON h.strategy_id = n.strategy_id
@@ -1506,28 +1507,9 @@ def _nav_unit_trading_days_offset(
     db: Session, strategy_id: str, asof: date, offset: int
 ) -> float | None:
     """asof（含）及之前第 offset 个交易日的 nav_unit；offset=5 与列表「5日」一致。"""
-    if offset < 0:
-        return None
-    row = db.execute(
-        text(
-            f"""
-            SELECT nav_unit
-            FROM strategy_nav_daily
-            WHERE strategy_id=:sid
-              AND {sql_date_compact_expr("trade_date")} <= :acmp
-            ORDER BY {sql_order_date_desc("trade_date")}
-            LIMIT 1 OFFSET :off
-            """
-        ),
-        {"sid": strategy_id, "acmp": asof.strftime("%Y%m%d"), "off": int(offset)},
-    ).mappings().first()
-    if not row or row.get("nav_unit") is None:
-        return None
-    try:
-        v = float(row["nav_unit"])
-        return v if v > 0 else None
-    except (TypeError, ValueError):
-        return None
+    from app.nav_list_metrics_calc import _nav_unit_trading_days_offset as _offset_nav
+
+    return _offset_nav(db, strategy_id, asof, offset)
 
 
 def _nav_rolling_window_returns(
@@ -1537,58 +1519,12 @@ def _nav_rolling_window_returns(
     last_td: date | None = None,
     last_nav: float | None = None,
 ) -> dict[str, float | None]:
-    """
-    滚动窗口收益（策略列表快照用库内最新末日；净值页传入 asof 则按查询区间末日）：
-    - last_5d_return：asof 相对前第 5 个交易日；
-    - month_return：asof 净值 / 严格早于 asof 当月 1 日的最近交易日净值 - 1；
-    - year_return：asof 净值 / 严格早于 asof 当年 1 月 1 日的最近交易日净值 - 1。
-    """
-    sid = str(strategy_id).strip()
-    out: dict[str, float | None] = {
-        "last_5d_return": None,
-        "month_return": None,
-        "year_return": None,
-    }
-    if not sid:
-        return out
-    if last_td is None or last_nav is None:
-        top = (
-            db.execute(
-                text(
-                    f"""
-                    SELECT trade_date, nav_unit
-                    FROM strategy_nav_daily
-                    WHERE strategy_id=:sid
-                    ORDER BY {sql_order_date_desc("trade_date")}
-                    LIMIT 1
-                    """
-                ),
-                {"sid": sid},
-            )
-            .mappings()
-            .first()
-        )
-        if not top:
-            return out
-        last_td = _nav_list_trade_date_as_date(top["trade_date"])
-        try:
-            last_nav = float(top["nav_unit"])
-        except (TypeError, ValueError):
-            return out
-    if last_td is None or last_nav is None or last_nav <= 0:
-        return out
-    base5 = _nav_unit_trading_days_offset(db, sid, last_td, 5)
-    if base5 is not None and base5 > 0:
-        out["last_5d_return"] = last_nav / base5 - 1.0
-    month_cut = last_td.replace(day=1)
-    year_cut = date(last_td.year, 1, 1)
-    anchor_m = _nav_unit_last_before(db, sid, month_cut)
-    anchor_y = _nav_unit_last_before(db, sid, year_cut)
-    if anchor_m is not None and anchor_m > 0:
-        out["month_return"] = last_nav / anchor_m - 1.0
-    if anchor_y is not None and anchor_y > 0:
-        out["year_return"] = last_nav / anchor_y - 1.0
-    return out
+    """滚动窗口收益（净值页可传 asof；列表快照用库内最新末日）。"""
+    from app.nav_list_metrics_calc import rolling_window_returns
+
+    return rolling_window_returns(
+        db, strategy_id, last_td=last_td, last_nav=last_nav
+    )
 
 
 def _nav_unit_last_before(db: Session, strategy_id: str, anchor_dt: date) -> float | None:
@@ -1743,60 +1679,10 @@ def _nav_list_summary_from_desc_rows(
 
 
 def _strategy_nav_list_summary_bounded(db: Session, strategy_id: str) -> dict[str, Any]:
-    """
-    单策略列表指标：仅 indexed 点查（末行 / 月年锚 / 本期期初 / 第6行），不扫全表 nav 序列。
-    供 strategy_list_metrics 刷新与日常增量后更新，降低 Turso 读取量。
-    """
-    sid = str(strategy_id).strip()
-    if not sid:
-        return dict(_NAV_LIST_SUMMARY_EMPTY)
-    top = db.execute(
-        text(
-            f"""
-            SELECT trade_date, nav_unit, daily_ret
-            FROM strategy_nav_daily
-            WHERE strategy_id=:sid
-            ORDER BY {sql_order_date_desc("trade_date")}
-            LIMIT 1
-            """
-        ),
-        {"sid": sid},
-    ).mappings().first()
-    if not top:
-        return dict(_NAV_LIST_SUMMARY_EMPTY)
-    try:
-        last_nav = float(top["nav_unit"])
-    except (TypeError, ValueError):
-        return dict(_NAV_LIST_SUMMARY_EMPTY)
-    if last_nav <= 0:
-        return dict(_NAV_LIST_SUMMARY_EMPTY)
-    last_1d_return = _safe_float(top.get("daily_ret"))
-    last_td = _nav_list_trade_date_as_date(top["trade_date"])
-    if last_td is None:
-        return dict(_NAV_LIST_SUMMARY_EMPTY)
+    """策略列表快照口径（实现见 nav_list_metrics_calc）。"""
+    from app.nav_list_metrics_calc import compute_strategy_list_metrics_snapshot
 
-    rolling = _nav_rolling_window_returns(
-        db, sid, last_td=last_td, last_nav=last_nav
-    )
-    last_5d_return = rolling["last_5d_return"]
-    month_ret = rolling["month_return"]
-    year_ret = rolling["year_return"]
-
-    max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
-    period_ret = None
-    if max_rb is not None:
-        p0 = _nav_period_start_nav_unit(db, sid, max_rb)
-        if p0 is not None and p0 > 0:
-            period_ret = last_nav / p0 - 1.0
-
-    return {
-        "latest_nav": _round_nav_unit(last_nav),
-        "last_1d_return": last_1d_return,
-        "last_5d_return": last_5d_return,
-        "period_since_rebalance_return": period_ret,
-        "month_return": month_ret,
-        "year_return": year_ret,
-    }
+    return compute_strategy_list_metrics_snapshot(db, strategy_id)
 
 
 def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> dict[str, dict[str, Any]]:

@@ -2180,6 +2180,12 @@ def run_update(
                         "strategy_list_metrics refresh failed sid=%s (skip_holdings)",
                         sid,
                     )
+                _release_run_update_strategy_memory(
+                    eod_by_code={},
+                    index_eod_by_code={},
+                    quote_map={},
+                    eod_local=None,
+                )
                 continue
 
             eod_by_code: dict[str, list] = {}
