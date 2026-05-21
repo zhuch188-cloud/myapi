@@ -1530,6 +1530,67 @@ def _nav_unit_trading_days_offset(
         return None
 
 
+def _nav_rolling_window_returns(
+    db: Session,
+    strategy_id: str,
+    *,
+    last_td: date | None = None,
+    last_nav: float | None = None,
+) -> dict[str, float | None]:
+    """
+    滚动窗口收益（与策略列表、净值页 nav-metrics 共用）：
+    - last_5d_return / week_return：末净值相对 asof 前第 5 个交易日；
+    - month_return：末净值 / 严格早于当月 1 日的最近交易日净值 - 1；
+    - year_return：末净值 / 严格早于当年 1 月 1 日的最近交易日净值 - 1。
+    """
+    sid = str(strategy_id).strip()
+    out: dict[str, float | None] = {
+        "last_5d_return": None,
+        "month_return": None,
+        "year_return": None,
+    }
+    if not sid:
+        return out
+    if last_td is None or last_nav is None:
+        top = (
+            db.execute(
+                text(
+                    f"""
+                    SELECT trade_date, nav_unit
+                    FROM strategy_nav_daily
+                    WHERE strategy_id=:sid
+                    ORDER BY {sql_order_date_desc("trade_date")}
+                    LIMIT 1
+                    """
+                ),
+                {"sid": sid},
+            )
+            .mappings()
+            .first()
+        )
+        if not top:
+            return out
+        last_td = _nav_list_trade_date_as_date(top["trade_date"])
+        try:
+            last_nav = float(top["nav_unit"])
+        except (TypeError, ValueError):
+            return out
+    if last_td is None or last_nav is None or last_nav <= 0:
+        return out
+    base5 = _nav_unit_trading_days_offset(db, sid, last_td, 5)
+    if base5 is not None and base5 > 0:
+        out["last_5d_return"] = last_nav / base5 - 1.0
+    month_cut = last_td.replace(day=1)
+    year_cut = date(last_td.year, 1, 1)
+    anchor_m = _nav_unit_last_before(db, sid, month_cut)
+    anchor_y = _nav_unit_last_before(db, sid, year_cut)
+    if anchor_m is not None and anchor_m > 0:
+        out["month_return"] = last_nav / anchor_m - 1.0
+    if anchor_y is not None and anchor_y > 0:
+        out["year_return"] = last_nav / anchor_y - 1.0
+    return out
+
+
 def _nav_unit_last_before(db: Session, strategy_id: str, anchor_dt: date) -> float | None:
     """严格早于 anchor_dt 的最近一条 nav_unit（与净值页 nav-metrics 本月/本年锚定一致）。"""
     row = db.execute(
@@ -1649,9 +1710,13 @@ def _nav_list_summary_from_desc_rows(
     last_td = _nav_list_trade_date_as_date(top["trade_date"])
     if last_td is None:
         return None
+    last_5d_return = None
+    if len(rows_desc) > 5:
+        n5 = float(rows_desc[5]["nav_unit"])
+        if n5 > 0:
+            last_5d_return = last_nav / n5 - 1.0
     month_cut = last_td.replace(day=1)
     year_cut = date(last_td.year, 1, 1)
-
     anchor_m_nav = _nav_anchor_nav_unit_before_rows(rows_desc, month_cut)
     anchor_y_nav = _nav_anchor_nav_unit_before_rows(rows_desc, year_cut)
     month_ret = (
@@ -1664,12 +1729,6 @@ def _nav_list_summary_from_desc_rows(
         if anchor_y_nav is not None and anchor_y_nav > 0
         else None
     )
-
-    last_5d_return = None
-    if len(rows_desc) > 5:
-        n5 = float(rows_desc[5]["nav_unit"])
-        if n5 > 0:
-            last_5d_return = last_nav / n5 - 1.0
 
     period_ret = None
     if max_rb is not None:
@@ -1716,41 +1775,12 @@ def _strategy_nav_list_summary_bounded(db: Session, strategy_id: str) -> dict[st
     if last_td is None:
         return dict(_NAV_LIST_SUMMARY_EMPTY)
 
-    row5 = db.execute(
-        text(
-            f"""
-            SELECT nav_unit
-            FROM strategy_nav_daily
-            WHERE strategy_id=:sid
-            ORDER BY {sql_order_date_desc("trade_date")}
-            LIMIT 1 OFFSET 5
-            """
-        ),
-        {"sid": sid},
-    ).mappings().first()
-    last_5d_return = None
-    if row5 and row5.get("nav_unit") is not None:
-        try:
-            n5 = float(row5["nav_unit"])
-            if n5 > 0:
-                last_5d_return = last_nav / n5 - 1.0
-        except (TypeError, ValueError):
-            pass
-
-    month_cut = last_td.replace(day=1)
-    year_cut = date(last_td.year, 1, 1)
-    anchor_m_nav = _nav_unit_last_before(db, sid, month_cut)
-    anchor_y_nav = _nav_unit_last_before(db, sid, year_cut)
-    month_ret = (
-        last_nav / anchor_m_nav - 1.0
-        if anchor_m_nav is not None and anchor_m_nav > 0
-        else None
+    rolling = _nav_rolling_window_returns(
+        db, sid, last_td=last_td, last_nav=last_nav
     )
-    year_ret = (
-        last_nav / anchor_y_nav - 1.0
-        if anchor_y_nav is not None and anchor_y_nav > 0
-        else None
-    )
+    last_5d_return = rolling["last_5d_return"]
+    month_ret = rolling["month_return"]
+    year_ret = rolling["year_return"]
 
     max_rb = _nav_list_period_rebalance_date(db, sid, last_td)
     period_ret = None
@@ -2693,46 +2723,25 @@ def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_se
         text(
             """
             SELECT c.strategy_id, c.strategy_name, c.benchmark_code, c.benchmark_name,
-                   c.strategy_intro, c.strategy_category, c.rebalance_frequency,
-                   m.latest_nav, m.last_1d_return, m.last_5d_return,
-                   m.period_since_rebalance_return, m.month_return, m.year_return,
-                   m.last_trade_date, m.stock_count_on_last_date
+                   c.strategy_intro, c.strategy_category, c.rebalance_frequency
             FROM strategy_configs c
-            LEFT JOIN strategy_list_metrics m ON m.strategy_id = c.strategy_id
             WHERE c.is_visible=1 AND c.status='enabled'
             ORDER BY c.updated_at DESC
             """
         )
     ).mappings().all()
     sids = [str(r["strategy_id"]) for r in rows]
+    nav_meta = _batch_nav_last_date_stock_count(db, sids)
     metrics_by_sid: dict[str, dict] = {}
-    for r in rows:
-        sid = str(r["strategy_id"])
+    for sid in sids:
+        live = _strategy_nav_list_summary_bounded(db, sid)
+        meta = nav_meta.get(sid) or {}
         metrics_by_sid[sid] = {
-            "latest_nav": r.get("latest_nav"),
-            "last_1d_return": r.get("last_1d_return"),
-            "last_5d_return": r.get("last_5d_return"),
-            "period_since_rebalance_return": r.get("period_since_rebalance_return"),
-            "month_return": r.get("month_return"),
-            "year_return": r.get("year_return"),
-            "last_trade_date": r.get("last_trade_date"),
-            "stock_count_on_last_date": r.get("stock_count_on_last_date"),
+            **live,
+            "last_trade_date": meta.get("last_trade_date"),
+            "stock_count_on_last_date": meta.get("stock_count"),
         }
-    if ensure_strategy_list_metrics_for_list(db, sids, do_commit=True) and sids:
-        quoted = ",".join("'" + s.replace("'", "''") + "'" for s in sids)
-        metric_rows = db.execute(
-            text(
-                f"""
-                SELECT strategy_id, latest_nav, last_1d_return, last_5d_return,
-                       period_since_rebalance_return, month_return, year_return,
-                       last_trade_date, stock_count_on_last_date
-                FROM strategy_list_metrics
-                WHERE strategy_id IN ({quoted})
-                """
-            )
-        ).mappings().all()
-        for mr in metric_rows:
-            metrics_by_sid[str(mr["strategy_id"])] = dict(mr)
+    ensure_strategy_list_metrics_for_list(db, sids, do_commit=True)
 
     username = user["username"]
     follow_rows = db.execute(
@@ -3666,45 +3675,37 @@ def strategy_nav_metrics(
     if win_day_pairs:
         win_rate = sum(1 for dr, br in win_day_pairs if dr >= br) / len(win_day_pairs)
 
-    end_td = _to_date(last.get("trade_date"))
-
-    def _anchor_nav(anchor_dt: date) -> float | None:
-        row = db.execute(
+    # 近5交易日/本月/本年：与策略列表一致，按库内最新净值日计算，不受图表 start/end 筛选影响
+    rolling = _nav_rolling_window_returns(db, strategy_id)
+    week_ret = rolling["last_5d_return"]
+    month_ret = rolling["month_return"]
+    year_ret = rolling["year_return"]
+    latest_row = (
+        db.execute(
             text(
                 f"""
-                SELECT nav_unit
+                SELECT trade_date
                 FROM strategy_nav_daily
                 WHERE strategy_id=:sid
-                  AND {sql_date_compact_expr("trade_date")} < :acmp
                 ORDER BY {sql_order_date_desc("trade_date")}
                 LIMIT 1
                 """
             ),
-            {"sid": strategy_id, "acmp": anchor_dt.strftime("%Y%m%d")},
-        ).mappings().first()
-        if not row or row.get("nav_unit") is None:
-            return None
-        return float(row["nav_unit"])
-
-    week_ret = None
-    month_ret = None
-    year_ret = None
-    if end_td is not None and last_nav is not None and last_nav > 0:
-        m_start = end_td.replace(day=1)
-        y_start = end_td.replace(month=1, day=1)
-        base_w = _nav_unit_trading_days_offset(db, strategy_id, end_td, 5)
-        base_m = _anchor_nav(m_start)
-        base_y = _anchor_nav(y_start)
-        if base_w is not None and base_w > 0:
-            week_ret = last_nav / base_w - 1.0
-        if base_m is not None and base_m > 0:
-            month_ret = last_nav / base_m - 1.0
-        if base_y is not None and base_y > 0:
-            year_ret = last_nav / base_y - 1.0
+            {"sid": strategy_id},
+        )
+        .mappings()
+        .first()
+    )
+    as_of_td = (
+        _nav_list_trade_date_as_date(latest_row["trade_date"])
+        if latest_row
+        else None
+    )
 
     return {
         "ok": True,
         "items_count": n_days,
+        "metrics_as_of_trade_date": as_of_td.isoformat() if as_of_td else None,
         "metrics": {
             "cum_return": cum_ret,
             "annual_return": ann_ret,

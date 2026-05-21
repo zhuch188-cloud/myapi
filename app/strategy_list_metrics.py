@@ -165,6 +165,14 @@ def ensure_strategy_list_metrics_for_list(
             n_td = str((nav_meta.get(sid) or {}).get("last_trade_date") or "").strip()[:10]
             if n_td and m_td != n_td:
                 stale.append(sid)
+                continue
+            try:
+                mr = float(r.get("month_return"))
+                yr = float(r.get("year_return"))
+                if abs(mr - yr) < 1e-12:
+                    stale.append(sid)
+            except (TypeError, ValueError):
+                pass
     to_refresh = list(dict.fromkeys(missing + stale))
     if not to_refresh:
         return False
