@@ -1878,6 +1878,12 @@ def import_strategy_files(
             if _wind_low_memory_mode():
                 gc.collect()
             completed.add(sid)
+            try:
+                from app.strategy_list_metrics import refresh_strategy_list_metrics_one
+
+                refresh_strategy_list_metrics_one(db, sid, do_commit=do_commit)
+            except Exception:
+                _log.exception("strategy_list_metrics refresh after import sid=%s", sid)
             done_list = sorted(completed)
             prog_msg = (
                 f"阶段1/3 [{len(completed)}/{total_targets}] 已完成 {sid}"
@@ -1928,16 +1934,6 @@ def import_strategy_files(
             if _mysql_lock_contention(ex):
                 hint = "（可能与「数据更新」或其它导入并发，请错开执行或稍后重试）"
             errors.append(f"{sid} ({c['file_name']}): {ex}{hint}")
-
-    if completed:
-        try:
-            from app.strategy_list_metrics import refresh_strategy_list_metrics_cache
-
-            refresh_strategy_list_metrics_cache(
-                db, sorted(completed), do_commit=do_commit
-            )
-        except Exception:
-            _log.exception("strategy_list_metrics refresh after import failed")
 
     expected_done = total_targets
     resumable = len(completed) < expected_done
@@ -2463,6 +2459,12 @@ def run_update(
                 if sync_job_id is None:
                     prog(f"[{i_active}/{n_active}] {sid}：持仓处理完成")
                 db.commit()
+            try:
+                from app.strategy_list_metrics import refresh_strategy_list_metrics_one
+
+                refresh_strategy_list_metrics_one(db, sid, do_commit=do_commit)
+            except Exception:
+                _log.exception("strategy_list_metrics refresh failed sid=%s", sid)
             _release_run_update_strategy_memory(
                 eod_by_code=eod_by_code,
                 index_eod_by_code=index_eod_by_code,
@@ -2475,14 +2477,13 @@ def run_update(
             wind_merged = None
 
         done_msg = f"全部完成（处理 {len(active)} 个策略，行情日 {trade_date}）"
-        try:
-            from app.strategy_list_metrics import refresh_strategy_list_metrics_cache
+        if not selected_strategy_ids:
+            try:
+                from app.strategy_list_metrics import prune_strategy_list_metrics_orphans
 
-            refresh_strategy_list_metrics_cache(
-                db, [w["sid"] for w in active], do_commit=False
-            )
-        except Exception:
-            _log.exception("strategy_list_metrics refresh after run_update failed")
+                prune_strategy_list_metrics_orphans(db, do_commit=False)
+            except Exception:
+                _log.exception("strategy_list_metrics prune after run_update failed")
         db.execute(
             text(
                 f"""
@@ -4826,6 +4827,19 @@ def rebuild_nav_series(
                     if do_commit:
                         with turso_stream_lock():
                             sdb.commit()
+                    if counted:
+                        try:
+                            from app.strategy_list_metrics import (
+                                refresh_strategy_list_metrics_one,
+                            )
+
+                            refresh_strategy_list_metrics_one(
+                                sdb, sid, do_commit=True
+                            )
+                        except Exception:
+                            _log.exception(
+                                "strategy_list_metrics refresh after nav sid=%s", sid
+                            )
                 finally:
                     if low_mem:
                         try:
@@ -4867,6 +4881,17 @@ def rebuild_nav_series(
                         )
                 if do_commit:
                     db.commit()
+                if counted:
+                    try:
+                        from app.strategy_list_metrics import (
+                            refresh_strategy_list_metrics_one,
+                        )
+
+                        refresh_strategy_list_metrics_one(db, sid, do_commit=True)
+                    except Exception:
+                        _log.exception(
+                            "strategy_list_metrics refresh after nav sid=%s", sid
+                        )
         except Exception as ex:
             failed += 1
             errors.append(f"{sid}: {ex}")
@@ -4899,15 +4924,6 @@ def rebuild_nav_series(
     _release_wind_memory(wind_bundle)
     wind_bundle = None
     gc.collect()
-    if db is not None and completed_nav:
-        try:
-            from app.strategy_list_metrics import refresh_strategy_list_metrics_cache
-
-            refresh_strategy_list_metrics_cache(
-                db, sorted(set(completed_nav)), do_commit=False
-            )
-        except Exception:
-            _log.exception("strategy_list_metrics refresh after rebuild_nav failed")
     if do_commit and db is not None:
         db.commit()
     return {

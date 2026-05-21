@@ -2715,7 +2715,7 @@ def public_feedback_submit(
 @app.get("/api/strategies")
 def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_session)):
     from app.strategy_list_metrics import (
-        ensure_strategy_list_metrics_for_list,
+        load_strategy_list_metrics_batch,
         metrics_fields_from_row,
     )
 
@@ -2731,17 +2731,7 @@ def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_se
         )
     ).mappings().all()
     sids = [str(r["strategy_id"]) for r in rows]
-    nav_meta = _batch_nav_last_date_stock_count(db, sids)
-    metrics_by_sid: dict[str, dict] = {}
-    for sid in sids:
-        live = _strategy_nav_list_summary_bounded(db, sid)
-        meta = nav_meta.get(sid) or {}
-        metrics_by_sid[sid] = {
-            **live,
-            "last_trade_date": meta.get("last_trade_date"),
-            "stock_count_on_last_date": meta.get("stock_count"),
-        }
-    ensure_strategy_list_metrics_for_list(db, sids, do_commit=True)
+    metrics_by_sid = load_strategy_list_metrics_batch(db, sids)
 
     username = user["username"]
     follow_rows = db.execute(
@@ -3712,6 +3702,7 @@ def strategy_nav_metrics(
             "annual_volatility": ann_vol,
             "max_drawdown": max_dd,
             "week_return": week_ret,
+            "last_5d_return": week_ret,
             "month_return": month_ret,
             "year_return": year_ret,
             "win_rate": win_rate,
@@ -4035,6 +4026,7 @@ def delete_strategy(
     db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.execute(text("DELETE FROM strategy_holding_daily WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": strategy_id})
+    db.execute(text("DELETE FROM strategy_list_metrics WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.execute(text("DELETE FROM strategy_configs WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.commit()
     return {"ok": True, "deleted_strategy_id": strategy_id}
@@ -4065,6 +4057,7 @@ def delete_strategies(
     db.execute(text(f"DELETE FROM strategy_positions WHERE strategy_id IN ({q2})"))
     db.execute(text(f"DELETE FROM strategy_holding_daily WHERE strategy_id IN ({q2})"))
     db.execute(text(f"DELETE FROM strategy_nav_daily WHERE strategy_id IN ({q2})"))
+    db.execute(text(f"DELETE FROM strategy_list_metrics WHERE strategy_id IN ({q2})"))
     db.execute(text(f"DELETE FROM strategy_configs WHERE strategy_id IN ({q2})"))
     db.commit()
     return {"ok": True, "deleted_count": len(hit_ids), "deleted_strategy_ids": hit_ids}

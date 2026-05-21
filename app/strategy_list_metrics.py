@@ -1,4 +1,4 @@
-"""策略列表展示指标快照：客户端列表只读此表，避免每次扫全表 strategy_nav_daily。"""
+"""策略列表指标快照 strategy_list_metrics：一行一策略（PK=strategy_id），行数=终端列表可见策略数；仅在数据更新成功后全量重算写入。"""
 
 from __future__ import annotations
 
@@ -28,48 +28,46 @@ def _enabled_visible_strategy_ids(db: Session) -> list[str]:
     return [str(r["strategy_id"]).strip() for r in rows if str(r.get("strategy_id") or "").strip()]
 
 
-def _metrics_ids_with_cache(db: Session, strategy_ids: list[str]) -> set[str]:
-    if not strategy_ids:
-        return set()
-    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in strategy_ids)
-    rows = db.execute(
+def _prune_list_metrics_not_in(db: Session, keep_ids: list[str], *, do_commit: bool = False) -> int:
+    """删除不在当前列表策略集合内的快照行，使表行数与可见策略数一致。"""
+    keep = [str(x).strip() for x in keep_ids if str(x or "").strip()]
+    if not keep:
+        cur = db.execute(text("SELECT COUNT(*) AS c FROM strategy_list_metrics")).mappings().first()
+        n_before = int(cur["c"] or 0) if cur else 0
+        if n_before:
+            db.execute(text("DELETE FROM strategy_list_metrics"))
+            if do_commit:
+                db.commit()
+        return n_before
+    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in keep)
+    cur = db.execute(
         text(
             f"""
-            SELECT strategy_id FROM strategy_list_metrics
-            WHERE strategy_id IN ({quoted})
+            SELECT COUNT(*) AS c FROM strategy_list_metrics
+            WHERE strategy_id NOT IN ({quoted})
             """
         )
-    ).mappings().all()
-    return {str(r["strategy_id"]).strip() for r in rows}
+    ).mappings().first()
+    n = int(cur["c"] or 0) if cur else 0
+    if n:
+        db.execute(
+            text(f"DELETE FROM strategy_list_metrics WHERE strategy_id NOT IN ({quoted})")
+        )
+        if do_commit:
+            db.commit()
+    return n
 
 
-def refresh_strategy_list_metrics_cache(
+def _upsert_metrics_rows(
     db: Session,
-    strategy_ids: list[str] | None = None,
+    strategy_ids: list[str],
+    summaries: dict[str, dict[str, Any]],
+    nav_meta: dict[str, dict],
     *,
     do_commit: bool = True,
 ) -> int:
-    """
-    按与列表页相同口径重算并 UPSERT strategy_list_metrics。
-    strategy_ids 为空时刷新全部已启用且可见策略。
-    """
-    from app.main import (
-        _NAV_LIST_SUMMARY_EMPTY,
-        _batch_nav_last_date_stock_count,
-        _strategy_nav_list_summary_bounded,
-        _nav_list_period_rebalance_date,
-    )
+    from app.main import _NAV_LIST_SUMMARY_EMPTY, _nav_list_period_rebalance_date
 
-    ids = [str(x).strip() for x in (strategy_ids or []) if str(x or "").strip()]
-    if not ids:
-        ids = _enabled_visible_strategy_ids(db)
-    if not ids:
-        return 0
-
-    summaries: dict[str, dict[str, Any]] = {}
-    for sid in ids:
-        summaries[sid] = _strategy_nav_list_summary_bounded(db, sid)
-    nav_meta = _batch_nav_last_date_stock_count(db, ids)
     now_expr = sql_now()
     upsert = text(
         f"""
@@ -95,9 +93,8 @@ def refresh_strategy_list_metrics_cache(
             updated_at=excluded.updated_at
         """
     )
-
     n = 0
-    for sid in ids:
+    for sid in strategy_ids:
         s = summaries.get(sid) or dict(_NAV_LIST_SUMMARY_EMPTY)
         m = nav_meta.get(sid) or {}
         period_rb_str: str | None = None
@@ -126,64 +123,87 @@ def refresh_strategy_list_metrics_cache(
             },
         )
         n += 1
-
     if do_commit:
         db.commit()
     return n
 
 
-def ensure_strategy_list_metrics_for_list(
-    db: Session, strategy_ids: list[str], *, do_commit: bool = True
-) -> bool:
-    """
-    列表接口：补算尚无快照的策略；若快照末日与净值表 MAX(trade_date) 不一致则重算（口径变更或更新后）。
-    返回是否发生了补算。
-    """
-    from app.main import _batch_nav_last_date_stock_count
-
+def load_strategy_list_metrics_batch(
+    db: Session, strategy_ids: list[str]
+) -> dict[str, dict[str, Any]]:
+    """单次查询读取列表展示用快照（/api/strategies 专用，不扫净值表）。"""
     ids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
     if not ids:
-        return False
-    cached = _metrics_ids_with_cache(db, ids)
-    missing = [s for s in ids if s not in cached]
-    nav_meta = _batch_nav_last_date_stock_count(db, ids)
-    stale: list[str] = []
-    if cached:
-        quoted = ",".join("'" + s.replace("'", "''") + "'" for s in cached)
-        rows = db.execute(
-            text(
-                f"""
-                SELECT strategy_id, last_trade_date
-                FROM strategy_list_metrics
-                WHERE strategy_id IN ({quoted})
-                """
-            )
-        ).mappings().all()
-        for r in rows:
-            sid = str(r["strategy_id"]).strip()
-            m_td = str(r.get("last_trade_date") or "").strip()[:10]
-            n_td = str((nav_meta.get(sid) or {}).get("last_trade_date") or "").strip()[:10]
-            if n_td and m_td != n_td:
-                stale.append(sid)
-                continue
-            try:
-                mr = float(r.get("month_return"))
-                yr = float(r.get("year_return"))
-                if abs(mr - yr) < 1e-12:
-                    stale.append(sid)
-            except (TypeError, ValueError):
-                pass
-    to_refresh = list(dict.fromkeys(missing + stale))
-    if not to_refresh:
-        return False
-    try:
-        refresh_strategy_list_metrics_cache(db, to_refresh, do_commit=do_commit)
-        return True
-    except Exception:
-        _log.exception(
-            "ensure strategy_list_metrics failed ids=%s", to_refresh[:20]
+        return {}
+    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in ids)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT strategy_id, latest_nav, last_1d_return, last_5d_return,
+                   period_since_rebalance_return, month_return, year_return,
+                   last_trade_date, stock_count_on_last_date
+            FROM strategy_list_metrics
+            WHERE strategy_id IN ({quoted})
+            """
         )
-        return False
+    ).mappings().all()
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        sid = str(r["strategy_id"]).strip()
+        out[sid] = dict(r)
+    return out
+
+
+def refresh_strategy_list_metrics_cache(
+    db: Session,
+    strategy_ids: list[str] | None = None,
+    *,
+    do_commit: bool = True,
+) -> int:
+    """
+    按列表口径重算并 UPSERT 快照。日常由 refresh_strategy_list_metrics_one 逐策略调用；
+    strategy_ids 为空时刷新全部可见策略（仅脚本/手工补数，run_update 不再在末尾全量重算）。
+    """
+    from app.main import (
+        _batch_nav_last_date_stock_count,
+        _strategy_nav_list_summary_bounded,
+    )
+
+    ids = [str(x).strip() for x in (strategy_ids or []) if str(x or "").strip()]
+    if not ids:
+        ids = _enabled_visible_strategy_ids(db)
+    if not ids:
+        return 0
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for sid in ids:
+        summaries[sid] = _strategy_nav_list_summary_bounded(db, sid)
+    nav_meta = _batch_nav_last_date_stock_count(db, ids)
+    n = _upsert_metrics_rows(db, ids, summaries, nav_meta, do_commit=False)
+    full_refresh = strategy_ids is None or not [
+        x for x in (strategy_ids or []) if str(x or "").strip()
+    ]
+    if full_refresh:
+        _prune_list_metrics_not_in(db, ids, do_commit=False)
+    if do_commit:
+        db.commit()
+    return n
+
+
+def refresh_strategy_list_metrics_one(
+    db: Session, strategy_id: str, *, do_commit: bool = False
+) -> None:
+    """单策略数据更新完成后：重算并 UPSERT 该策略一行快照。"""
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return
+    refresh_strategy_list_metrics_cache(db, [sid], do_commit=do_commit)
+
+
+def prune_strategy_list_metrics_orphans(db: Session, *, do_commit: bool = True) -> int:
+    """全量任务收尾：删除已不在列表中的策略快照行（不重复重算指标）。"""
+    ids = _enabled_visible_strategy_ids(db)
+    return _prune_list_metrics_not_in(db, ids, do_commit=do_commit)
 
 
 def metrics_fields_from_row(row: dict[str, Any] | None) -> dict[str, Any]:
