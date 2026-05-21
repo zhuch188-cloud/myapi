@@ -109,7 +109,10 @@ def _statement_lock_acquire(conn) -> None:
 
 
 def _statement_lock_release(conn) -> None:
-    if not conn.info.pop("turso_stmt_lock", False):
+    if conn is None:
+        return
+    info = getattr(conn, "info", None)
+    if info is None or not info.pop("turso_stmt_lock", False):
         return
     try:
         _stream_sem.release()
@@ -255,8 +258,8 @@ def create_app_engine():
         _statement_lock_release(conn)
 
     @event.listens_for(eng, "handle_error")
-    def _release_on_cursor_error(conn, *_args, **_kwargs):
-        _statement_lock_release(conn)
+    def _release_on_cursor_error(exception_context, *_args, **_kwargs):
+        _statement_lock_release(getattr(exception_context, "connection", None))
 
     return eng
 
