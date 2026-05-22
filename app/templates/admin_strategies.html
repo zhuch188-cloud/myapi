@@ -399,14 +399,17 @@
             body: JSON.stringify({ strategy_ids: ids, import_mode: importMode })
           });
           if (ret.queued && ret.sync_job_id != null) {
+            ensureJobTableAutoRefresh();
             const deadline = Date.now() + 120 * 60 * 1000;
             while (Date.now() < deadline) {
               const st = await api("/api/admin/sync-jobs/" + encodeURIComponent(String(ret.sync_job_id)), {
                 headers: authHeaders()
               });
               const stg = st.stage ? ` · ${st.stage}` : "";
+              const pat = st.progress_at ? ` · ${st.progress_at}` : "";
               const tail = st.message ? ` — ${st.message}` : "";
-              msg.textContent = `#${st.id} ${st.status}${stg}${tail}`;
+              msg.textContent = `#${st.id} ${st.status}${stg}${pat}${tail}`;
+              await loadSyncJobs();
               if (st.status === "QUEUED" || st.status === "RUNNING") {
                 await maybeRefreshStrategyListDuringPoll();
               }
@@ -422,7 +425,7 @@
                 await refreshStrategyListAfterJob();
                 return;
               }
-              await sleep(2000);
+              await sleep(JOB_POLL_MS);
             }
             msg.textContent += "（轮询超时：后端可能仍在执行，请刷新列表或查看 strategy_update_jobs / admin_sync_jobs 表核对）";
             return;
@@ -551,12 +554,48 @@
       function esc(s) {
         return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       }
+      const JOB_POLL_MS = 1000;
+      let jobTableAutoTimer = null;
+      function jobMsgCell(j) {
+        const at = j.progress_at ? `<div class="job-msg-time">${esc(j.progress_at)}</div>` : "";
+        const body = esc((j.message || "").slice(0, 1200));
+        const title = esc(j.message || "");
+        return `<div class="job-msg" title="${title}">${at}${body}</div>`;
+      }
+      function jobTablesHaveActive(items) {
+        return (items || []).some((j) => j.status === "QUEUED" || j.status === "RUNNING");
+      }
+      async function refreshJobTablesIfActive() {
+        try {
+          const [imp, sync, upd] = await Promise.all([
+            api("/api/admin/import-jobs?limit=30"),
+            api("/api/admin/sync-jobs?limit=20"),
+            api("/api/admin/update-jobs", { headers: authHeaders() }),
+          ]);
+          await loadImportJobs();
+          await loadSyncJobs();
+          await loadUpdateJobs();
+          const active =
+            jobTablesHaveActive(imp.items) ||
+            jobTablesHaveActive(sync.items) ||
+            jobTablesHaveActive(upd.items);
+          if (!active && jobTableAutoTimer) {
+            clearInterval(jobTableAutoTimer);
+            jobTableAutoTimer = null;
+          }
+        } catch (_) {}
+      }
+      function ensureJobTableAutoRefresh() {
+        if (jobTableAutoTimer) return;
+        jobTableAutoTimer = setInterval(refreshJobTablesIfActive, JOB_POLL_MS);
+      }
       async function pollImportJob(jobId) {
         const msg = document.getElementById("jobMsg");
         const deadline = Date.now() + 120 * 60 * 1000;
         while (Date.now() < deadline) {
           const j = await api("/api/admin/import-jobs/" + encodeURIComponent(String(jobId)));
-          msg.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
+          const pat = j.progress_at ? ` · ${j.progress_at}` : "";
+          msg.textContent = `#${j.id} ${j.status}${pat} — ${j.message || ""}`;
           await loadImportJobs();
           if (j.status === "QUEUED" || j.status === "RUNNING") {
             await maybeRefreshStrategyListDuringPoll();
@@ -570,7 +609,7 @@
             await refreshStrategyListAfterJob();
             return j;
           }
-          await sleep(2000);
+          await sleep(JOB_POLL_MS);
         }
         msg.textContent += "（轮询超时）";
         return null;
@@ -585,13 +624,11 @@
             method: "POST",
             body: JSON.stringify({ strategy_ids: ids, import_mode: importMode, background: true }),
           });
-          if (ret.import_job_id != null) await pollImportJob(ret.import_job_id);
+          if (ret.import_job_id != null) {
+            ensureJobTableAutoRefresh();
+            await pollImportJob(ret.import_job_id);
+          }
         } catch (e) { msg.textContent = formatFetchError(e); }
-      }
-      function jobMsgCell(j) {
-        const at = j.progress_at ? `<div class="job-msg-time">${esc(j.progress_at)}</div>` : "";
-        const body = esc((j.message || "").slice(0, 280));
-        return `<div class="job-msg">${at}${body}</div>`;
       }
       function resumableJobButtons(resumeFn, abandonFn, id) {
         return `<div class="job-task-actions">`
@@ -607,7 +644,10 @@
             body: JSON.stringify({ resume_job_id: jobId }),
           });
           msg.textContent = ret.message || `续传任务 #${jobId}`;
-          if (ret.import_job_id != null) await pollImportJob(ret.import_job_id);
+          if (ret.import_job_id != null) {
+            ensureJobTableAutoRefresh();
+            await pollImportJob(ret.import_job_id);
+          }
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       async function abandonImportJob(jobId) {
@@ -655,7 +695,7 @@
         while (Date.now() < deadline) {
           const st = await api("/api/admin/sync-jobs/" + encodeURIComponent(String(jobId)));
           const stg = st.stage ? ` · ${st.stage}` : "";
-          const stt = st.started_at ? ` · 开始 ${st.started_at}` : "";
+          const stt = st.progress_at ? ` · ${st.progress_at}` : (st.started_at ? ` · 开始 ${st.started_at}` : "");
           msg.textContent = `#${st.id} ${st.status}${stg}${stt}${st.message ? " — " + st.message : ""}`;
           await loadSyncJobs();
           await loadUpdateJobs();
@@ -666,7 +706,7 @@
             await refreshStrategyListAfterJob();
             return st;
           }
-          await sleep(2000);
+          await sleep(JOB_POLL_MS);
         }
         msg.textContent += "（轮询超时）";
         return null;
@@ -676,6 +716,7 @@
         try {
           const ret = await api(`/api/admin/sync-jobs/${jobId}/resume`, { method: "POST" });
           msg.textContent = ret.message || `续传同步 #${jobId}`;
+          ensureJobTableAutoRefresh();
           await pollSyncJob(jobId);
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
@@ -746,16 +787,18 @@
             msg.textContent = "接口未返回 job_id，请升级后端";
             return;
           }
+          ensureJobTableAutoRefresh();
           const deadline = Date.now() + 45 * 60 * 1000;
           while (Date.now() < deadline) {
             const jobs = await api("/api/admin/update-jobs", { headers: authHeaders() });
             const j = (jobs.items || []).find((x) => x.id === targetId);
             if (!j) {
               msg.textContent = `未找到任务 #${targetId}，稍后重试轮询…`;
-              await sleep(2000);
+              await sleep(JOB_POLL_MS);
               continue;
             }
-            msg.textContent = `#${j.id} ${j.status} — ${j.message || ""}`;
+            const pat = j.progress_at ? ` · ${j.progress_at}` : "";
+            msg.textContent = `#${j.id} ${j.status}${pat} — ${j.message || ""}`;
             await loadUpdateJobs();
             if (j.status === "RUNNING") {
               await maybeRefreshStrategyListDuringPoll();
@@ -764,7 +807,7 @@
               await refreshStrategyListAfterJob();
               return;
             }
-            await sleep(2000);
+            await sleep(JOB_POLL_MS);
           }
           msg.textContent += "（轮询超时）";
           await loadUpdateJobs();
@@ -825,6 +868,7 @@
       loadImportJobs();
       loadSyncJobs();
       loadUpdateJobs();
+      refreshJobTablesIfActive().then(() => ensureJobTableAutoRefresh());
     </script>
 {% include 'partials/site_disclaimer.html' %}
   </body>

@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from sqlalchemy import text
@@ -139,6 +139,45 @@ def _strategy_nav_notional_capital() -> float:
     """固定股数法名义本金（元），nav_unit = 收盘市值 / 该值；收益序列与取值无关。"""
     v = float(settings.strategy_nav_initial_capital)
     return v if v > 0 else 100_000_000.0
+
+
+def _import_progress_touch(
+    db: Session,
+    message: str,
+    *,
+    sync_job_id: int | None = None,
+    strategy_import_job_id: int | None = None,
+    do_commit: bool = False,
+) -> None:
+    """阶段1 Excel 导入：同步写入 admin_sync / strategy_import 任务说明。"""
+    msg = (message or "")[:6000]
+    if sync_job_id is not None:
+        _admin_sync_job_touch(sync_job_id, "import", msg, db=db, do_commit=do_commit)
+    if strategy_import_job_id is not None:
+        _strategy_import_job_touch(
+            db, strategy_import_job_id, message=msg, do_commit=do_commit
+        )
+
+
+def _nav_progress_touch(
+    message: str,
+    *,
+    sync_job_id: int | None,
+    progress_cb: Callable[[str], None] | None,
+    db: Session | None = None,
+    turso_remote: bool = False,
+) -> None:
+    msg = (message or "")[:6000]
+    if sync_job_id is not None:
+        _admin_sync_job_touch(
+            sync_job_id,
+            "nav",
+            msg,
+            db=None if turso_remote else db,
+            do_commit=True,
+        )
+    elif progress_cb:
+        progress_cb(msg)
 
 
 def _job_progress(
@@ -547,6 +586,7 @@ def _import_strategy_holdings_from_excel(
     import_mode: str,
     *,
     sync_job_id: int | None = None,
+    strategy_import_job_id: int | None = None,
     repair_last_period: bool = False,
 ) -> dict[str, str]:
     """导入单策略 Excel 持仓；大文件走流式，返回 label_meta。"""
@@ -560,12 +600,12 @@ def _import_strategy_holdings_from_excel(
             if repair_last_period:
                 cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
                 cutoff_inclusive = cutoff_rb is not None
-                if cutoff_rb and sync_job_id is not None:
-                    _admin_sync_job_touch(
-                        sync_job_id,
-                        "import",
+                if cutoff_rb:
+                    _import_progress_touch(
+                        db,
                         f"阶段1/3 {sid}：续传已删最后一期 {cutoff_rb.isoformat()}，重导该期及之后…",
-                        db=db,
+                        sync_job_id=sync_job_id,
+                        strategy_import_job_id=strategy_import_job_id,
                         do_commit=False,
                     )
             if cutoff_rb is None:
@@ -587,14 +627,13 @@ def _import_strategy_holdings_from_excel(
             _import_positions_batch(db, sid, chunk)
             imported_rows += len(chunk)
             db.commit()
-            if sync_job_id is not None and (batch_no == 1 or batch_no % 3 == 0):
-                _admin_sync_job_touch(
-                    sync_job_id,
-                    "import",
-                    f"阶段1/3 {sid}：流式导入中… 已写入 {imported_rows} 行（第 {batch_no} 批）",
-                    db=db,
-                    do_commit=False,
-                )
+            _import_progress_touch(
+                db,
+                f"阶段1/3 {sid}：流式导入 第 {batch_no} 批，已累计 {imported_rows} 行…",
+                sync_job_id=sync_job_id,
+                strategy_import_job_id=strategy_import_job_id,
+                do_commit=False,
+            )
             chunk.clear()
             gc.collect()
         if imported_rows == 0 and import_mode == "full":
@@ -607,8 +646,22 @@ def _import_strategy_holdings_from_excel(
         )
     else:
         # .xls 等：pandas 仅读必要列；行数过多时仍可能 OOM，建议另存为 .xlsx
+        _import_progress_touch(
+            db,
+            f"阶段1/3 {sid}：读取 Excel（前 {_strategy_excel_read_max_col()} 列）…",
+            sync_job_id=sync_job_id,
+            strategy_import_job_id=strategy_import_job_id,
+            do_commit=False,
+        )
         label_meta = _read_strategy_excel_label_meta(file_path)
         label_meta2, rows_to_write = _read_strategy_holdings_excel(file_path)
+        _import_progress_touch(
+            db,
+            f"阶段1/3 {sid}：已解析 {len(rows_to_write)} 行，写入数据库…",
+            sync_job_id=sync_job_id,
+            strategy_import_job_id=strategy_import_job_id,
+            do_commit=False,
+        )
         label_meta.update({k: v for k, v in (label_meta2 or {}).items() if v})
         _import_write_positions_one_strategy(
             db, sid, rows_to_write, label_meta, import_mode, repair_last_period=repair_last_period
@@ -1990,6 +2043,11 @@ def import_strategy_files(
             continue
         seq = len(completed) + 1
         stream = _strategy_excel_use_streaming(file_path)
+        batch_hint = (
+            f"流式 每批{_strategy_excel_row_batch_size()}行 列≤{_strategy_excel_read_max_col()}"
+            if stream
+            else f"pandas 列≤{_strategy_excel_read_max_col()}"
+        )
         _log.info(
             "import_strategy %s file=%s streaming=%s sync_job=%s",
             sid,
@@ -1998,7 +2056,8 @@ def import_strategy_files(
             sync_job_id,
         )
         start_msg = (
-            f"阶段1/3 [{seq}/{total_targets}] 正在导入 {sid}（{c.get('file_name') or ''}）…"
+            f"阶段1/3 [{seq}/{total_targets}] {sid}（{c.get('file_name') or ''}）"
+            f"{batch_hint} 开始…"
         )
         if sync_job_id is not None:
             _admin_sync_job_touch(
@@ -2022,6 +2081,7 @@ def import_strategy_files(
                             file_path,
                             import_mode,
                             sync_job_id=sync_job_id,
+                            strategy_import_job_id=strategy_import_job_id,
                             repair_last_period=repair_last_period,
                         )
                     else:
@@ -2060,12 +2120,15 @@ def import_strategy_files(
             done_list = sorted(completed)
             prog_msg = (
                 f"阶段1/3 [{len(completed)}/{total_targets}] 已完成 {sid}"
-                f"（本批新增 {imported_new}，失败 {failed}）"
+                f"（累计 {len(completed)}/{total_targets}，失败 {failed}）"
             )
-            if sync_job_id is not None:
-                _admin_sync_job_touch(
-                    sync_job_id, "import", prog_msg, db=db, do_commit=False
-                )
+            _import_progress_touch(
+                db,
+                prog_msg,
+                sync_job_id=sync_job_id,
+                strategy_import_job_id=strategy_import_job_id,
+                do_commit=False,
+            )
             if sync_job_id is not None:
                 ck_row = (
                     db.execute(
@@ -2316,6 +2379,8 @@ def run_update(
                                 mysql_plan=pl1,
                                 wind_bundle=None,
                                 nav_full_rebuild=bool(full_refresh),
+                                sync_job_id=sync_job_id,
+                                progress_cb=prog if sync_job_id is None else None,
                             )
                             nav_max_c = _strategy_nav_max_trade_compact(db, sid)
                             lt_c = _compact_date(latest_trade)
@@ -3724,6 +3789,7 @@ def _rebuild_nav_incremental_from_current_period(
     trade_days: list[str],
     *,
     sync_job_id: int | None = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> tuple[bool, Any]:
     """
     以库内末净值日 nav×本金 初始化股数，仅模拟并落库 append_after_c 之后的交易日。
@@ -3776,15 +3842,14 @@ def _rebuild_nav_incremental_from_current_period(
         bench_day_map = _index_eod_to_bench_day_map(idx_all, bench_code)
         idx_all.clear()
 
-    if sync_job_id is not None:
-        _admin_sync_job_touch(
-            sync_job_id,
-            "nav",
+    if sync_job_id is not None or progress_cb:
+        _nav_progress_touch(
             f"{sid}：锚定调仓 {_compact_date(anchor_rb)} 末净值 {append_after_c} "
             f"EOD {eod_start_c}→{latest_trade_c} 补 {len(sim_days)} 日 "
             f"成分 {len(period_codes)} 只…",
+            sync_job_id=sync_job_id,
+            progress_cb=progress_cb,
             db=db,
-            do_commit=True,
         )
 
     if use_seg:
@@ -4096,6 +4161,7 @@ def _rebuild_nav_for_strategy_yearly(
     *,
     sync_job_id: int | None = None,
     nav_full_rebuild: bool = True,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> tuple[bool, Any]:
     """低内存：按时间分段 + 股票小批拉 EOD，避免全历史成分 day_map 一次占满内存。"""
     from app.db import SessionLocalFactory, turso_stream_lock, uses_remote_turso_only
@@ -4140,13 +4206,13 @@ def _rebuild_nav_for_strategy_yearly(
     append_after_c = _nav_persist_after_compact(db, sid, nav_full_rebuild)
     if append_after_c and append_after_c >= latest_trade_c:
         _log.info("nav incremental %s: already through %s", sid, append_after_c)
-        if sync_job_id is not None:
-            _admin_sync_job_touch(
-                sync_job_id,
-                "nav",
+        if sync_job_id is not None or progress_cb:
+            _nav_progress_touch(
                 f"阶段2/3 {sid}：净值已至 {append_after_c}，无需补算",
+                sync_job_id=sync_job_id,
+                progress_cb=progress_cb,
                 db=None if turso_remote else db,
-                do_commit=True,
+                turso_remote=turso_remote,
             )
         return True, wind
     if not nav_full_rebuild and append_after_c:
@@ -4161,23 +4227,24 @@ def _rebuild_nav_for_strategy_yearly(
             append_after_c,
             trade_days_all,
             sync_job_id=sync_job_id,
+            progress_cb=progress_cb,
         )
         if ok_inc:
             return True, wind
-    if sync_job_id is not None:
+    if sync_job_id is not None or progress_cb:
         nav_mode = (
             f"增量自 {append_after_c} 后补至 {latest_trade_c}"
             if append_after_c
             else f"全量 {start_c}~{latest_trade_c}"
         )
-        _admin_sync_job_touch(
-            sync_job_id,
-            "nav",
+        _nav_progress_touch(
             f"阶段2/3 {sid}：{nav_mode}；动态分段 {eod_step_months} 月/段"
             f"（最新期 {latest_n} 只×{eod_step_months}≤{budget}），"
             f"共 {len(time_segs)} 段、历史成分约 {n_codes_union} 只…",
+            sync_job_id=sync_job_id,
+            progress_cb=progress_cb,
             db=None if turso_remote else db,
-            do_commit=True,
+            turso_remote=turso_remote,
         )
     if nav_full_rebuild:
         for attempt in range(4):
@@ -4238,13 +4305,13 @@ def _rebuild_nav_for_strategy_yearly(
         seg_codes = _codes_for_nav_segment(rb_sorted, rb_map, shares, seg_st, seg_ed)
         if not seg_codes:
             continue
-        if sync_job_id is not None:
-            _admin_sync_job_touch(
-                sync_job_id,
-                "nav",
+        if sync_job_id is not None or progress_cb:
+            _nav_progress_touch(
                 f"阶段2/3 {sid}：行情段 {seg_i}/{len(time_segs)}（{seg_st}~{seg_ed}，{len(seg_codes)} 只股票）…",
+                sync_job_id=sync_job_id,
+                progress_cb=progress_cb,
                 db=None if turso_remote else db,
-                do_commit=True,
+                turso_remote=turso_remote,
             )
 
         def _load_maps(sess: Session):
@@ -4297,14 +4364,15 @@ def _rebuild_nav_for_strategy_yearly(
             if not nav_full_rebuild and append_after_c and td <= append_after_c:
                 continue
             td_i += 1
-            if sync_job_id is not None and td_i % 40 == 0:
-                _admin_sync_job_touch(
-                    sync_job_id,
-                    "nav",
-                    f"阶段2/3 {sid}：净值计算中 {td}（段 {seg_i}/{len(time_segs)}）…",
-                    db=None if turso_remote else db,
-                    do_commit=True,
-                )
+            if sync_job_id is not None or progress_cb:
+                if td_i % 15 == 0:
+                    _nav_progress_touch(
+                        f"阶段2/3 {sid}：净值计算 {td}（段 {seg_i}/{len(time_segs)}，第 {td_i} 日）…",
+                        sync_job_id=sync_job_id,
+                        progress_cb=progress_cb,
+                        db=None if turso_remote else db,
+                        turso_remote=turso_remote,
+                    )
             rb_idx_at_start = rb_idx
             td_date = datetime.strptime(td, "%Y%m%d").date()
             while rb_idx + 1 < len(rb_sorted) and rb_sorted[rb_idx + 1] <= td_date:
@@ -4428,6 +4496,7 @@ def _rebuild_nav_for_strategy(
     wind_bundle: dict[str, Any] | None = None,
     sync_job_id: int | None = None,
     nav_full_rebuild: bool = True,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> tuple[bool, Any]:
     """
     单策略净值重建。固定股数、调仓日按收盘复权价满仓再平衡。
@@ -4559,6 +4628,7 @@ def _rebuild_nav_for_strategy(
             append_after_c,
             td_period,
             sync_job_id=sync_job_id,
+            progress_cb=progress_cb,
         )
         if ok_inc:
             return True, wind
@@ -4585,6 +4655,7 @@ def _rebuild_nav_for_strategy(
             wind_bundle=wind_bundle,
             sync_job_id=sync_job_id,
             nav_full_rebuild=True,
+            progress_cb=progress_cb,
         )
 
     yearly_start = start_c
@@ -4611,6 +4682,7 @@ def _rebuild_nav_for_strategy(
             ic0,
             sync_job_id=sync_job_id,
             nav_full_rebuild=nav_full_rebuild,
+            progress_cb=progress_cb,
         )
 
     codes_for_eod = sorted(code_set)
