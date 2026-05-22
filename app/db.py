@@ -326,6 +326,7 @@ def _apply_runtime_schema_migrations(conn) -> None:
         )
     )
     _sqlite_add_column_if_missing(conn, "strategy_import_jobs", "progress_at", "TEXT NULL")
+    _sqlite_add_column_if_missing(conn, "strategy_import_jobs", "checkpoint_json", "TEXT NULL")
     conn.execute(
         text(
             """

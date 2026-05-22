@@ -25,7 +25,8 @@ console.log("=== positions", sid, "===", summary);
 const jobs = (
   await db.execute(
     `SELECT id, status, import_mode, progress_at, finished_at,
-            imported_count, failed_count, substr(message,1,300) AS msg
+            imported_count, failed_count, substr(message,1,300) AS msg,
+            checkpoint_json
      FROM strategy_import_jobs ORDER BY id`
   )
 ).rows;
@@ -36,6 +37,12 @@ for (const j of jobs) {
     `#${j.id} ${j.status} ${j.import_mode} imported=${j.imported_count} @ ${j.progress_at}`,
   );
   console.log(" ", j.msg);
+  if (j.checkpoint_json) {
+    try {
+      const cp = JSON.parse(j.checkpoint_json);
+      console.log("   checkpoint:", cp);
+    } catch (_) {}
+  }
 }
 
 const per = (

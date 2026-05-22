@@ -760,10 +760,24 @@ def _import_strategy_holdings_from_excel(
             imported_rows += len(chunk)
             db.commit()
             _import_after_batch_commit(db)
+            stats["imported_rows"] = imported_rows
+            stats["skipped_rows"] = skipped_rows
+            stats["excel_rows"] = excel_rows
+            stats["rows_after"] = _strategy_positions_row_count(db, sid)
+            if strategy_import_job_id is not None:
+                _strategy_import_job_save_checkpoint(
+                    db,
+                    int(strategy_import_job_id),
+                    sid,
+                    stats=stats,
+                    batch_no=batch_no,
+                    do_commit=False,
+                )
             _import_progress_touch(
                 db,
-                f"阶段1/3 {sid}：流式导入 第 {batch_no} 批，已累计 {imported_rows} 行"
-                f"{f'（跳过已入库 {skipped_rows} 行）' if skipped_rows else ''}…",
+                f"阶段1/3 {sid}：流式 第 {batch_no} 批 +{len(chunk)} 行"
+                f"，库内实计 {stats['rows_after']} 行"
+                f"{f'（Excel已扫 {excel_rows}，跳过 {skipped_rows}）' if cutoff_rb else ''}…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=True,
@@ -1935,6 +1949,39 @@ def _effective_eod_chunk_size(n_stocks: int) -> int:
     return base
 
 
+def _strategy_import_job_save_checkpoint(
+    db: Session,
+    job_id: int,
+    sid: str,
+    *,
+    stats: dict[str, int],
+    batch_no: int,
+    do_commit: bool = True,
+) -> None:
+    """每批落库后写入 checkpoint，便于对照「进度累计行数」与库内实计行数。"""
+    rows_after = int(stats.get("rows_after") or 0)
+    payload = {
+        "strategy_id": sid,
+        "batch_no": batch_no,
+        "excel_rows_scanned": int(stats.get("excel_rows") or 0),
+        "imported_rows_session": int(stats.get("imported_rows") or 0),
+        "skipped_rows": int(stats.get("skipped_rows") or 0),
+        "rows_in_db": rows_after,
+    }
+    db.execute(
+        text(
+            f"""
+            UPDATE strategy_import_jobs
+            SET checkpoint_json=:cp, progress_at={sql_now()}
+            WHERE id=:id
+            """
+        ),
+        {"cp": json.dumps(payload, ensure_ascii=False), "id": job_id},
+    )
+    if do_commit:
+        db.commit()
+
+
 def _strategy_import_job_touch(
     db: Session,
     job_id: int,
@@ -2017,7 +2064,7 @@ def get_strategy_import_job_row(db: Session, job_id: int) -> dict[str, Any] | No
                 """
                 SELECT id, status, import_mode, strategy_ids_json, completed_strategy_ids_json,
                        imported_count, failed_count, errors_json, message, triggered_by,
-                       created_at, started_at, finished_at, progress_at
+                       created_at, started_at, finished_at, progress_at, checkpoint_json
                 FROM strategy_import_jobs
                 WHERE id = :id
                 LIMIT 1
