@@ -90,14 +90,16 @@ class Settings(BaseSettings):
     wind_eod_stock_chunk: int = 0
     # 低内存：数据更新按「每个调仓期 × 该期成分股小批」拉 EOD 并立即落库（峰值≈单期持仓，Wind 重复读可接受）
     update_eod_per_rebalance_chunk: bool = True
-    # 策略 Excel 导入：持仓 UPSERT 批大小（减少逐行往返）
+    # 策略 Excel 导入：持仓 UPSERT 批大小（低内存自动压至 ≤200）
     strategy_import_position_batch_size: int = 500
-    # 大 Excel（如沪深300增强）：openpyxl 流式读行，避免整表进 pandas（阶段1 导入）
+    # 大 Excel：openpyxl 流式 + 只读必要列（Render 512MB 务必开启）
     strategy_excel_streaming_import: bool = True
-    # 文件大于该 MB 时启用流式导入；0=始终流式
+    # 文件大于该 MB 时启用流式；0= xlsx/xlsm 始终流式
     strategy_excel_streaming_min_mb: int = 0
-    # 流式 Excel 每批行数；Render 低内存建议 200～500（默认随 wind_low_memory_mode 自动缩小）
-    strategy_excel_import_row_batch: int = 2500
+    # 流式每批行数；Render 建议 200～400（默认 600，低内存自动 ≤200）
+    strategy_excel_import_row_batch: int = 600
+    # 策略 Excel 只读前 N 列（标准模板 A～E：日期/代码/持仓权重/行业权重/分类或调仓频率）
+    strategy_excel_read_max_col: int = 5
     # 净值重建：每 N 个交易日落库一批（仅阶段2 nav_accum；不减小 day_map 峰值）
     nav_rebuild_persist_chunk: int = 400
     # 低内存下分段拉 Wind EOD 算净值（避免全区间 day_map 一次驻留）

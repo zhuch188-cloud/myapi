@@ -208,8 +208,9 @@ def _first_nonempty_meta_from_openpyxl(
     idx = next((col_index[c] for c in col_names if c in col_index), None)
     if idx is None:
         return ""
+    max_c = _strategy_excel_read_max_col()
     n = 0
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in ws.iter_rows(min_row=2, min_col=1, max_col=max_c, values_only=True):
         n += 1
         if n > max_rows:
             break
@@ -232,7 +233,11 @@ def _read_strategy_excel_label_meta_openpyxl(file_path: str) -> dict[str, str]:
     wb = load_workbook(file_path, read_only=True, data_only=True)
     try:
         ws = wb.active
-        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        max_c = _strategy_excel_read_max_col()
+        header_row = next(
+            ws.iter_rows(min_row=1, max_row=1, min_col=1, max_col=max_c, values_only=True),
+            None,
+        )
         if not header_row:
             return out
         col_index: dict[str, int] = {}
@@ -256,6 +261,16 @@ _STRATEGY_EXCEL_OPTIONAL_COLS = frozenset(
     {"持仓权重", "行业中性权重", "分类", "策略分类", "调仓频率"}
 )
 _STRATEGY_EXCEL_STREAM_SUFFIXES = (".xlsx", ".xlsm")
+
+
+def _strategy_excel_read_max_col() -> int:
+    """策略模板有效数据在前 N 列（默认 A～E）；忽略右侧格式/空列，避免宽表 OOM。"""
+    n = int(getattr(settings, "strategy_excel_read_max_col", 5) or 5)
+    return max(2, min(n, 20))
+
+
+def _strategy_excel_pandas_usecols() -> list[int]:
+    return list(range(_strategy_excel_read_max_col()))
 
 
 def _strategy_excel_use_streaming(file_path: str) -> bool:
@@ -284,12 +299,13 @@ def _read_strategy_excel_label_meta(file_path: str) -> dict[str, str]:
             _log.warning("openpyxl label meta failed, fallback pandas: %s", file_path, exc_info=True)
     meta_names = {"分类", "策略分类", "调仓频率"}
     try:
-        header = pd.read_excel(file_path, sheet_name=0, nrows=0)
+        usecols = _strategy_excel_pandas_usecols()
+        header = pd.read_excel(file_path, sheet_name=0, nrows=0, usecols=usecols)
         cols = [str(c).strip() for c in header.columns]
         pick = [c for c in cols if c in meta_names]
         if not pick:
             return {}
-        kw: dict[str, Any] = {"sheet_name": 0, "usecols": pick, "nrows": 3000}
+        kw: dict[str, Any] = {"sheet_name": 0, "usecols": usecols, "nrows": 3000}
         try:
             df = pd.read_excel(file_path, engine="calamine", **kw)
         except Exception:
@@ -334,43 +350,112 @@ def _excel_cell_weight(v: Any) -> float | None:
 
 
 def _strategy_excel_row_batch_size() -> int:
-    n = int(getattr(settings, "strategy_excel_import_row_batch", 2500) or 2500)
+    n = int(getattr(settings, "strategy_excel_import_row_batch", 600) or 600)
     if _wind_low_memory_mode():
-        return max(100, min(n, 400))
-    return max(500, n)
+        return max(100, min(n, 200))
+    return max(200, min(n, 1500))
+
+
+def _strategy_import_position_batch_size() -> int:
+    n = int(getattr(settings, "strategy_import_position_batch_size", 500) or 500)
+    if _wind_low_memory_mode():
+        return max(50, min(n, 200))
+    return max(50, n)
+
+
+def _strategy_excel_parse_header(header_row: tuple[Any, ...] | None) -> dict[str, int]:
+    if not header_row:
+        raise ValueError("Excel 表为空")
+    max_c = _strategy_excel_read_max_col()
+    idx: dict[str, int] = {}
+    for i, c in enumerate(header_row[:max_c]):
+        name = str(c).strip() if c is not None else ""
+        if name and name not in idx:
+            idx[name] = i
+    for need in _STRATEGY_EXCEL_REQUIRED_COLS:
+        if need not in idx:
+            raise ValueError(f"缺少列: {need}（须在前 {max_c} 列内）")
+    return idx
+
+
+def _strategy_excel_fill_meta_from_cells(
+    cells: tuple[Any, ...],
+    col_index: dict[str, int],
+    meta_out: dict[str, str],
+    *,
+    category_done: list[bool],
+    freq_done: list[bool],
+) -> None:
+    from app.text_encoding import normalize_unicode_text
+
+    if not category_done[0]:
+        for name, key in (("分类", "strategy_category"), ("策略分类", "strategy_category")):
+            li = col_index.get(name)
+            if li is None or li >= len(cells):
+                continue
+            cell = cells[li]
+            if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+                continue
+            t = normalize_unicode_text(cell, max_len=128)
+            if t:
+                meta_out[key] = t
+                category_done[0] = True
+                break
+    if not freq_done[0]:
+        li = col_index.get("调仓频率")
+        if li is not None and li < len(cells):
+            cell = cells[li]
+            if cell is not None and not (isinstance(cell, float) and pd.isna(cell)):
+                t = normalize_unicode_text(cell, max_len=128)
+                if t:
+                    meta_out["rebalance_frequency"] = t
+                    freq_done[0] = True
 
 
 def _iter_strategy_holdings_excel_batches(
     file_path: str,
+    *,
+    meta_out: dict[str, str] | None = None,
 ) -> Any:
-    """openpyxl 流式按批产出持仓行，不将整个 Excel 载入 DataFrame。"""
+    """
+    openpyxl 流式按批产出持仓行；固定只读前 N 列（默认 A～E），单遍扫描。
+    """
     from openpyxl import load_workbook
 
     batch_size = _strategy_excel_row_batch_size()
+    max_c = _strategy_excel_read_max_col()
     wb = load_workbook(file_path, read_only=True, data_only=True)
     try:
         ws = wb.active
-        row_it = ws.iter_rows(values_only=True)
-        try:
-            header_row = next(row_it)
-        except StopIteration:
-            return
-        headers = [str(c).strip() if c is not None else "" for c in header_row]
-        idx: dict[str, int] = {h: i for i, h in enumerate(headers) if h}
-        for need in _STRATEGY_EXCEL_REQUIRED_COLS:
-            if need not in idx:
-                raise ValueError(f"缺少列: {need}")
-        i_dt = idx["调整日期"]
-        i_code = idx["证券代码"]
-        i_hw = idx.get("持仓权重")
-        i_iw = idx.get("行业中性权重")
+        header_row = next(
+            ws.iter_rows(min_row=1, max_row=1, min_col=1, max_col=max_c, values_only=True),
+            None,
+        )
+        col_index = _strategy_excel_parse_header(header_row)
+        i_dt = col_index["调整日期"]
+        i_code = col_index["证券代码"]
+        i_hw = col_index.get("持仓权重")
+        i_iw = col_index.get("行业中性权重")
         batch: list[tuple[date, str, float | None, float | None]] = []
         last_rb: date | None = None
+        category_done = [bool(meta_out and meta_out.get("strategy_category"))]
+        freq_done = [bool(meta_out and meta_out.get("rebalance_frequency"))]
+        meta_rows = 0
+        row_it = ws.iter_rows(
+            min_row=2,
+            min_col=1,
+            max_col=max_c,
+            values_only=True,
+        )
         for row in row_it:
             if not row:
                 continue
-            ncol = len(headers)
-            cells = list(row) + [None] * max(0, ncol - len(row))
+            cells = tuple(row)
+            if meta_out is not None and meta_rows < 3000:
+                meta_rows += 1
+                _strategy_excel_fill_meta_from_cells(
+                    cells, col_index, meta_out, category_done=category_done, freq_done=freq_done
+                )
             rb = _excel_cell_rebalance_date(cells[i_dt] if i_dt < len(cells) else None)
             raw_code = cells[i_code] if i_code < len(cells) else None
             if raw_code is None or (isinstance(raw_code, float) and pd.isna(raw_code)):
@@ -390,10 +475,69 @@ def _iter_strategy_holdings_excel_batches(
             if len(batch) >= batch_size:
                 yield batch
                 batch = []
+                gc.collect()
         if batch:
             yield batch
     finally:
         wb.close()
+
+
+def _strategy_positions_max_rebalance_date(db: Session, sid: str) -> date | None:
+    max_row = db.execute(
+        text(
+            f"""
+            SELECT {sql_max_date_expr("rebalance_date")} AS d
+            FROM strategy_positions
+            WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": sid},
+    ).mappings().first()
+    return _row_sql_date(max_row["d"]) if max_row and max_row.get("d") else None
+
+
+def _delete_strategy_positions_rebalance_period(
+    db: Session, sid: str, rebalance: date
+) -> None:
+    rb_cmp = _compact_date(rebalance)
+    db.execute(
+        text(
+            f"""
+            DELETE FROM strategy_positions
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
+            """
+        ),
+        {"sid": sid, "rb_cmp": rb_cmp},
+    )
+
+
+def _prepare_strategy_import_resume_last_period(db: Session, sid: str) -> date | None:
+    """
+    续传：删除库内最后一期（可能仅写入部分股票），返回该调仓日；
+    随后从 Excel 导入 rebalance_date >= 该日的全部行。
+    """
+    max_rb = _strategy_positions_max_rebalance_date(db, sid)
+    if max_rb is None:
+        return None
+    _delete_strategy_positions_rebalance_period(db, sid, max_rb)
+    _log.info(
+        "import resume %s: deleted last period %s before re-import",
+        sid,
+        max_rb.isoformat(),
+    )
+    return max_rb
+
+
+def _import_incremental_row_allowed(
+    rebalance: date,
+    cutoff: date | None,
+    *,
+    inclusive: bool,
+) -> bool:
+    if cutoff is None:
+        return True
+    return rebalance >= cutoff if inclusive else rebalance > cutoff
 
 
 def _import_strategy_holdings_from_excel(
@@ -403,30 +547,40 @@ def _import_strategy_holdings_from_excel(
     import_mode: str,
     *,
     sync_job_id: int | None = None,
+    repair_last_period: bool = False,
 ) -> dict[str, str]:
     """导入单策略 Excel 持仓；大文件走流式，返回 label_meta。"""
-    label_meta = _read_strategy_excel_label_meta(file_path)
+    label_meta: dict[str, str] = {}
     if _strategy_excel_use_streaming(file_path):
         if import_mode == "full":
             db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
-        max_rb: date | None = None
+        cutoff_rb: date | None = None
+        cutoff_inclusive = False
         if import_mode != "full":
-            max_row = db.execute(
-                text(
-                    f"""
-                    SELECT {sql_max_date_expr("rebalance_date")} AS d
-                    FROM strategy_positions
-                    WHERE strategy_id=:sid
-                    """
-                ),
-                {"sid": sid},
-            ).mappings().first()
-            max_rb = _row_sql_date(max_row["d"]) if max_row else None
+            if repair_last_period:
+                cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
+                cutoff_inclusive = cutoff_rb is not None
+                if cutoff_rb and sync_job_id is not None:
+                    _admin_sync_job_touch(
+                        sync_job_id,
+                        "import",
+                        f"阶段1/3 {sid}：续传已删最后一期 {cutoff_rb.isoformat()}，重导该期及之后…",
+                        db=db,
+                        do_commit=False,
+                    )
+            if cutoff_rb is None:
+                cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
         imported_rows = 0
         batch_no = 0
-        for chunk in _iter_strategy_holdings_excel_batches(file_path):
-            if import_mode != "full" and max_rb is not None:
-                chunk = [x for x in chunk if x[0] > max_rb]
+        for chunk in _iter_strategy_holdings_excel_batches(file_path, meta_out=label_meta):
+            if import_mode != "full" and cutoff_rb is not None:
+                chunk = [
+                    x
+                    for x in chunk
+                    if _import_incremental_row_allowed(
+                        x[0], cutoff_rb, inclusive=cutoff_inclusive
+                    )
+                ]
             if not chunk:
                 continue
             batch_no += 1
@@ -442,8 +596,7 @@ def _import_strategy_holdings_from_excel(
                     do_commit=False,
                 )
             chunk.clear()
-            if _wind_low_memory_mode():
-                gc.collect()
+            gc.collect()
         if imported_rows == 0 and import_mode == "full":
             raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
         _log.info(
@@ -453,9 +606,16 @@ def _import_strategy_holdings_from_excel(
             batch_no,
         )
     else:
+        # .xls 等：pandas 仅读必要列；行数过多时仍可能 OOM，建议另存为 .xlsx
+        label_meta = _read_strategy_excel_label_meta(file_path)
         label_meta2, rows_to_write = _read_strategy_holdings_excel(file_path)
-        label_meta = label_meta2 or label_meta
-        _import_write_positions_one_strategy(db, sid, rows_to_write, label_meta, import_mode)
+        label_meta.update({k: v for k, v in (label_meta2 or {}).items() if v})
+        _import_write_positions_one_strategy(
+            db, sid, rows_to_write, label_meta, import_mode, repair_last_period=repair_last_period
+        )
+        rows_to_write.clear()
+        del rows_to_write
+        gc.collect()
         return label_meta
     if label_meta:
         keys = [k for k, v in label_meta.items() if str(v or "").strip()]
@@ -485,21 +645,16 @@ def _read_strategy_holdings_excel(
     file_path: str,
 ) -> tuple[dict[str, str], list[tuple[date, str, float | None, float | None]]]:
     """
-    只读持仓相关列，避免宽表/格式列撑爆内存；解析后释放 DataFrame。
+    只读前 N 列（默认 A～E），避免宽表/格式列撑爆内存；解析后释放 DataFrame。
     """
-    header = pd.read_excel(file_path, sheet_name=0, nrows=0)
+    max_c = _strategy_excel_read_max_col()
+    usecols = _strategy_excel_pandas_usecols()
+    header = pd.read_excel(file_path, sheet_name=0, nrows=0, usecols=usecols)
     all_cols = [str(c).strip() for c in header.columns]
-    pick = [
-        c
-        for c in all_cols
-        if c in _STRATEGY_EXCEL_REQUIRED_COLS or c in _STRATEGY_EXCEL_OPTIONAL_COLS
-    ]
     for need in _STRATEGY_EXCEL_REQUIRED_COLS:
         if need not in all_cols:
-            raise ValueError(f"缺少列: {need}")
-    read_kw: dict[str, Any] = {"sheet_name": 0, "dtype": object}
-    if pick and len(pick) < len(all_cols):
-        read_kw["usecols"] = pick
+            raise ValueError(f"缺少列: {need}（须在前 {max_c} 列内）")
+    read_kw: dict[str, Any] = {"sheet_name": 0, "dtype": object, "usecols": usecols}
     try:
         df = pd.read_excel(file_path, engine="calamine", **read_kw)
     except Exception:
@@ -537,7 +692,7 @@ def _import_positions_batch(
     sid: str,
     write_rows: list[tuple[date, str, float | None, float | None]],
 ) -> None:
-    batch = max(50, int(getattr(settings, "strategy_import_position_batch_size", 500)))
+    batch = _strategy_import_position_batch_size()
     for i in range(0, len(write_rows), batch):
         chunk = write_rows[i : i + batch]
         db.execute(
@@ -1383,24 +1538,28 @@ def _import_write_positions_one_strategy(
     rows_to_write: list[tuple[date, str, float | None, float | None]],
     label_meta: dict[str, str],
     import_mode: str,
+    *,
+    repair_last_period: bool = False,
 ) -> None:
     """单策略：删/增 strategy_positions，可选更新 strategy_configs 元数据（不含 commit）。"""
     if import_mode == "full":
         db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
         write_rows = rows_to_write
     else:
-        max_row = db.execute(
-            text(
-                f"""
-                SELECT {sql_max_date_expr("rebalance_date")} AS d
-                FROM strategy_positions
-                WHERE strategy_id=:sid
-                """
-            ),
-            {"sid": sid},
-        ).mappings().first()
-        max_rb = _row_sql_date(max_row["d"]) if max_row else None
-        write_rows = [x for x in rows_to_write if (max_rb is None or x[0] > max_rb)]
+        cutoff_rb: date | None = None
+        cutoff_inclusive = False
+        if repair_last_period:
+            cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
+            cutoff_inclusive = cutoff_rb is not None
+        if cutoff_rb is None:
+            cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
+        write_rows = [
+            x
+            for x in rows_to_write
+            if _import_incremental_row_allowed(
+                x[0], cutoff_rb, inclusive=cutoff_inclusive
+            )
+        ]
     _import_positions_batch(db, sid, write_rows)
     if label_meta:
         keys = [k for k, v in label_meta.items() if str(v or "").strip()]
@@ -1774,6 +1933,7 @@ def import_strategy_files(
     skip_strategy_ids: set[str] | None = None,
     sync_job_id: int | None = None,
     strategy_import_job_id: int | None = None,
+    resume: bool = False,
 ) -> dict:
     selected_set = {str(x).strip() for x in (selected_strategy_ids or []) if str(x).strip()}
     skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
@@ -1852,16 +2012,27 @@ def import_strategy_files(
                 do_commit=do_commit,
             )
         try:
+            repair_last_period = bool(resume) and import_mode != "full"
             for attempt in range(4):
                 try:
                     if stream:
                         _import_strategy_holdings_from_excel(
-                            db, sid, file_path, import_mode, sync_job_id=sync_job_id
+                            db,
+                            sid,
+                            file_path,
+                            import_mode,
+                            sync_job_id=sync_job_id,
+                            repair_last_period=repair_last_period,
                         )
                     else:
                         label_meta, rows_to_write = _read_strategy_holdings_excel(file_path)
                         _import_write_positions_one_strategy(
-                            db, sid, rows_to_write, label_meta, import_mode
+                            db,
+                            sid,
+                            rows_to_write,
+                            label_meta,
+                            import_mode,
+                            repair_last_period=repair_last_period,
                         )
                         rows_to_write = None
                     if do_commit:
@@ -1878,8 +2049,7 @@ def import_strategy_files(
 
             imported_new += 1
             rows_to_write = None
-            if _wind_low_memory_mode():
-                gc.collect()
+            gc.collect()
             completed.add(sid)
             try:
                 from app.strategy_list_metrics import refresh_strategy_list_metrics_one
@@ -5189,6 +5359,7 @@ def execute_admin_sync_pipeline(
                     do_commit=True,
                     skip_strategy_ids=completed_import,
                     sync_job_id=sync_job_id,
+                    resume=resume,
                 )
                 completed_import = set(imp.get("completed_strategy_ids") or [])
                 if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
@@ -5452,6 +5623,7 @@ def run_strategy_import_background_task(
                 do_commit=True,
                 skip_strategy_ids=skip,
                 strategy_import_job_id=job_id,
+                resume=resume,
             )
             all_ids = set(ids)
             done = set(ret.get("completed_strategy_ids") or [])
