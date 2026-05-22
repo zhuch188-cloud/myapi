@@ -4012,6 +4012,7 @@ def admin_import(
                     finished_at=NULL,
                     completed_strategy_ids_json='[]',
                     imported_count=0,
+                    checkpoint_json=NULL,
                     message=:m
                 WHERE id=:id
                 """

@@ -559,50 +559,11 @@ def _delete_strategy_positions_rebalance_period(
     )
 
 
-def _assert_import_resume_not_gap_stuck(
-    db: Session,
-    sid: str,
-    file_path: str,
-    rows_baseline: int,
-    cutoff_rb: date | None,
-    *,
-    stats: dict[str, int | str] | None = None,
-) -> None:
-    """
-    续传仅重做库内 MAX(调仓日) 并导入 Excel >= 该日；中间残缺时续传无效。
-    在扫描 Excel 前比对「删末日前」各调仓日行数，避免白扫整表仍缺数千行。
-    """
-    if rows_baseline <= 0 and cutoff_rb is None:
-        return
-    ex_counts, ex_total = _excel_period_row_counts(file_path)
-    if stats is not None and ex_total > 0:
-        stats["expected_file_rows"] = ex_total
-    if ex_total <= 0:
-        return
-    db_counts, _ = _db_period_row_counts(db, sid)
-    if cutoff_rb is not None:
-        rb_iso = cutoff_rb.isoformat()
-        expected_baseline = sum(c for d, c in ex_counts.items() if d < rb_iso)
-        if rows_baseline != expected_baseline:
-            raise ValueError(
-                f"{sid} 删末调仓日 {rb_iso} 后基线 {rows_baseline} 行，"
-                f"按 Excel 累计应 {expected_baseline} 行（差 {rows_baseline - expected_baseline:+d}）。"
-                f"中间多期不完整，续传无法补全；请 confirm_wipe:true 全量清库重导。"
-            )
-        for d, ec in ex_counts.items():
-            if d >= rb_iso:
-                continue
-            dc = db_counts.get(d, 0)
-            if ec != dc:
-                raise ValueError(
-                    f"{sid} 调仓日 {d} 与 Excel 不一致（Excel {ec} / 库内 {dc}），"
-                    f"续传无法补中间残缺；请 confirm_wipe:true 全量清库重导。"
-                )
-    elif rows_baseline < ex_total:
-        raise ValueError(
-            f"{sid} 库内仅 {rows_baseline} 行，Excel {ex_total} 行；"
-            f"请 confirm_wipe:true 全量清库重导。"
-        )
+def _mismatch_rebalance_dates(
+    ex_counts: dict[str, int], db_counts: dict[str, int]
+) -> set[str]:
+    keys = set(ex_counts) | set(db_counts)
+    return {d for d in keys if ex_counts.get(d, 0) != db_counts.get(d, 0)}
 
 
 def _prepare_strategy_import_resume_from_db_max(
@@ -816,9 +777,89 @@ def _verify_strategy_positions_exact_match(
         raise ValueError(
             f"{sid} 调仓日与 Excel 不一致：共 {len(bad)} 期{extra}。"
             f"首期差异 {d0}（Excel {e0} / 库内 {b0}）。"
-            f"续传无法补中间残缺，请 confirm_wipe:true 全量清库重导。"
+            f"自动补写后仍不一致，请再点「续传」或 confirm_wipe:true 全量重导。"
         )
     return db_total, ex_total
+
+
+def _verify_strategy_positions_exact_match_with_auto_repair(
+    db: Session,
+    sid: str,
+    file_path: str,
+    *,
+    max_repair_rounds: int = 3,
+) -> tuple[int, int]:
+    """终态校验；不一致时按调仓日自动补写后重试，避免中断残留导致误失败。"""
+    last_err: ValueError | None = None
+    rounds = max(1, int(max_repair_rounds or 3))
+    for rnd in range(rounds):
+        try:
+            return _verify_strategy_positions_exact_match(db, sid, file_path)
+        except ValueError as ve:
+            last_err = ve
+            from app.db import run_under_turso_stream_lock
+
+            def _repair_once() -> int:
+                return _repair_strategy_positions_against_excel(db, sid, file_path)
+
+            n = int(run_under_turso_stream_lock(_repair_once) or 0)
+            if n <= 0:
+                raise
+            _log.info(
+                "import %s: 校验第 %s 轮不一致，已自动补写 %s 行后重试",
+                sid,
+                rnd + 1,
+                n,
+            )
+    if last_err is not None:
+        raise last_err
+    raise ValueError(f"{sid} 导入校验失败")
+
+
+def _heal_positions_gaps_from_excel(
+    db: Session,
+    sid: str,
+    file_path: str,
+    *,
+    stats: dict[str, int | str] | None = None,
+    sync_job_id: int | None = None,
+    strategy_import_job_id: int | None = None,
+) -> int:
+    """
+    对比 Excel/库内各调仓日行数，对不一致的日期整期 UPSERT（可修中间残缺，不依赖 confirm_wipe）。
+    """
+    from app.db import run_under_turso_stream_lock
+
+    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    if stats is not None and ex_total > 0:
+        stats["expected_file_rows"] = ex_total
+    if ex_total <= 0:
+        return 0
+    db_counts, _ = _db_period_row_counts(db, sid)
+    bad = _mismatch_rebalance_dates(ex_counts, db_counts)
+    if not bad:
+        return 0
+
+    def _do_heal() -> int:
+        return _repair_strategy_positions_against_excel(
+            db, sid, file_path, bad_dates=bad
+        )
+
+    n = int(run_under_turso_stream_lock(_do_heal) or 0)
+    if n > 0:
+        msg = (
+            f"阶段1/3 {sid}：检测到 {len(bad)} 个调仓日与 Excel 不一致，"
+            f"已自动补写 {n} 行…"
+        )
+        _import_progress_touch(
+            db,
+            msg,
+            sync_job_id=sync_job_id,
+            strategy_import_job_id=strategy_import_job_id,
+            do_commit=True,
+        )
+        _log.info("import %s: pre-import heal %s periods, %s rows", sid, len(bad), n)
+    return n
 
 
 def _verify_strategy_full_import_row_count(
@@ -832,7 +873,7 @@ def _verify_strategy_full_import_row_count(
     if str(import_mode or "").lower() != "full":
         db_n = _strategy_positions_row_count(db, sid)
         return db_n, 0
-    return _verify_strategy_positions_exact_match(db, sid, file_path)
+    return _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
 
 
 def _strategy_config_excel_path(db: Session, sid: str) -> str:
@@ -913,15 +954,48 @@ def _import_strategy_holdings_from_excel(
     delete_all = False
     if _strategy_excel_use_streaming(file_path):
         resume_cutoff: date | None = None
-        cutoff_rb, cutoff_inclusive, delete_all, rows_baseline = _import_cutoff_plan(
-            db,
-            sid,
-            import_mode,
-            repair_last_period=repair_last_period,
-        )
+        cutoff_rb: date | None = None
+        cutoff_inclusive = False
+        delete_all = False
+        rows_baseline = 0
         if repair_last_period:
+            healed_pre = _heal_positions_gaps_from_excel(
+                db,
+                sid,
+                file_path,
+                stats=stats,
+                sync_job_id=sync_job_id,
+                strategy_import_job_id=strategy_import_job_id,
+            )
+            if healed_pre:
+                stats["healed_rows"] = int(stats.get("healed_rows") or 0) + healed_pre
+            cutoff_rb, cutoff_inclusive, delete_all, rows_baseline = _import_cutoff_plan(
+                db,
+                sid,
+                import_mode,
+                repair_last_period=True,
+            )
             resume_cutoff = cutoff_rb
             stats["rows_before"] = rows_baseline
+            resume_from = resume_cutoff
+            _import_progress_touch(
+                db,
+                f"阶段1/3 {sid}：续传 — 已自动补写残缺调仓日"
+                f"{f'（{healed_pre} 行）' if healed_pre else ''}；"
+                f"库内最新调仓日 {resume_from.isoformat() if resume_from else '（无）'}"
+                f"，已删该日全部记录，从 Excel 写入 >= 该日；"
+                f"删后基线 {stats['rows_before']} 行…",
+                sync_job_id=sync_job_id,
+                strategy_import_job_id=strategy_import_job_id,
+                do_commit=False,
+            )
+        else:
+            cutoff_rb, cutoff_inclusive, delete_all, rows_baseline = _import_cutoff_plan(
+                db,
+                sid,
+                import_mode,
+                repair_last_period=False,
+            )
         if delete_all:
             _import_progress_touch(
                 db,
@@ -942,26 +1016,6 @@ def _import_strategy_holdings_from_excel(
             run_under_turso_stream_lock(_wipe)
             _import_after_batch_commit(db)
             stats["rows_before"] = 0
-        elif repair_last_period:
-            resume_from = resume_cutoff
-            _assert_import_resume_not_gap_stuck(
-                db,
-                sid,
-                file_path,
-                int(stats.get("rows_before") or 0),
-                resume_cutoff,
-                stats=stats,
-            )
-            _import_progress_touch(
-                db,
-                f"阶段1/3 {sid}：续传 — 已查库内最新调仓日"
-                f"{resume_from.isoformat() if resume_from else '（无，从首行）'}"
-                f"，删该日全部记录后从 Excel 写入 >= 该日；"
-                f"删后基线 {stats['rows_before']} 行（实计）；每批 commit 后再写下一批…",
-                sync_job_id=sync_job_id,
-                strategy_import_job_id=strategy_import_job_id,
-                do_commit=False,
-            )
         imported_rows = 0
         batch_no = 0
         skipped_rows = 0
@@ -1070,7 +1124,7 @@ def _import_strategy_holdings_from_excel(
             import_mode=import_mode,
         )
         if import_mode == "full":
-            _verify_strategy_positions_exact_match(db, sid, file_path)
+            _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
         _log.info(
             "import_strategy %s streaming done excel=%s imported=%s db=%s skipped=%s mode=%s repair=%s",
             sid,
@@ -1123,7 +1177,7 @@ def _import_strategy_holdings_from_excel(
             import_mode=import_mode,
         )
         if import_mode == "full":
-            _verify_strategy_positions_exact_match(db, sid, file_path)
+            _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
         rows_to_write.clear()
         del rows_to_write
         gc.collect()
@@ -1264,17 +1318,20 @@ def _commit_positions_chunk_resilient(
 
 
 def _repair_strategy_positions_against_excel(
-    db: Session, sid: str, file_path: str
+    db: Session,
+    sid: str,
+    file_path: str,
+    *,
+    bad_dates: set[str] | None = None,
 ) -> int:
     """
-    导入主循环结束后：按调仓日对比 Excel/库内行数，对不一致的日期整期 UPSERT 补写。
+    按调仓日对比 Excel/库内行数，对不一致的日期整期 UPSERT 补写。
     返回补写行数。
     """
-    ex_counts, _ = _excel_period_row_counts(file_path)
-    db_counts, _ = _db_period_row_counts(db, sid)
-    bad_dates = {
-        d for d, ec in ex_counts.items() if db_counts.get(d, 0) != ec
-    }
+    if bad_dates is None:
+        ex_counts, _ = _excel_period_row_counts(file_path)
+        db_counts, _ = _db_period_row_counts(db, sid)
+        bad_dates = _mismatch_rebalance_dates(ex_counts, db_counts)
     if not bad_dates:
         return 0
     _log.info(
@@ -1297,8 +1354,11 @@ def _repair_strategy_positions_against_excel(
     if buf:
         _commit_positions_chunk_resilient(db, sid, buf, batch_no=0)
         repaired += len(buf)
+    ex_counts2, _ = _excel_period_row_counts(file_path)
     db_counts2, _ = _db_period_row_counts(db, sid)
-    still = [d for d in bad_dates if db_counts2.get(d, 0) != ex_counts.get(d, 0)]
+    still = [
+        d for d in bad_dates if db_counts2.get(d, 0) != ex_counts2.get(d, 0)
+    ]
     if still:
         _log.warning(
             "import %s: 补写后仍有 %s 个调仓日与 Excel 不一致: %s…",
@@ -6068,7 +6128,9 @@ def execute_admin_sync_pipeline(
                 for sid in sorted(completed_import):
                     try:
                         fp = _strategy_config_excel_path(db, sid)
-                        _verify_strategy_positions_exact_match(db, sid, fp)
+                        _verify_strategy_positions_exact_match_with_auto_repair(
+                            db, sid, fp
+                        )
                     except ValueError as ve:
                         completed_import.discard(sid)
                         verify_errors.append(str(ve))
