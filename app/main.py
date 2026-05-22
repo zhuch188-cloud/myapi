@@ -3964,6 +3964,7 @@ def admin_import(
         from app.timeutil import now_naive
 
         resume_ts = now_naive().strftime("%Y-%m-%d %H:%M:%S")
+        im = str(job.get("import_mode") or "full")
         db.execute(
             text(
                 f"""
@@ -3976,7 +3977,10 @@ def admin_import(
                 WHERE id=:id
                 """
             ),
-            {"id": job_id, "m": f"续传已入队（{resume_ts}）"},
+            {
+                "id": job_id,
+                "m": f"续传已入队（{resume_ts}，模式 {im}；全量续传仍清空后重导，增量续传删最后一期）",
+            },
         )
         db.commit()
         background_tasks.add_task(run_strategy_import_background_task, job_id, resume=True)
@@ -3985,7 +3989,8 @@ def admin_import(
             "queued": True,
             "resumed": True,
             "import_job_id": job_id,
-            "message": f"已续传策略导入任务 #{job_id}，请轮询 GET /api/admin/import-jobs/{job_id}",
+            "import_mode": im,
+            "message": f"已续传策略导入任务 #{job_id}（模式 {im}）",
         }
     if bool(body.get("background")):
         if not ids:
@@ -4223,7 +4228,7 @@ def admin_sync_job_resume(
             WHERE id=:id
             """
         ),
-        {"id": job_id, "m": f"续传已入队（{resume_ts}）"},
+        {"id": job_id, "m": f"续传已入队（{resume_ts}，模式 {import_mode}）"},
     )
     db.commit()
     spawn_daemon(

@@ -579,6 +579,38 @@ def _import_incremental_row_allowed(
     return rebalance >= cutoff if inclusive else rebalance > cutoff
 
 
+def _import_after_batch_commit(db: Session) -> None:
+    """每批落库后释放 ORM 身份映射，减轻长时流式导入内存爬升。"""
+    try:
+        db.expire_all()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _import_cutoff_plan(
+    db: Session,
+    sid: str,
+    import_mode: str,
+    *,
+    repair_last_period: bool,
+) -> tuple[date | None, bool, bool]:
+    """
+    返回 (cutoff_rb, cutoff_inclusive, delete_all)。
+    全量：始终清空该策略持仓后整表重导（含续传）；增量：按 cutoff 追加/续传删最后一期。
+    """
+    if import_mode == "full":
+        return None, False, True
+    cutoff_rb: date | None = None
+    cutoff_inclusive = False
+    if repair_last_period:
+        cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
+        cutoff_inclusive = cutoff_rb is not None
+    else:
+        cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
+    return cutoff_rb, cutoff_inclusive, False
+
+
 def _import_strategy_holdings_from_excel(
     db: Session,
     sid: str,
@@ -592,28 +624,27 @@ def _import_strategy_holdings_from_excel(
     """导入单策略 Excel 持仓；大文件走流式，返回 label_meta。"""
     label_meta: dict[str, str] = {}
     if _strategy_excel_use_streaming(file_path):
-        if import_mode == "full":
+        cutoff_rb, cutoff_inclusive, delete_all = _import_cutoff_plan(
+            db, sid, import_mode, repair_last_period=repair_last_period
+        )
+        if delete_all:
             db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
-        cutoff_rb: date | None = None
-        cutoff_inclusive = False
-        if import_mode != "full":
-            if repair_last_period:
-                cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
-                cutoff_inclusive = cutoff_rb is not None
-                if cutoff_rb:
-                    _import_progress_touch(
-                        db,
-                        f"阶段1/3 {sid}：续传已删最后一期 {cutoff_rb.isoformat()}，重导该期及之后…",
-                        sync_job_id=sync_job_id,
-                        strategy_import_job_id=strategy_import_job_id,
-                        do_commit=False,
-                    )
-            if cutoff_rb is None:
-                cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
+            db.commit()
+            _import_after_batch_commit(db)
+        elif repair_last_period and cutoff_rb:
+            _import_progress_touch(
+                db,
+                f"阶段1/3 {sid}：续传已删最后一期 {cutoff_rb.isoformat()}，重导该期及之后…",
+                sync_job_id=sync_job_id,
+                strategy_import_job_id=strategy_import_job_id,
+                do_commit=False,
+            )
         imported_rows = 0
         batch_no = 0
+        skipped_rows = 0
         for chunk in _iter_strategy_holdings_excel_batches(file_path, meta_out=label_meta):
             if import_mode != "full" and cutoff_rb is not None:
+                before = len(chunk)
                 chunk = [
                     x
                     for x in chunk
@@ -621,28 +652,33 @@ def _import_strategy_holdings_from_excel(
                         x[0], cutoff_rb, inclusive=cutoff_inclusive
                     )
                 ]
+                skipped_rows += before - len(chunk)
             if not chunk:
                 continue
             batch_no += 1
             _import_positions_batch(db, sid, chunk)
             imported_rows += len(chunk)
             db.commit()
+            _import_after_batch_commit(db)
             _import_progress_touch(
                 db,
-                f"阶段1/3 {sid}：流式导入 第 {batch_no} 批，已累计 {imported_rows} 行…",
+                f"阶段1/3 {sid}：流式导入 第 {batch_no} 批，已累计 {imported_rows} 行"
+                f"{f'（跳过已入库 {skipped_rows} 行）' if skipped_rows else ''}…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=False,
             )
             chunk.clear()
-            gc.collect()
         if imported_rows == 0 and import_mode == "full":
             raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
         _log.info(
-            "import_strategy %s streaming done rows=%s batches=%s",
+            "import_strategy %s streaming done rows=%s skipped=%s batches=%s mode=%s repair=%s",
             sid,
             imported_rows,
+            skipped_rows,
             batch_no,
+            import_mode,
+            repair_last_period,
         )
     else:
         # .xls 等：pandas 仅读必要列；行数过多时仍可能 OOM，建议另存为 .xlsx
@@ -1595,21 +1631,18 @@ def _import_write_positions_one_strategy(
     repair_last_period: bool = False,
 ) -> None:
     """单策略：删/增 strategy_positions，可选更新 strategy_configs 元数据（不含 commit）。"""
-    if import_mode == "full":
+    cutoff_rb, cutoff_inclusive, delete_all = _import_cutoff_plan(
+        db, sid, import_mode, repair_last_period=repair_last_period
+    )
+    if delete_all:
         db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
         write_rows = rows_to_write
     else:
-        cutoff_rb: date | None = None
-        cutoff_inclusive = False
-        if repair_last_period:
-            cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
-            cutoff_inclusive = cutoff_rb is not None
-        if cutoff_rb is None:
-            cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
         write_rows = [
             x
             for x in rows_to_write
-            if _import_incremental_row_allowed(
+            if cutoff_rb is None
+            or _import_incremental_row_allowed(
                 x[0], cutoff_rb, inclusive=cutoff_inclusive
             )
         ]
