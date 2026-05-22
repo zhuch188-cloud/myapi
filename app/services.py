@@ -630,6 +630,51 @@ def _strategy_positions_import_stats(db: Session, sid: str) -> tuple[int, date |
     return n, max_rb
 
 
+def _strategy_positions_row_count(db: Session, sid: str) -> int:
+    row = db.execute(
+        text("SELECT COUNT(*) AS n FROM strategy_positions WHERE strategy_id=:sid"),
+        {"sid": sid},
+    ).mappings().first()
+    return int(row.get("n") or 0) if row else 0
+
+
+def _validate_strategy_import_result(
+    sid: str,
+    stats: dict[str, int],
+    *,
+    delete_all: bool,
+    repair_last_period: bool,
+    import_mode: str,
+) -> None:
+    """导入结束校验：续传(full)也必须库内行数接近本次扫描的 Excel 有效行数。"""
+    rows_before = int(stats.get("rows_before") or 0)
+    rows_after = int(stats.get("rows_after") or 0)
+    imported = int(stats.get("imported_rows") or 0)
+    excel_rows = int(stats.get("excel_rows") or 0)
+    need_complete = delete_all or (repair_last_period and import_mode == "full")
+    if need_complete and excel_rows > 0:
+        min_rows = int(excel_rows * 0.98)
+        if rows_after < min_rows:
+            raise ValueError(
+                f"{sid} 持仓不完整：Excel 有效约 {excel_rows} 行，库内 {rows_after} 行"
+                f"（差 {excel_rows - rows_after}）。"
+                f"进程可能在 Render 上被重启/OOM 中断，请点「续传」继续，不要新建全量。"
+            )
+    if delete_all:
+        if rows_after <= 0:
+            raise ValueError(f"{sid} 全量导入后库内 0 行")
+        return
+    if repair_last_period:
+        if rows_before > 0 and imported <= 0 and rows_after < int(excel_rows * 0.98):
+            raise ValueError(
+                f"{sid} 续传未写入新行且库内仍明显少于 Excel（{rows_after}/{excel_rows}），请再点「续传」"
+            )
+        if rows_after + 200 < rows_before:
+            raise ValueError(
+                f"{sid} 续传后行数异常减少 {rows_before} → {rows_after}，请再点「续传」或全量重来"
+            )
+
+
 def _import_strategy_holdings_from_excel(
     db: Session,
     sid: str,
@@ -639,13 +684,22 @@ def _import_strategy_holdings_from_excel(
     sync_job_id: int | None = None,
     strategy_import_job_id: int | None = None,
     repair_last_period: bool = False,
-) -> dict[str, str]:
-    """导入单策略 Excel 持仓；大文件走流式，返回 label_meta。"""
+) -> tuple[dict[str, str], dict[str, int]]:
+    """导入单策略 Excel 持仓；大文件走流式。返回 (label_meta, import_stats)。"""
     label_meta: dict[str, str] = {}
+    stats: dict[str, int] = {
+        "rows_before": _strategy_positions_row_count(db, sid),
+        "excel_rows": 0,
+        "imported_rows": 0,
+        "skipped_rows": 0,
+        "rows_after": 0,
+    }
+    delete_all = False
     if _strategy_excel_use_streaming(file_path):
         prior_rows, prior_max_rb = (0, None)
         if repair_last_period:
             prior_rows, prior_max_rb = _strategy_positions_import_stats(db, sid)
+            stats["rows_before"] = prior_rows
         cutoff_rb, cutoff_inclusive, delete_all = _import_cutoff_plan(
             db, sid, import_mode, repair_last_period=repair_last_period
         )
@@ -676,7 +730,9 @@ def _import_strategy_holdings_from_excel(
         batch_no = 0
         skipped_rows = 0
         scan_batch_no = 0
+        excel_rows = 0
         for chunk in _iter_strategy_holdings_excel_batches(file_path, meta_out=label_meta):
+            excel_rows += len(chunk)
             if cutoff_rb is not None:
                 before = len(chunk)
                 chunk = [
@@ -689,16 +745,15 @@ def _import_strategy_holdings_from_excel(
                 skipped_rows += before - len(chunk)
             if not chunk:
                 scan_batch_no += 1
-                if scan_batch_no % 12 == 0 and cutoff_rb is not None:
+                if scan_batch_no % 48 == 0 and cutoff_rb is not None:
                     _import_progress_touch(
                         db,
                         f"阶段1/3 {sid}：续传扫描 Excel… 已跳过 {skipped_rows} 行"
                         f"{f'，已写入 {imported_rows} 行' if imported_rows else ''}…",
                         sync_job_id=sync_job_id,
                         strategy_import_job_id=strategy_import_job_id,
-                        do_commit=True,
+                        do_commit=False,
                     )
-                    db.commit()
                 continue
             batch_no += 1
             _import_positions_batch(db, sid, chunk)
@@ -711,17 +766,29 @@ def _import_strategy_holdings_from_excel(
                 f"{f'（跳过已入库 {skipped_rows} 行）' if skipped_rows else ''}…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
-                do_commit=False,
+                do_commit=True,
             )
             chunk.clear()
+        stats["excel_rows"] = excel_rows
+        stats["imported_rows"] = imported_rows
+        stats["skipped_rows"] = skipped_rows
+        stats["rows_after"] = _strategy_positions_row_count(db, sid)
         if imported_rows == 0 and import_mode == "full" and not repair_last_period:
             raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
-        _log.info(
-            "import_strategy %s streaming done rows=%s skipped=%s batches=%s mode=%s repair=%s",
+        _validate_strategy_import_result(
             sid,
+            stats,
+            delete_all=delete_all,
+            repair_last_period=repair_last_period,
+            import_mode=import_mode,
+        )
+        _log.info(
+            "import_strategy %s streaming done excel=%s imported=%s db=%s skipped=%s mode=%s repair=%s",
+            sid,
+            excel_rows,
             imported_rows,
+            stats["rows_after"],
             skipped_rows,
-            batch_no,
             import_mode,
             repair_last_period,
         )
@@ -744,13 +811,26 @@ def _import_strategy_holdings_from_excel(
             do_commit=False,
         )
         label_meta.update({k: v for k, v in (label_meta2 or {}).items() if v})
+        stats["excel_rows"] = len(rows_to_write)
+        delete_all = import_mode == "full" and not repair_last_period
         _import_write_positions_one_strategy(
             db, sid, rows_to_write, label_meta, import_mode, repair_last_period=repair_last_period
+        )
+        stats["rows_after"] = _strategy_positions_row_count(db, sid)
+        stats["imported_rows"] = stats["rows_after"] if delete_all else max(
+            0, stats["rows_after"] - stats["rows_before"]
+        )
+        _validate_strategy_import_result(
+            sid,
+            stats,
+            delete_all=delete_all,
+            repair_last_period=repair_last_period,
+            import_mode=import_mode,
         )
         rows_to_write.clear()
         del rows_to_write
         gc.collect()
-        return label_meta
+        return label_meta, stats
     if label_meta:
         keys = [k for k, v in label_meta.items() if str(v or "").strip()]
         if keys:
@@ -761,7 +841,7 @@ def _import_strategy_holdings_from_excel(
                 text(f"UPDATE strategy_configs SET {sets} WHERE strategy_id=:sid"),
                 params,
             )
-    return label_meta
+    return label_meta, stats
 
 _POSITION_UPSERT_SQL = text(
     """
@@ -1955,9 +2035,45 @@ def strategy_import_job_is_resumable(job: dict[str, Any]) -> bool:
     st = str(job.get("status") or "").upper()
     if st in ("SUCCESS", "ABANDONED"):
         return False
-    all_ids = set(_json_str_list(job.get("strategy_ids_json")))
-    done = set(_json_str_list(job.get("completed_strategy_ids_json")))
-    return bool(all_ids - done) and st in ("FAILED", "RUNNING", "QUEUED", "PARTIAL")
+    return st in ("FAILED", "RUNNING", "QUEUED", "PARTIAL")
+
+
+def find_resumable_strategy_import_job(
+    db: Session, strategy_ids: list[str]
+) -> dict[str, Any] | None:
+    """是否存在针对相同策略、可续传的失败/中断任务（避免重复全量清空）。"""
+    want = {str(x).strip() for x in strategy_ids if str(x).strip()}
+    if not want:
+        return None
+    rows = db.execute(
+        text(
+            """
+            SELECT id, status, import_mode, strategy_ids_json, message, progress_at
+            FROM strategy_import_jobs
+            WHERE status IN ('FAILED', 'RUNNING', 'QUEUED', 'PARTIAL')
+            ORDER BY id DESC
+            LIMIT 30
+            """
+        )
+    ).mappings().all()
+    for row in rows:
+        job = dict(row)
+        if not strategy_import_job_is_resumable(job):
+            continue
+        ids = set(_json_str_list(job.get("strategy_ids_json")))
+        if ids & want:
+            return job
+    return None
+
+
+def count_strategy_positions_rows(db: Session, strategy_ids: list[str]) -> int:
+    ids = [str(x).strip() for x in strategy_ids if str(x).strip()]
+    if not ids:
+        return 0
+    total = 0
+    for sid in ids:
+        total += _strategy_positions_row_count(db, sid)
+    return total
 
 
 def admin_sync_job_is_resumable(row: dict[str, Any]) -> bool:
@@ -2074,7 +2190,8 @@ def import_strategy_files(
         if not job:
             return {"imported": 0, "failed": 1, "errors": ["strategy import job not found"]}
         selected_set = set(_json_str_list(job.get("strategy_ids_json")))
-        skip |= set(_json_str_list(job.get("completed_strategy_ids_json")))
+        if not resume:
+            skip |= set(_json_str_list(job.get("completed_strategy_ids_json")))
         import_mode = str(job.get("import_mode") or import_mode)
 
     if selected_set:
@@ -2150,29 +2267,18 @@ def import_strategy_files(
             )
         try:
             repair_last_period = bool(resume)
+            import_stats: dict[str, int] = {}
             for attempt in range(4):
                 try:
-                    if stream:
-                        _import_strategy_holdings_from_excel(
-                            db,
-                            sid,
-                            file_path,
-                            import_mode,
-                            sync_job_id=sync_job_id,
-                            strategy_import_job_id=strategy_import_job_id,
-                            repair_last_period=repair_last_period,
-                        )
-                    else:
-                        label_meta, rows_to_write = _read_strategy_holdings_excel(file_path)
-                        _import_write_positions_one_strategy(
-                            db,
-                            sid,
-                            rows_to_write,
-                            label_meta,
-                            import_mode,
-                            repair_last_period=repair_last_period,
-                        )
-                        rows_to_write = None
+                    label_meta, import_stats = _import_strategy_holdings_from_excel(
+                        db,
+                        sid,
+                        file_path,
+                        import_mode,
+                        sync_job_id=sync_job_id,
+                        strategy_import_job_id=strategy_import_job_id,
+                        repair_last_period=repair_last_period,
+                    )
                     if do_commit:
                         db.commit()
                     break
@@ -2196,9 +2302,13 @@ def import_strategy_files(
             except Exception:
                 _log.exception("strategy_list_metrics refresh after import sid=%s", sid)
             done_list = sorted(completed)
+            db_rows = import_stats.get("rows_after") or _strategy_positions_row_count(db, sid)
+            excel_rows = import_stats.get("excel_rows") or 0
             prog_msg = (
                 f"阶段1/3 [{len(completed)}/{total_targets}] 已完成 {sid}"
-                f"（累计 {len(completed)}/{total_targets}，失败 {failed}）"
+                f"（库内 {db_rows} 行"
+                f"{f'，Excel 约 {excel_rows} 行' if excel_rows else ''}"
+                f"，累计 {len(completed)}/{total_targets}，失败 {failed}）"
             )
             _import_progress_touch(
                 db,
@@ -2231,7 +2341,6 @@ def import_strategy_files(
                     db,
                     int(strategy_import_job_id),
                     message=prog_msg,
-                    completed_ids=done_list,
                     imported=len(completed),
                     failed=failed,
                     errors=errors,
@@ -5776,14 +5885,19 @@ def run_strategy_import_background_task(
         )
         all_ids = set(ids)
         done = set(ret.get("completed_strategy_ids") or [])
+        row_checks: list[str] = []
+        for sid in sorted(all_ids):
+            cnt = _strategy_positions_row_count(db, sid)
+            row_checks.append(f"{sid}={cnt}")
         ok = all_ids <= done and int(ret.get("failed") or 0) == 0
         st = "SUCCESS" if ok else "FAILED"
         if not ok and ret.get("resumable"):
             st = "FAILED"
+        rows_hint = "；".join(row_checks) if row_checks else ""
         msg = (
-            f"完成：成功 {len(done)}/{len(all_ids)} 个策略"
+            f"完成：成功 {len(done)}/{len(all_ids)} 个策略（{rows_hint}）"
             if ok
-            else f"部分完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」"
+            else f"未完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」。{rows_hint}"
         )
         db.execute(
             text(

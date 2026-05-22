@@ -618,17 +618,37 @@
         const ids = selectedStrategyIds();
         const msg = document.getElementById("jobMsg");
         if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
+        let confirmWipe = false;
+        if (importMode === "full") {
+          const hint =
+            "全量导入会先 DELETE 清空所选策略在库内的全部持仓，再从 Excel 首行写入。\n\n"
+            + "若上次任务失败，应点任务表「续传」，不要重复全量。\n\n"
+            + "确定继续全量导入吗？";
+          if (!confirm(hint)) return;
+          confirmWipe = true;
+        }
         try {
           msg.textContent = `${importMode === "full" ? "全量" : "增量"}导入已提交…`;
           const ret = await api("/api/admin/import", {
             method: "POST",
-            body: JSON.stringify({ strategy_ids: ids, import_mode: importMode, background: true }),
+            body: JSON.stringify({
+              strategy_ids: ids,
+              import_mode: importMode,
+              background: true,
+              confirm_wipe: confirmWipe,
+            }),
           });
           if (ret.import_job_id != null) {
             ensureJobTableAutoRefresh();
             await pollImportJob(ret.import_job_id);
           }
-        } catch (e) { msg.textContent = formatFetchError(e); }
+        } catch (e) {
+          const t = formatFetchError(e);
+          msg.textContent = t;
+          if (t.includes("续传") || t.includes("confirm_wipe") || t.includes("清空")) {
+            await loadImportJobs();
+          }
+        }
       }
       function resumableJobButtons(resumeFn, abandonFn, id) {
         return `<div class="job-task-actions">`

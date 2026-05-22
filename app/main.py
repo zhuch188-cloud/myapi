@@ -66,6 +66,8 @@ from app.services import (
     get_strategy_import_job_row,
     run_strategy_import_background_task,
     strategy_import_job_is_resumable,
+    find_resumable_strategy_import_job,
+    count_strategy_positions_rows,
     admin_sync_job_is_resumable,
     abandon_strategy_import_job,
     abandon_admin_sync_job,
@@ -3978,6 +3980,8 @@ def admin_import(
                     started_at={sql_now()},
                     progress_at={sql_now()},
                     finished_at=NULL,
+                    completed_strategy_ids_json='[]',
+                    imported_count=0,
                     message=:m
                 WHERE id=:id
                 """
@@ -4008,6 +4012,16 @@ def admin_import(
                 status_code=400,
                 detail="background import requires non-empty strategy_ids",
             )
+        if mode == "full":
+            row_count = count_strategy_positions_rows(db, ids)
+            if row_count > 0 and not bool(body.get("confirm_wipe")):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"库内已有 {row_count} 行持仓，全量将先清空再导入。"
+                        "若确要重来请传 confirm_wipe:true；中断后请对同一任务点「续传」。"
+                    ),
+                )
         job_id = create_strategy_import_job(
             db,
             strategy_ids=ids,
