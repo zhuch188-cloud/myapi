@@ -551,6 +551,52 @@ def _delete_strategy_positions_rebalance_period(
     )
 
 
+def _assert_import_resume_not_gap_stuck(
+    db: Session,
+    sid: str,
+    file_path: str,
+    rows_baseline: int,
+    cutoff_rb: date | None,
+    *,
+    stats: dict[str, int | str] | None = None,
+) -> None:
+    """
+    续传仅重做库内 MAX(调仓日) 并导入 Excel >= 该日；中间残缺时续传无效。
+    在扫描 Excel 前比对「删末日前」各调仓日行数，避免白扫整表仍缺数千行。
+    """
+    if rows_baseline <= 0 and cutoff_rb is None:
+        return
+    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    if stats is not None and ex_total > 0:
+        stats["expected_file_rows"] = ex_total
+    if ex_total <= 0:
+        return
+    db_counts, _ = _db_period_row_counts(db, sid)
+    if cutoff_rb is not None:
+        rb_iso = cutoff_rb.isoformat()
+        expected_baseline = sum(c for d, c in ex_counts.items() if d < rb_iso)
+        if rows_baseline != expected_baseline:
+            raise ValueError(
+                f"{sid} 删末调仓日 {rb_iso} 后基线 {rows_baseline} 行，"
+                f"按 Excel 累计应 {expected_baseline} 行（差 {rows_baseline - expected_baseline:+d}）。"
+                f"中间多期不完整，续传无法补全；请 confirm_wipe:true 全量清库重导。"
+            )
+        for d, ec in ex_counts.items():
+            if d >= rb_iso:
+                continue
+            dc = db_counts.get(d, 0)
+            if ec != dc:
+                raise ValueError(
+                    f"{sid} 调仓日 {d} 与 Excel 不一致（Excel {ec} / 库内 {dc}），"
+                    f"续传无法补中间残缺；请 confirm_wipe:true 全量清库重导。"
+                )
+    elif rows_baseline < ex_total:
+        raise ValueError(
+            f"{sid} 库内仅 {rows_baseline} 行，Excel {ex_total} 行；"
+            f"请 confirm_wipe:true 全量清库重导。"
+        )
+
+
 def _prepare_strategy_import_resume_from_db_max(
     db: Session, sid: str
 ) -> tuple[date | None, int]:
@@ -686,6 +732,82 @@ def _count_strategy_excel_data_rows(file_path: str) -> int:
     return n
 
 
+def _excel_period_row_counts(file_path: str) -> tuple[dict[str, int], int]:
+    """按调仓日统计 Excel 有效行数（与导入解析规则一致）。"""
+    counts: dict[str, int] = defaultdict(int)
+    total = 0
+    for chunk in _iter_strategy_holdings_excel_batches(file_path):
+        for rb, _code, _hw, _iw in chunk:
+            k = rb.isoformat()
+            counts[k] += 1
+            total += 1
+        chunk.clear()
+    return dict(counts), total
+
+
+def _db_period_row_counts(db: Session, sid: str) -> tuple[dict[str, int], int]:
+    rows = db.execute(
+        text(
+            """
+            SELECT rebalance_date AS rb, COUNT(*) AS cnt
+            FROM strategy_positions
+            WHERE strategy_id=:sid
+            GROUP BY rebalance_date
+            """
+        ),
+        {"sid": sid},
+    ).mappings().all()
+    counts: dict[str, int] = {}
+    total = 0
+    for r in rows:
+        d = _row_sql_date(r.get("rb"))
+        if not d:
+            continue
+        k = d.isoformat()
+        c = int(r.get("cnt") or 0)
+        counts[k] = c
+        total += c
+    return counts, total
+
+
+def _verify_strategy_positions_exact_match(
+    db: Session,
+    sid: str,
+    file_path: str,
+) -> tuple[int, int]:
+    """
+    全量导入终态校验：总行数与每个调仓日行数均须与 Excel 完全一致（不多不少）。
+    返回 (db_rows, excel_rows)；不达标抛错，禁止标 SUCCESS。
+    """
+    if not os.path.isfile(file_path):
+        raise ValueError(f"{sid} Excel 不存在: {file_path}")
+    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    if ex_total <= 0:
+        raise ValueError(f"{sid} Excel 无有效持仓行")
+    db_counts, db_total = _db_period_row_counts(db, sid)
+    if db_total != ex_total:
+        raise ValueError(
+            f"{sid} 行数不一致：Excel {ex_total} 行，库内 {db_total} 行（差 {db_total - ex_total:+d}）。"
+            f"请全量导入并传 confirm_wipe:true 清库后重导。"
+        )
+    all_dates = sorted(set(ex_counts) | set(db_counts))
+    bad: list[tuple[str, int, int]] = []
+    for d in all_dates:
+        ec = ex_counts.get(d, 0)
+        dc = db_counts.get(d, 0)
+        if ec != dc:
+            bad.append((d, ec, dc))
+    if bad:
+        d0, e0, b0 = bad[0]
+        extra = f"；另有 {len(bad) - 1} 个调仓日" if len(bad) > 1 else ""
+        raise ValueError(
+            f"{sid} 调仓日与 Excel 不一致：共 {len(bad)} 期{extra}。"
+            f"首期差异 {d0}（Excel {e0} / 库内 {b0}）。"
+            f"续传无法补中间残缺，请 confirm_wipe:true 全量清库重导。"
+        )
+    return db_total, ex_total
+
+
 def _verify_strategy_full_import_row_count(
     db: Session,
     sid: str,
@@ -693,27 +815,11 @@ def _verify_strategy_full_import_row_count(
     *,
     import_mode: str,
 ) -> tuple[int, int]:
-    """
-    全量/续传(full) 完成后：库内行数须 ≥ Excel 有效行数 98%。
-    返回 (db_rows, excel_rows)；不达标则抛错（防止任务误标 SUCCESS）。
-    """
+    """全量完成后与 Excel 逐期完全一致；增量模式不在此做全表比对。"""
     if str(import_mode or "").lower() != "full":
         db_n = _strategy_positions_row_count(db, sid)
         return db_n, 0
-    if not os.path.isfile(file_path):
-        raise ValueError(f"{sid} Excel 不存在: {file_path}")
-    excel_n = _count_strategy_excel_data_rows(file_path)
-    db_n = _strategy_positions_row_count(db, sid)
-    if excel_n <= 0:
-        raise ValueError(f"{sid} Excel 无有效持仓行")
-    min_n = int(excel_n * 0.98)
-    if db_n < min_n:
-        raise ValueError(
-            f"{sid} 导入后校验失败：Excel 约 {excel_n} 行，库内 {db_n} 行（差 {excel_n - db_n}）。"
-            f"中间调仓日残缺时「续传」只重做库内最后一天，无法补全；"
-            f"请全量导入并传 confirm_wipe:true 清库后重导。"
-        )
-    return db_n, excel_n
+    return _verify_strategy_positions_exact_match(db, sid, file_path)
 
 
 def _strategy_config_excel_path(db: Session, sid: str) -> str:
@@ -744,19 +850,17 @@ def _validate_strategy_import_result(
     expected_total = int(stats.get("expected_file_rows") or 0) or excel_rows
     need_complete = delete_all or (repair_last_period and import_mode == "full")
     if need_complete and expected_total > 0:
-        min_rows = int(expected_total * 0.98)
-        if rows_after < min_rows:
+        if rows_after != expected_total:
             gap = expected_total - rows_after
-            scanned_all = excel_rows >= int(expected_total * 0.95)
-            if repair_last_period and scanned_all and gap > expected_total * 0.15:
+            scanned_all = excel_rows >= expected_total
+            if repair_last_period and scanned_all and abs(gap) > max(50, int(expected_total * 0.01)):
                 raise ValueError(
-                    f"{sid} 已扫完 Excel 但库内仅 {rows_after} 行（约 {expected_total} 行），"
-                    f"中间多期不完整，仅靠「续传」无法补全。"
-                    f"请一次全量导入并传 confirm_wipe:true 清库后重导。"
+                    f"{sid} 已扫完 Excel 但库内 {rows_after} 行 ≠ Excel {expected_total} 行，"
+                    f"中间多期不完整，续传无法补全；请 confirm_wipe:true 全量清库重导。"
                 )
             raise ValueError(
-                f"{sid} 持仓不完整：Excel 有效约 {expected_total} 行，库内 {rows_after} 行（差 {gap}）。"
-                f"{'进程可能在 Render 重启前未写完，请再点「续传」。' if not scanned_all else '请再点「续传」或全量清库重来。'}"
+                f"{sid} 行数不一致：Excel {expected_total} 行，库内 {rows_after} 行（差 {gap:+d}）。"
+                f"{'进程可能在 Render 重启前未写完，请再点「续传」。' if not scanned_all else '请 confirm_wipe:true 全量清库重导。'}"
             )
     if delete_all:
         if rows_after <= 0:
@@ -764,9 +868,9 @@ def _validate_strategy_import_result(
         return
     if repair_last_period:
         exp = int(stats.get("expected_file_rows") or 0) or excel_rows
-        if rows_before > 0 and imported <= 0 and exp > 0 and rows_after < int(exp * 0.98):
+        if rows_before > 0 and imported <= 0 and exp > 0 and rows_after != exp:
             raise ValueError(
-                f"{sid} 续传未写入新行且库内仍明显少于 Excel（{rows_after}/{exp}），请再点「续传」"
+                f"{sid} 续传未写入新行且库内 {rows_after} 行 ≠ Excel {exp} 行，请全量清库重导"
             )
         if rows_after + 200 < rows_before:
             raise ValueError(
@@ -819,12 +923,20 @@ def _import_strategy_holdings_from_excel(
             stats["rows_before"] = 0
         elif repair_last_period:
             resume_from = resume_cutoff
+            _assert_import_resume_not_gap_stuck(
+                db,
+                sid,
+                file_path,
+                int(stats.get("rows_before") or 0),
+                resume_cutoff,
+                stats=stats,
+            )
             _import_progress_touch(
                 db,
                 f"阶段1/3 {sid}：续传 — 已查库内最新调仓日"
                 f"{resume_from.isoformat() if resume_from else '（无，从首行）'}"
                 f"，删该日全部记录后从 Excel 写入 >= 该日；"
-                f"删后基线 {stats['rows_before']} 行；每批 commit 后再写下一批…",
+                f"删后基线 {stats['rows_before']} 行（实计）；每批 commit 后再写下一批…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=False,
@@ -885,7 +997,7 @@ def _import_strategy_holdings_from_excel(
             _import_progress_touch(
                 db,
                 f"阶段1/3 {sid}：第 {batch_no} 批已 commit +{len(chunk)} 行"
-                f"，库内约 {stats['rows_after']} 行"
+                f"，库内估 {stats['rows_after']} 行（基线+本任务已写，非 COUNT）"
                 f"{f'，末调仓日 {lrb}' if lrb else ''}"
                 f"{f'（Excel已扫 {excel_rows}，跳过 {skipped_rows}）' if cutoff_rb else ''}…",
                 sync_job_id=sync_job_id,
@@ -914,6 +1026,8 @@ def _import_strategy_holdings_from_excel(
             repair_last_period=repair_last_period,
             import_mode=import_mode,
         )
+        if import_mode == "full":
+            _verify_strategy_positions_exact_match(db, sid, file_path)
         _log.info(
             "import_strategy %s streaming done excel=%s imported=%s db=%s skipped=%s mode=%s repair=%s",
             sid,
@@ -965,6 +1079,8 @@ def _import_strategy_holdings_from_excel(
             repair_last_period=repair_last_period,
             import_mode=import_mode,
         )
+        if import_mode == "full":
+            _verify_strategy_positions_exact_match(db, sid, file_path)
         rows_to_write.clear()
         del rows_to_write
         gc.collect()
@@ -5816,6 +5932,23 @@ def execute_admin_sync_pipeline(
                 resume=resume,
             )
             completed_import = set(imp.get("completed_strategy_ids") or [])
+            verify_errors: list[str] = []
+            if import_mode == "full" and completed_import:
+                for sid in sorted(completed_import):
+                    try:
+                        fp = _strategy_config_excel_path(db, sid)
+                        _verify_strategy_positions_exact_match(db, sid, fp)
+                    except ValueError as ve:
+                        completed_import.discard(sid)
+                        verify_errors.append(str(ve))
+                if verify_errors:
+                    imp = {
+                        **imp,
+                        "failed": max(int(imp.get("failed") or 0), len(verify_errors)),
+                        "errors": list(imp.get("errors") or []) + verify_errors,
+                        "completed_strategy_ids": sorted(completed_import),
+                        "resumable": True,
+                    }
             if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
                 return {
                     "ok": False,
