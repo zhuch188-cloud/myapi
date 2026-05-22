@@ -165,6 +165,14 @@ def turso_stream_lock(*, timeout: float | None = None) -> TursoStreamLockContext
     return TursoStreamLockContext(timeout=timeout)
 
 
+def run_under_turso_stream_lock(fn, *, timeout: float | None = None):
+    """远程 Turso 时在持锁区内执行写操作；本地库则直接执行。"""
+    if not uses_remote_turso_only():
+        return fn()
+    with turso_stream_lock(timeout=timeout):
+        return fn()
+
+
 class _LibsqlCursor:
     def __init__(self, cursor):
         self._cursor = cursor

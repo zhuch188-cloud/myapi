@@ -395,6 +395,14 @@ def _strategy_excel_row_batch_size() -> int:
     return max(200, min(n, 1500))
 
 
+def _strategy_import_progress_interval() -> int:
+    return max(1, int(getattr(settings, "strategy_import_progress_every_batches", 8) or 8))
+
+
+def _strategy_import_batch_retry_max() -> int:
+    return max(3, int(getattr(settings, "strategy_import_batch_retry", 5) or 5))
+
+
 def _strategy_import_position_batch_size() -> int:
     n = int(getattr(settings, "strategy_import_position_batch_size", 500) or 500)
     if _wind_low_memory_mode():
@@ -608,8 +616,13 @@ def _prepare_strategy_import_resume_from_db_max(
     if max_rb is None:
         _log.info("import resume %s: 库内无持仓，从 Excel 首行导入", sid)
         return None, 0
-    _delete_strategy_positions_rebalance_period(db, sid, max_rb)
-    db.commit()
+    from app.db import run_under_turso_stream_lock
+
+    def _del_last() -> None:
+        _delete_strategy_positions_rebalance_period(db, sid, max_rb)
+        db.commit()
+
+    run_under_turso_stream_lock(_del_last)
     rows_after, max_after = _strategy_positions_import_stats(db, sid)
     _log.info(
         "import resume %s: 库内最新调仓日 %s（删前 %s 行）→ 已删该日全部记录；"
@@ -917,8 +930,16 @@ def _import_strategy_holdings_from_excel(
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=False,
             )
-            db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
-            db.commit()
+            from app.db import run_under_turso_stream_lock
+
+            def _wipe() -> None:
+                db.execute(
+                    text("DELETE FROM strategy_positions WHERE strategy_id=:sid"),
+                    {"sid": sid},
+                )
+                db.commit()
+
+            run_under_turso_stream_lock(_wipe)
             _import_after_batch_commit(db)
             stats["rows_before"] = 0
         elif repair_last_period:
@@ -973,13 +994,7 @@ def _import_strategy_holdings_from_excel(
                     )
                 continue
             batch_no += 1
-            _commit_positions_chunk_resilient(
-                db,
-                sid,
-                chunk,
-                expect_new_rows=bool(delete_all),
-                batch_no=batch_no,
-            )
+            _commit_positions_chunk_resilient(db, sid, chunk, batch_no=batch_no)
             imported_rows += len(chunk)
             _import_after_batch_commit(db)
             batch_max_rb = max((x[0] for x in chunk), default=None)
@@ -988,38 +1003,55 @@ def _import_strategy_holdings_from_excel(
             stats["imported_rows"] = imported_rows
             stats["skipped_rows"] = skipped_rows
             stats["excel_rows"] = excel_rows
-            stats["rows_after"] = _strategy_positions_row_count(db, sid)
-            if strategy_import_job_id is not None:
-                _strategy_import_job_save_checkpoint(
-                    db,
-                    int(strategy_import_job_id),
-                    sid,
-                    stats=stats,
-                    batch_no=batch_no,
-                    do_commit=False,
-                )
-            lrb = stats.get("last_committed_rebalance_date")
-            _import_progress_touch(
-                db,
-                f"阶段1/3 {sid}：第 {batch_no} 批已 commit +{len(chunk)} 行"
-                f"，库内实计 {stats['rows_after']} 行"
-                f"{f'，末调仓日 {lrb}' if lrb else ''}"
-                f"{f'（Excel已扫 {excel_rows}，跳过 {skipped_rows}）' if cutoff_rb else ''}…",
-                sync_job_id=sync_job_id,
-                strategy_import_job_id=strategy_import_job_id,
-                do_commit=True,
-            )
+            stats["rows_after"] = int(stats.get("rows_before") or 0) + imported_rows
+            prog_iv = _strategy_import_progress_interval()
+            if batch_no % prog_iv == 0:
+                from app.db import run_under_turso_stream_lock
+
+                lrb = stats.get("last_committed_rebalance_date")
+
+                def _touch_progress() -> None:
+                    if strategy_import_job_id is not None:
+                        _strategy_import_job_save_checkpoint(
+                            db,
+                            int(strategy_import_job_id),
+                            sid,
+                            stats=stats,
+                            batch_no=batch_no,
+                            do_commit=False,
+                        )
+                    _import_progress_touch(
+                        db,
+                        f"阶段1/3 {sid}：第 {batch_no} 批已 commit +{len(chunk)} 行"
+                        f"，累计约 {stats['rows_after']} 行"
+                        f"{f'，末调仓日 {lrb}' if lrb else ''}"
+                        f"{f'（Excel已扫 {excel_rows}，跳过 {skipped_rows}）' if cutoff_rb else ''}…",
+                        sync_job_id=sync_job_id,
+                        strategy_import_job_id=strategy_import_job_id,
+                        do_commit=True,
+                    )
+
+                run_under_turso_stream_lock(_touch_progress)
             chunk.clear()
         stats["excel_rows"] = excel_rows
         stats["imported_rows"] = imported_rows
         stats["skipped_rows"] = skipped_rows
+        from app.db import run_under_turso_stream_lock
+
         if import_mode == "full":
-            repaired = _repair_strategy_positions_against_excel(db, sid, file_path)
-            if repaired:
-                stats["repaired_rows"] = int(stats.get("repaired_rows") or 0) + repaired
-                imported_rows += repaired
-                stats["imported_rows"] = imported_rows
-        stats["rows_after"] = _strategy_positions_row_count(db, sid)
+
+            def _finish_import() -> None:
+                nonlocal imported_rows
+                repaired = _repair_strategy_positions_against_excel(db, sid, file_path)
+                if repaired:
+                    stats["repaired_rows"] = int(stats.get("repaired_rows") or 0) + repaired
+                    imported_rows += repaired
+                    stats["imported_rows"] = imported_rows
+                stats["rows_after"] = _strategy_positions_row_count(db, sid)
+
+            run_under_turso_stream_lock(_finish_import)
+        else:
+            stats["rows_after"] = _strategy_positions_row_count(db, sid)
         if repair_last_period and import_mode == "full":
             exp = int(stats.get("expected_file_rows") or 0)
             _log.info(
@@ -1194,41 +1226,26 @@ def _commit_positions_chunk_resilient(
     sid: str,
     chunk: list[tuple[date, str, float | None, float | None]],
     *,
-    expect_new_rows: bool,
     batch_no: int = 0,
 ) -> None:
     """
-    写入并 commit。全量清空导入时期望本批新增 len(chunk) 行；若未落库则自动重试，不中断任务。
+    写入并 commit（短持 Turso 流锁）。不在每批 COUNT；失败仅按 OperationalError 重试。
     """
+    from app.db import run_under_turso_stream_lock
+
     need = len(chunk)
     if need <= 0:
         return
-    max_attempts = max(3, int(getattr(settings, "strategy_import_batch_retry", 8) or 8))
+    max_attempts = _strategy_import_batch_retry_max()
+
+    def _write_once() -> None:
+        _import_positions_batch(db, sid, chunk)
+        db.commit()
+
     for attempt in range(max_attempts):
         try:
-            before = _strategy_positions_row_count(db, sid)
-            _import_positions_batch(db, sid, chunk)
-            db.commit()
-            gained = _strategy_positions_row_count(db, sid) - before
-            if not expect_new_rows or gained >= need:
-                if expect_new_rows and gained > need:
-                    _log.debug(
-                        "import %s batch %s: +%s rows (chunk %s)",
-                        sid,
-                        batch_no,
-                        gained,
-                        need,
-                    )
-                return
-            _log.warning(
-                "import %s batch %s: commit 后 +%s 行，本批 %s 行，自动重试 %s/%s",
-                sid,
-                batch_no,
-                gained,
-                need,
-                attempt + 1,
-                max_attempts,
-            )
+            run_under_turso_stream_lock(_write_once)
+            return
         except OperationalError as oe:
             try:
                 db.rollback()
@@ -1238,14 +1255,8 @@ def _commit_positions_chunk_resilient(
                 time.sleep(0.3 * (2**attempt))
                 continue
             raise
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        if attempt < max_attempts - 1:
-            time.sleep(0.25 * (2**attempt))
     _log.warning(
-        "import %s batch %s: 重试 %s 次后仍可能少写，留待批次结束后自动补写",
+        "import %s batch %s: 重试 %s 次后仍失败，留待结束补写",
         sid,
         batch_no,
         max_attempts,
@@ -1279,16 +1290,12 @@ def _repair_strategy_positions_against_excel(
             if row[0].isoformat() in bad_dates:
                 buf.append(row)
                 if len(buf) >= sub_batch:
-                    _commit_positions_chunk_resilient(
-                        db, sid, buf, expect_new_rows=False, batch_no=0
-                    )
+                    _commit_positions_chunk_resilient(db, sid, buf, batch_no=0)
                     repaired += len(buf)
                     buf.clear()
         chunk.clear()
     if buf:
-        _commit_positions_chunk_resilient(
-            db, sid, buf, expect_new_rows=False, batch_no=0
-        )
+        _commit_positions_chunk_resilient(db, sid, buf, batch_no=0)
         repaired += len(buf)
     db_counts2, _ = _db_period_row_counts(db, sid)
     still = [d for d in bad_dates if db_counts2.get(d, 0) != ex_counts.get(d, 0)]
@@ -6300,11 +6307,8 @@ def run_strategy_import_background_task(
     *,
     resume: bool = False,
 ) -> None:
-    """守护线程中执行；远程 Turso 时持 stream 锁，避免与轮询 API 并发写导致 commit 丢失。"""
-    from app.db import SessionLocalFactory, turso_stream_lock
-
-    with turso_stream_lock():
-        _run_strategy_import_background_task_impl(job_id, resume=resume)
+    """守护线程中执行；按批短持 Turso 流锁，避免整段导入阻塞 API 轮询 90 秒。"""
+    _run_strategy_import_background_task_impl(job_id, resume=resume)
 
 
 def _run_strategy_import_background_task_impl(

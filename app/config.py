@@ -122,6 +122,10 @@ class Settings(BaseSettings):
     skip_startup_date_normalization: bool = False
     # 管理端 API 等待 Turso 流锁的最长时间（秒）；全量同步跑净值时其它接口可能排队
     turso_stream_lock_api_timeout_seconds: int = 90
+    # 策略 Excel 导入：每 N 批写一次进度/checkpoint（降低 Turso 请求频率）
+    strategy_import_progress_every_batches: int = 8
+    # 单批 UPSERT 失败时最大重试次数
+    strategy_import_batch_retry: int = 5
 
 
 settings = Settings()
