@@ -640,9 +640,32 @@ def _prepare_strategy_import_resume_incremental(
 
 
 def _import_job_message_indicates_import_done(message: str | None) -> bool:
-    """import_strategy_files 已写入「已完成 … 失败 0」但终态尚未落库时的进度文案。"""
+    """导入阶段已写完数据且失败数为 0，但 SUCCESS 终态尚未落库（如 SIGTERM 打断 finalize）。"""
     m = str(message or "")
-    return "已完成" in m and "失败 0" in m
+    if "失败 0" in m and "已完成" in m:
+        return True
+    if "阶段1/3" in m and "导入已完成" in m and "失败 0" in m:
+        return True
+    return False
+
+
+def _strategy_import_job_row_ready_to_succeed(row: dict[str, Any]) -> bool:
+    """根据任务行判断是否可安全标 SUCCESS（避免数据已齐却标 FAILED）。"""
+    ids = {str(x).strip() for x in _json_str_list(row.get("strategy_ids_json")) if str(x).strip()}
+    done = {str(x).strip() for x in _json_str_list(row.get("completed_strategy_ids_json")) if str(x).strip()}
+    if not ids or not ids <= done:
+        return False
+    ej = str(row.get("errors_json") or "[]").strip()
+    if ej not in ("[]", "", "null"):
+        return False
+    if int(row.get("failed_count") or 0) > 0:
+        return False
+    msg = str(row.get("message") or "")
+    if _import_job_message_indicates_import_done(msg):
+        return True
+    if "阶段1/3" in msg and "已完成" in msg and len(done) >= len(ids):
+        return True
+    return False
 
 
 def _finalize_strategy_import_job(
@@ -729,7 +752,8 @@ def mark_running_strategy_import_jobs_interrupted(*, reason: str) -> None:
         rows = db.execute(
             text(
                 """
-                SELECT id, message, errors_json, strategy_ids_json, import_mode
+                SELECT id, message, errors_json, strategy_ids_json, import_mode,
+                       completed_strategy_ids_json, failed_count
                 FROM strategy_import_jobs
                 WHERE status='RUNNING'
                 """
@@ -738,48 +762,57 @@ def mark_running_strategy_import_jobs_interrupted(*, reason: str) -> None:
         suffix_fail = f"（{reason}）"
         for row in rows:
             jid = int(row["id"])
-            msg = str(row.get("message") or "")
-            ej = str(row.get("errors_json") or "[]")
-            if _import_job_message_indicates_import_done(msg) and ej.strip() in (
-                "[]",
-                "",
-                "null",
-            ):
-                ids = _json_str_list(row.get("strategy_ids_json"))
-                try:
-                    _finalize_strategy_import_job(
-                        db,
-                        jid,
-                        {
-                            "completed_strategy_ids": ids,
-                            "failed": 0,
-                            "errors": [],
-                            "resumable": False,
-                        },
-                        str(row.get("import_mode") or "full"),
-                        ids,
-                    )
-                    _log.info(
-                        "strategy_import job %s: import done, promoted to SUCCESS on shutdown",
-                        jid,
-                    )
-                    continue
-                except Exception:
-                    _log.exception(
-                        "strategy_import job %s: promote SUCCESS on shutdown failed",
-                        jid,
-                    )
-            db.execute(
-                text(
-                    f"""
-                    UPDATE strategy_import_jobs
-                    SET status='FAILED', finished_at={sql_now()},
-                        message=COALESCE(message, '') || :suf
-                    WHERE id=:id AND status='RUNNING'
-                    """
-                ),
-                {"suf": suffix_fail[:500], "id": jid},
-            )
+            if not _strategy_import_job_row_ready_to_succeed(row):
+                jid_mark = int(row["id"])
+                db.execute(
+                    text(
+                        f"""
+                        UPDATE strategy_import_jobs
+                        SET status='FAILED', finished_at={sql_now()},
+                            message=COALESCE(message, '') || :suf
+                        WHERE id=:id AND status='RUNNING'
+                        """
+                    ),
+                    {"suf": suffix_fail[:500], "id": jid_mark},
+                )
+                continue
+            ids = _json_str_list(row.get("strategy_ids_json"))
+            done = _json_str_list(row.get("completed_strategy_ids_json")) or ids
+            try:
+                _finalize_strategy_import_job(
+                    db,
+                    jid,
+                    {
+                        "completed_strategy_ids": sorted(set(done)),
+                        "verified_strategy_ids": sorted(set(done)),
+                        "verify_rows": {},
+                        "failed": 0,
+                        "errors": [],
+                        "resumable": False,
+                    },
+                    str(row.get("import_mode") or "full"),
+                    ids,
+                )
+                _log.info(
+                    "strategy_import job %s: import done, promoted to SUCCESS on shutdown",
+                    jid,
+                )
+            except Exception:
+                _log.exception(
+                    "strategy_import job %s: promote SUCCESS on shutdown failed",
+                    jid,
+                )
+                db.execute(
+                    text(
+                        f"""
+                        UPDATE strategy_import_jobs
+                        SET status='FAILED', finished_at={sql_now()},
+                            message=COALESCE(message, '') || :suf
+                        WHERE id=:id AND status='RUNNING'
+                        """
+                    ),
+                    {"suf": suffix_fail[:500], "id": jid},
+                )
         db.commit()
     except Exception:
         db.rollback()
@@ -3370,6 +3403,7 @@ def import_strategy_files(
                     db,
                     int(strategy_import_job_id),
                     message=prog_msg,
+                    completed_ids=done_list,
                     imported=len(completed),
                     failed=failed,
                     errors=errors,
@@ -3389,6 +3423,24 @@ def import_strategy_files(
 
     expected_done = total_targets
     resumable = len(completed) < expected_done
+    if (
+        strategy_import_job_id is not None
+        and failed == 0
+        and expected_done > 0
+        and len(completed) >= expected_done
+    ):
+        _strategy_import_job_touch(
+            db,
+            int(strategy_import_job_id),
+            message=(
+                f"阶段1/3 导入已完成（{len(completed)}/{expected_done}，失败 0）"
+            ),
+            completed_ids=sorted(completed),
+            imported=len(completed),
+            failed=0,
+            errors=[],
+            do_commit=do_commit,
+        )
     return {
         "imported": len(completed),
         "imported_new": imported_new,
@@ -6669,19 +6721,21 @@ def execute_admin_sync_pipeline(
                 resume=resume,
             )
             completed_import = set(imp.get("completed_strategy_ids") or [])
+            pre_verified = set(imp.get("verified_strategy_ids") or [])
             verify_errors: list[str] = []
             if completed_import:
                 for sid in sorted(completed_import):
+                    if sid in pre_verified:
+                        continue
                     try:
                         fp = _strategy_config_excel_path(db, sid)
-                        if str(import_mode or "").lower() == "full":
-                            _verify_strategy_positions_exact_match_with_auto_repair(
-                                db, sid, fp
-                            )
-                        else:
-                            _verify_strategy_positions_incremental_match_with_auto_repair(
-                                db, sid, fp
-                            )
+                        _verify_strategy_full_import_row_count(
+                            db,
+                            sid,
+                            fp,
+                            import_mode=import_mode,
+                            heavy=True,
+                        )
                     except ValueError as ve:
                         completed_import.discard(sid)
                         verify_errors.append(str(ve))
@@ -6932,6 +6986,9 @@ def _run_strategy_import_background_task_impl(
     from app.db import SessionLocalFactory
 
     db = SessionLocalFactory()
+    ret: dict[str, Any] | None = None
+    ids: list[str] = []
+    import_mode = "full"
     try:
         job = get_strategy_import_job_row(db, job_id)
         if not job:
@@ -6968,6 +7025,20 @@ def _run_strategy_import_background_task_impl(
         db.commit()
     except Exception as ex:
         _log.exception("strategy_import job %s failed", job_id)
+        all_ids = {str(x).strip() for x in ids if str(x).strip()}
+        done = set((ret or {}).get("completed_strategy_ids") or [])
+        if ret and all_ids <= done and int(ret.get("failed") or 0) == 0:
+            try:
+                _finalize_strategy_import_job(db, job_id, ret, import_mode, ids)
+                db.commit()
+                _log.info(
+                    "strategy_import job %s: finalize recovered after %s",
+                    job_id,
+                    type(ex).__name__,
+                )
+                return
+            except Exception:
+                _log.exception("strategy_import job %s: finalize recovery failed", job_id)
         try:
             db.execute(
                 text(
