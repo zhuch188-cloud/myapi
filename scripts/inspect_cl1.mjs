@@ -45,19 +45,11 @@ perPeriod.slice(-3).forEach((r) => console.log(r));
 const stockCounts = perPeriod.map((r) => Number(r.stocks));
 const avg = stockCounts.reduce((a, b) => a + b, 0) / (stockCounts.length || 1);
 console.log(`avg stocks/period: ${avg.toFixed(1)} min=${Math.min(...stockCounts)} max=${Math.max(...stockCounts)}`);
-
-const peak = Math.max(...stockCounts);
-const threshold = Math.max(90, Math.floor(peak * 0.85));
-const bad = perPeriod.filter((r) => Number(r.stocks) < threshold);
-console.log(`\n=== incomplete period scan (threshold=${threshold}) ===`);
-console.log(`suspect periods: ${bad.length} / ${perPeriod.length}`);
-if (bad.length) {
-  console.log("first incomplete:", bad[0].rebalance_date, "stocks=", bad[0].stocks);
-  console.log("samples:", bad.slice(0, 6).map((r) => `${r.rebalance_date}:${r.stocks}`).join(", "));
-  const deleteFrom = bad[0].rebalance_date;
-  const wouldDelete = perPeriod.filter((r) => String(r.rebalance_date) >= String(deleteFrom)).length;
-  console.log(`resume fix would re-import ${wouldDelete} periods from ${deleteFrom}`);
-}
+console.log(
+  "\n=== 续传说明 ===\n" +
+    "导入按 Excel 行顺序（调仓日递增）写入；单次中断仅最后一期可能残缺。\n" +
+    "若中间调仓日成分数偏少，多为历史「增量追加/旧续传逻辑」遗留，需一次全量首次导入清库后重导。"
+);
 
 const syncJobs = await q(
   `SELECT id, status, stage, import_mode, progress_at,
