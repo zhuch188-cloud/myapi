@@ -551,21 +551,129 @@ def _delete_strategy_positions_rebalance_period(
     )
 
 
+def _delete_strategy_positions_from_rebalance_date(
+    db: Session, sid: str, from_rebalance: date
+) -> None:
+    """删除某调仓日及之后全部持仓（续传时回滚不完整尾部）。"""
+    rb_cmp = _compact_date(from_rebalance)
+    db.execute(
+        text(
+            f"""
+            DELETE FROM strategy_positions
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("rebalance_date")} >= :rb_cmp
+            """
+        ),
+        {"sid": sid, "rb_cmp": rb_cmp},
+    )
+
+
+def _strategy_positions_period_counts(db: Session, sid: str) -> list[tuple[date, int]]:
+    rows = db.execute(
+        text(
+            f"""
+            SELECT rebalance_date, COUNT(*) AS n
+            FROM strategy_positions
+            WHERE strategy_id=:sid
+            GROUP BY rebalance_date
+            ORDER BY {sql_order_date_asc("rebalance_date")}
+            """
+        ),
+        {"sid": sid},
+    ).mappings().all()
+    out: list[tuple[date, int]] = []
+    for row in rows:
+        rb = _row_sql_date(row.get("rebalance_date"))
+        if rb is None:
+            continue
+        out.append((rb, int(row.get("n") or 0)))
+    return out
+
+
+def _incomplete_period_stock_threshold(counts: list[int]) -> int:
+    """中断导入常留下「远少于正常期」的残缺调仓期；用峰值比例估完整期下限。"""
+    if not counts:
+        return 90
+    peak = max(counts)
+    return max(90, int(peak * 0.85))
+
+
+def _find_earliest_incomplete_rebalance_date(
+    period_counts: list[tuple[date, int]],
+) -> tuple[date | None, int, list[tuple[date, int]]]:
+    """返回 (最早残缺调仓日, 阈值, 残缺期列表)。"""
+    if not period_counts:
+        return None, 90, []
+    counts = [n for _, n in period_counts]
+    threshold = _incomplete_period_stock_threshold(counts)
+    bad = [(rb, n) for rb, n in period_counts if n < threshold]
+    if not bad:
+        return None, threshold, []
+    return bad[0][0], threshold, bad
+
+
 def _prepare_strategy_import_resume_last_period(db: Session, sid: str) -> date | None:
     """
-    续传：删除库内最后一期（可能仅写入部分股票），返回该调仓日；
-    随后从 Excel 导入 rebalance_date >= 该日的全部行。
+    续传：删除库内不完整调仓段后重导。
+    多次中断时，中间残缺期不会成为 MAX(rebalance_date)，仅删最后一期会永久漏行。
+    """
+    period_counts = _strategy_positions_period_counts(db, sid)
+    if not period_counts:
+        return None
+    earliest_bad, threshold, bad_periods = _find_earliest_incomplete_rebalance_date(
+        period_counts
+    )
+    max_rb = period_counts[-1][0]
+    if earliest_bad is None:
+        _delete_strategy_positions_rebalance_period(db, sid, max_rb)
+        _log.info(
+            "import resume %s: deleted last period %s before re-import",
+            sid,
+            max_rb.isoformat(),
+        )
+        return max_rb
+    n_from = sum(1 for rb, _ in period_counts if rb >= earliest_bad)
+    _delete_strategy_positions_from_rebalance_date(db, sid, earliest_bad)
+    _log.warning(
+        "import resume %s: found %s incomplete periods (threshold=%s stocks), "
+        "deleted %s periods from %s; samples=%s",
+        sid,
+        len(bad_periods),
+        threshold,
+        n_from,
+        earliest_bad.isoformat(),
+        [(d.isoformat(), n) for d, n in bad_periods[:8]],
+    )
+    return earliest_bad
+
+
+def _maybe_repair_incomplete_last_period_for_incremental(
+    db: Session, sid: str
+) -> tuple[date | None, bool]:
+    """
+    增量导入：若最后一期明显残缺（中断遗留），先删该期并以 >= 该日重导。
+    否则仍只追加 > MAX(rebalance_date)。
     """
     max_rb = _strategy_positions_max_rebalance_date(db, sid)
     if max_rb is None:
-        return None
+        return None, False
+    period_counts = _strategy_positions_period_counts(db, sid)
+    if not period_counts:
+        return None, False
+    threshold = _incomplete_period_stock_threshold([n for _, n in period_counts])
+    last_cnt = period_counts[-1][1]
+    if last_cnt >= threshold:
+        return max_rb, False
     _delete_strategy_positions_rebalance_period(db, sid, max_rb)
     _log.info(
-        "import resume %s: deleted last period %s before re-import",
+        "import incremental %s: last period %s had only %s stocks (threshold=%s), "
+        "deleted for re-import",
         sid,
         max_rb.isoformat(),
+        last_cnt,
+        threshold,
     )
-    return max_rb
+    return max_rb, True
 
 
 def _import_incremental_row_allowed(
@@ -597,8 +705,9 @@ def _import_cutoff_plan(
 ) -> tuple[date | None, bool, bool]:
     """
     返回 (cutoff_rb, cutoff_inclusive, delete_all)。
-    首次全量：清空后整表重导；续传（full/incremental）：删最后一期并从该期继续，不从头清空。
-    首次增量：只追加 > MAX(rebalance_date) 的行。
+    首次全量：清空后整表重导。
+    续传：从最早「残缺调仓期」起重删并重导（>= cutoff），避免中间中断漏行。
+    首次增量：只追加 > MAX(rebalance_date)；若最后一期明显残缺则先删该期并以 >= 重导。
     """
     if import_mode == "full" and not repair_last_period:
         return None, False, True
@@ -608,7 +717,9 @@ def _import_cutoff_plan(
         cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
         cutoff_inclusive = cutoff_rb is not None
     elif import_mode != "full":
-        cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
+        cutoff_rb, cutoff_inclusive = _maybe_repair_incomplete_last_period_for_incremental(
+            db, sid
+        )
     return cutoff_rb, cutoff_inclusive, False
 
 
@@ -643,8 +754,12 @@ def _import_strategy_holdings_from_excel(
     label_meta: dict[str, str] = {}
     if _strategy_excel_use_streaming(file_path):
         prior_rows, prior_max_rb = (0, None)
+        resume_bad_periods: list[tuple[date, int]] = []
         if repair_last_period:
             prior_rows, prior_max_rb = _strategy_positions_import_stats(db, sid)
+            _, _, resume_bad_periods = _find_earliest_incomplete_rebalance_date(
+                _strategy_positions_period_counts(db, sid)
+            )
         cutoff_rb, cutoff_inclusive, delete_all = _import_cutoff_plan(
             db, sid, import_mode, repair_last_period=repair_last_period
         )
@@ -661,11 +776,17 @@ def _import_strategy_holdings_from_excel(
             _import_after_batch_commit(db)
         elif repair_last_period:
             resume_from = cutoff_rb or prior_max_rb
+            bad_hint = (
+                f"，已回滚 {len(resume_bad_periods)} 个不完整调仓期"
+                if resume_bad_periods
+                else ""
+            )
             _import_progress_touch(
                 db,
                 f"阶段1/3 {sid}：续传（{import_mode}）库内已有 {prior_rows} 行"
                 f"{f'至 {prior_max_rb.isoformat()}' if prior_max_rb else ''}，"
-                f"从 {resume_from.isoformat() if resume_from else '首行'} 继续（非从头）…",
+                f"从 {resume_from.isoformat() if resume_from else '首行'} 继续（非从头）"
+                f"{bad_hint}…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=False,
