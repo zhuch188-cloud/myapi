@@ -47,8 +47,8 @@ const avg = stockCounts.reduce((a, b) => a + b, 0) / (stockCounts.length || 1);
 console.log(`avg stocks/period: ${avg.toFixed(1)} min=${Math.min(...stockCounts)} max=${Math.max(...stockCounts)}`);
 console.log(
   "\n=== 续传说明 ===\n" +
-    "导入按 Excel 行顺序（调仓日递增）写入；单次中断仅最后一期可能残缺。\n" +
-    "若中间调仓日成分数偏少，多为历史「增量追加/旧续传逻辑」遗留，需一次全量首次导入清库后重导。"
+    "续传：查库内 MAX(调仓日)→删该日该策略全部记录→从 Excel 写入 >= 该日（每批 commit）。\n" +
+    "若中间调仓日成分数仍偏少，需一次全量 confirm_wipe 清库后重导。"
 );
 
 const syncJobs = await q(

@@ -27,8 +27,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import settings
 from app.timeutil import now, now_naive, today as beijing_today
-from app.bg_threads import spawn_daemon
+from app.bg_threads import (
+    active_background_thread_names,
+    join_background_threads,
+    register_shutdown_signals,
+    spawn_daemon,
+)
 from app.boot import boot_error, is_ready, start_background_boot
+from app.render_diag import log_render_runtime
 from app.db import DatabaseNotReadyError, TursoStreamBusyError
 
 _log = logging.getLogger(__name__)
@@ -104,8 +110,25 @@ async def _app_lifespan(_app: FastAPI):
         os.getpid(),
         os.environ.get("PORT", ""),
     )
+    log_render_runtime("app lifespan start")
+    register_shutdown_signals()
     start_background_boot(scheduler, _scheduled_update)
     yield
+    alive = active_background_thread_names()
+    if alive:
+        _log.warning(
+            "lifespan shutdown（多为 Render 部署 SIGTERM）：后台任务 %s，等待最多 28s…",
+            alive,
+        )
+        try:
+            from app.services import mark_running_strategy_import_jobs_interrupted
+
+            mark_running_strategy_import_jobs_interrupted(
+                reason="部署/进程关闭中断（请点「续传」，勿新建全量）",
+            )
+        except Exception:
+            _log.exception("lifespan shutdown: 标记导入任务失败")
+        join_background_threads(timeout=28.0)
     if scheduler.running:
         scheduler.shutdown()
 
@@ -1756,12 +1779,20 @@ def health_live():
 
 @app.get("/health")
 def health(verbose: bool = False):
-    wind_ok = wind_sql.use_remote_sqlserver()
-    wind_st = wind_sql.wind_status() if verbose else None
-    turso_url = (settings.turso_database_url or "").strip()
-    wind_configured = bool((settings.wind_sqlserver_server or "").strip())
+    """存活探针：默认轻量（与 /health/live 一致）。详细 Wind/DB 用 ?verbose=1。"""
     db_ready = is_ready()
     err = boot_error()
+    if not verbose:
+        return {
+            "ok": db_ready and not err,
+            "live": True,
+            "db_ready": db_ready,
+            "service": "strategy-showcase-python",
+        }
+    wind_ok = wind_sql.use_remote_sqlserver()
+    wind_st = wind_sql.wind_status()
+    turso_url = (settings.turso_database_url or "").strip()
+    wind_configured = bool((settings.wind_sqlserver_server or "").strip())
     out: dict[str, Any] = {
         "ok": db_ready and not err and (not wind_configured or wind_ok),
         "db_ready": db_ready,
@@ -1770,9 +1801,8 @@ def health(verbose: bool = False):
         "turso_configured": bool(turso_url and (settings.turso_auth_token or "").strip()),
         "wind_data_source": "sqlserver" if wind_ok else "disabled",
         "wind_sqlserver_ready": wind_ok,
+        "wind_sqlserver": wind_st,
     }
-    if verbose:
-        out["wind_sqlserver"] = wind_st
     return out
 
 
@@ -3992,6 +4022,7 @@ def admin_import(
             },
         )
         db.commit()
+        _log.info("strategy import RESUME job=%s mode=%s", job_id, im)
         spawn_daemon(
             f"strategy-import-{job_id}",
             run_strategy_import_background_task,
@@ -4029,6 +4060,12 @@ def admin_import(
             triggered_by=str(user.get("username") or "admin"),
         )
         db.commit()
+        _log.info(
+            "strategy import NEW job=%s mode=%s strategies=%s (full=先DELETE库内持仓)",
+            job_id,
+            mode,
+            ids,
+        )
         spawn_daemon(
             f"strategy-import-{job_id}",
             run_strategy_import_background_task,

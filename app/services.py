@@ -391,14 +391,14 @@ def _excel_cell_weight(v: Any) -> float | None:
 def _strategy_excel_row_batch_size() -> int:
     n = int(getattr(settings, "strategy_excel_import_row_batch", 600) or 600)
     if _wind_low_memory_mode():
-        return max(100, min(n, 200))
+        return max(80, min(n, 120))
     return max(200, min(n, 1500))
 
 
 def _strategy_import_position_batch_size() -> int:
     n = int(getattr(settings, "strategy_import_position_batch_size", 500) or 500)
     if _wind_low_memory_mode():
-        return max(50, min(n, 200))
+        return max(40, min(n, 100))
     return max(50, n)
 
 
@@ -551,21 +551,59 @@ def _delete_strategy_positions_rebalance_period(
     )
 
 
-def _prepare_strategy_import_resume_last_period(db: Session, sid: str) -> date | None:
+def _prepare_strategy_import_resume_from_db_max(
+    db: Session, sid: str
+) -> tuple[date | None, int]:
     """
-    续传：Excel 按调仓日顺序流式写入，中断时只有「库内最后一期」可能只写了一半。
-    删该期后从 Excel 导入 rebalance_date >= 该日；更早各期已在完整批次中 commit，不再动。
+    续传：查库内该策略 MAX(调仓日)，删除该日全部记录，再从 Excel 导入 >= 该日。
+    返回 (cutoff_rb, 删后库内行数基线)。仅 1 次聚合查询 + 1 次 DELETE。
     """
-    max_rb = _strategy_positions_max_rebalance_date(db, sid)
+    rows_before, max_rb = _strategy_positions_import_stats(db, sid)
     if max_rb is None:
-        return None
+        _log.info("import resume %s: 库内无持仓，从 Excel 首行导入", sid)
+        return None, 0
     _delete_strategy_positions_rebalance_period(db, sid, max_rb)
+    db.commit()
+    rows_after, max_after = _strategy_positions_import_stats(db, sid)
     _log.info(
-        "import resume %s: deleted last period %s before re-import",
+        "import resume %s: 库内最新调仓日 %s（删前 %s 行）→ 已删该日全部记录；"
+        "删后 %s 行 MAX=%s；从 Excel >=%s 重导",
         sid,
         max_rb.isoformat(),
+        rows_before,
+        rows_after,
+        max_after.isoformat() if max_after else "—",
+        max_rb.isoformat(),
     )
-    return max_rb
+    return max_rb, rows_after
+
+
+def mark_running_strategy_import_jobs_interrupted(*, reason: str) -> None:
+    """进程关闭前将 RUNNING 导入标为失败，避免界面仍显示执行中。"""
+    from app.db import SessionLocalFactory
+
+    if SessionLocalFactory is None:
+        return
+    db = SessionLocalFactory()
+    try:
+        suffix = f"（{reason}）"
+        db.execute(
+            text(
+                f"""
+                UPDATE strategy_import_jobs
+                SET status='FAILED', finished_at={sql_now()},
+                    message=COALESCE(message, '') || :suf
+                WHERE status='RUNNING'
+                """
+            ),
+            {"suf": suffix[:500]},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def _import_after_batch_commit(db: Session) -> None:
@@ -594,23 +632,24 @@ def _import_cutoff_plan(
     import_mode: str,
     *,
     repair_last_period: bool,
-) -> tuple[date | None, bool, bool]:
+) -> tuple[date | None, bool, bool, int]:
     """
-    返回 (cutoff_rb, cutoff_inclusive, delete_all)。
+    返回 (cutoff_rb, cutoff_inclusive, delete_all, rows_baseline_after_cutoff)。
     首次全量：清空后整表重导。
-    续传：删最后一期，导入 >= 该日（按日期顺序写，仅尾部可能残缺）。
+    续传：库内 MAX(调仓日) 删该日全部记录，Excel 导入 >= 该日。
     首次增量：只追加 > MAX(rebalance_date)。
     """
+    rows_baseline = 0
     if import_mode == "full" and not repair_last_period:
-        return None, False, True
+        return None, False, True, rows_baseline
     cutoff_rb: date | None = None
     cutoff_inclusive = False
     if repair_last_period:
-        cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
+        cutoff_rb, rows_baseline = _prepare_strategy_import_resume_from_db_max(db, sid)
         cutoff_inclusive = cutoff_rb is not None
     elif import_mode != "full":
         cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
-    return cutoff_rb, cutoff_inclusive, False
+    return cutoff_rb, cutoff_inclusive, False, rows_baseline
 
 
 def _strategy_positions_import_stats(db: Session, sid: str) -> tuple[int, date | None]:
@@ -646,28 +685,30 @@ def _validate_strategy_import_result(
     repair_last_period: bool,
     import_mode: str,
 ) -> None:
-    """导入结束校验：续传(full)也必须库内行数接近本次扫描的 Excel 有效行数。"""
+    """导入结束校验：以库内行数为准；续传完成时须接近 Excel 文件总行数（非本次扫描累计）。"""
     rows_before = int(stats.get("rows_before") or 0)
     rows_after = int(stats.get("rows_after") or 0)
     imported = int(stats.get("imported_rows") or 0)
     excel_rows = int(stats.get("excel_rows") or 0)
+    expected_total = int(stats.get("expected_file_rows") or 0) or excel_rows
     need_complete = delete_all or (repair_last_period and import_mode == "full")
-    if need_complete and excel_rows > 0:
-        min_rows = int(excel_rows * 0.98)
+    if need_complete and expected_total > 0:
+        min_rows = int(expected_total * 0.98)
         if rows_after < min_rows:
             raise ValueError(
-                f"{sid} 持仓不完整：Excel 有效约 {excel_rows} 行，库内 {rows_after} 行"
-                f"（差 {excel_rows - rows_after}）。"
-                f"进程可能在 Render 上被重启/OOM 中断，请点「续传」继续，不要新建全量。"
+                f"{sid} 持仓不完整：Excel 有效约 {expected_total} 行，库内 {rows_after} 行"
+                f"（差 {expected_total - rows_after}）。"
+                f"进程可能在 Render 上被重启/部署中断，请点「续传」继续，不要新建全量。"
             )
     if delete_all:
         if rows_after <= 0:
             raise ValueError(f"{sid} 全量导入后库内 0 行")
         return
     if repair_last_period:
-        if rows_before > 0 and imported <= 0 and rows_after < int(excel_rows * 0.98):
+        exp = int(stats.get("expected_file_rows") or 0) or excel_rows
+        if rows_before > 0 and imported <= 0 and exp > 0 and rows_after < int(exp * 0.98):
             raise ValueError(
-                f"{sid} 续传未写入新行且库内仍明显少于 Excel（{rows_after}/{excel_rows}），请再点「续传」"
+                f"{sid} 续传未写入新行且库内仍明显少于 Excel（{rows_after}/{exp}），请再点「续传」"
             )
         if rows_after + 200 < rows_before:
             raise ValueError(
@@ -687,8 +728,8 @@ def _import_strategy_holdings_from_excel(
 ) -> tuple[dict[str, str], dict[str, int]]:
     """导入单策略 Excel 持仓；大文件走流式。返回 (label_meta, import_stats)。"""
     label_meta: dict[str, str] = {}
-    stats: dict[str, int] = {
-        "rows_before": _strategy_positions_row_count(db, sid),
+    stats: dict[str, int | str] = {
+        "rows_before": 0,
         "excel_rows": 0,
         "imported_rows": 0,
         "skipped_rows": 0,
@@ -696,13 +737,16 @@ def _import_strategy_holdings_from_excel(
     }
     delete_all = False
     if _strategy_excel_use_streaming(file_path):
-        prior_rows, prior_max_rb = (0, None)
-        if repair_last_period:
-            prior_rows, prior_max_rb = _strategy_positions_import_stats(db, sid)
-            stats["rows_before"] = prior_rows
-        cutoff_rb, cutoff_inclusive, delete_all = _import_cutoff_plan(
-            db, sid, import_mode, repair_last_period=repair_last_period
+        resume_cutoff: date | None = None
+        cutoff_rb, cutoff_inclusive, delete_all, rows_baseline = _import_cutoff_plan(
+            db,
+            sid,
+            import_mode,
+            repair_last_period=repair_last_period,
         )
+        if repair_last_period:
+            resume_cutoff = cutoff_rb
+            stats["rows_before"] = rows_baseline
         if delete_all:
             _import_progress_touch(
                 db,
@@ -714,14 +758,15 @@ def _import_strategy_holdings_from_excel(
             db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
             db.commit()
             _import_after_batch_commit(db)
+            stats["rows_before"] = 0
         elif repair_last_period:
-            resume_from = cutoff_rb or prior_max_rb
+            resume_from = resume_cutoff
             _import_progress_touch(
                 db,
-                f"阶段1/3 {sid}：续传（{import_mode}）库内已有 {prior_rows} 行"
-                f"{f'至 {prior_max_rb.isoformat()}' if prior_max_rb else ''}，"
-                f"已删最后一期，从 {resume_from.isoformat() if resume_from else '首行'} 重导"
-                f"（更早各期已完整入库，跳过）…",
+                f"阶段1/3 {sid}：续传 — 已查库内最新调仓日"
+                f"{resume_from.isoformat() if resume_from else '（无，从首行）'}"
+                f"，删该日全部记录后从 Excel 写入 >= 该日；"
+                f"删后基线 {stats['rows_before']} 行；每批 commit 后再写下一批…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=False,
@@ -746,10 +791,12 @@ def _import_strategy_holdings_from_excel(
             if not chunk:
                 scan_batch_no += 1
                 if scan_batch_no % 48 == 0 and cutoff_rb is not None:
+                    est = int(stats.get("rows_before") or 0) + imported_rows
                     _import_progress_touch(
                         db,
                         f"阶段1/3 {sid}：续传扫描 Excel… 已跳过 {skipped_rows} 行"
-                        f"{f'，已写入 {imported_rows} 行' if imported_rows else ''}…",
+                        f"{f'，本段已 commit {imported_rows} 行' if imported_rows else ''}；"
+                        f"库内约 {est} 行（按批累计，非全表 COUNT）…",
                         sync_job_id=sync_job_id,
                         strategy_import_job_id=strategy_import_job_id,
                         do_commit=False,
@@ -760,10 +807,13 @@ def _import_strategy_holdings_from_excel(
             imported_rows += len(chunk)
             db.commit()
             _import_after_batch_commit(db)
+            batch_max_rb = max((x[0] for x in chunk), default=None)
+            if batch_max_rb is not None:
+                stats["last_committed_rebalance_date"] = batch_max_rb.isoformat()
             stats["imported_rows"] = imported_rows
             stats["skipped_rows"] = skipped_rows
             stats["excel_rows"] = excel_rows
-            stats["rows_after"] = _strategy_positions_row_count(db, sid)
+            stats["rows_after"] = int(stats.get("rows_before") or 0) + imported_rows
             if strategy_import_job_id is not None:
                 _strategy_import_job_save_checkpoint(
                     db,
@@ -773,10 +823,12 @@ def _import_strategy_holdings_from_excel(
                     batch_no=batch_no,
                     do_commit=False,
                 )
+            lrb = stats.get("last_committed_rebalance_date")
             _import_progress_touch(
                 db,
-                f"阶段1/3 {sid}：流式 第 {batch_no} 批 +{len(chunk)} 行"
-                f"，库内实计 {stats['rows_after']} 行"
+                f"阶段1/3 {sid}：第 {batch_no} 批已 commit +{len(chunk)} 行"
+                f"，库内约 {stats['rows_after']} 行"
+                f"{f'，末调仓日 {lrb}' if lrb else ''}"
                 f"{f'（Excel已扫 {excel_rows}，跳过 {skipped_rows}）' if cutoff_rb else ''}…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
@@ -787,6 +839,14 @@ def _import_strategy_holdings_from_excel(
         stats["imported_rows"] = imported_rows
         stats["skipped_rows"] = skipped_rows
         stats["rows_after"] = _strategy_positions_row_count(db, sid)
+        if repair_last_period and import_mode == "full":
+            exp = int(stats.get("expected_file_rows") or 0)
+            _log.info(
+                "import resume %s: 结束 库内=%s 行，Excel 文件约 %s 行",
+                sid,
+                stats["rows_after"],
+                exp or "?",
+            )
         if imported_rows == 0 and import_mode == "full" and not repair_last_period:
             raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
         _validate_strategy_import_result(
@@ -828,7 +888,13 @@ def _import_strategy_holdings_from_excel(
         stats["excel_rows"] = len(rows_to_write)
         delete_all = import_mode == "full" and not repair_last_period
         _import_write_positions_one_strategy(
-            db, sid, rows_to_write, label_meta, import_mode, repair_last_period=repair_last_period
+            db,
+            sid,
+            rows_to_write,
+            label_meta,
+            import_mode,
+            repair_last_period=repair_last_period,
+            file_path=file_path,
         )
         stats["rows_after"] = _strategy_positions_row_count(db, sid)
         stats["imported_rows"] = stats["rows_after"] if delete_all else max(
@@ -1768,10 +1834,14 @@ def _import_write_positions_one_strategy(
     import_mode: str,
     *,
     repair_last_period: bool = False,
+    file_path: str = "",
 ) -> None:
     """单策略：删/增 strategy_positions，可选更新 strategy_configs 元数据（不含 commit）。"""
-    cutoff_rb, cutoff_inclusive, delete_all = _import_cutoff_plan(
-        db, sid, import_mode, repair_last_period=repair_last_period
+    cutoff_rb, cutoff_inclusive, delete_all, _baseline = _import_cutoff_plan(
+        db,
+        sid,
+        import_mode,
+        repair_last_period=repair_last_period,
     )
     if delete_all:
         db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
@@ -1958,8 +2028,9 @@ def _strategy_import_job_save_checkpoint(
     batch_no: int,
     do_commit: bool = True,
 ) -> None:
-    """每批落库后写入 checkpoint，便于对照「进度累计行数」与库内实计行数。"""
+    """每批 commit 后写 checkpoint（用内存累计行数，不再每批 COUNT 全表）。"""
     rows_after = int(stats.get("rows_after") or 0)
+    max_rb_s = stats.get("last_committed_rebalance_date")
     payload = {
         "strategy_id": sid,
         "batch_no": batch_no,
@@ -1967,6 +2038,8 @@ def _strategy_import_job_save_checkpoint(
         "imported_rows_session": int(stats.get("imported_rows") or 0),
         "skipped_rows": int(stats.get("skipped_rows") or 0),
         "rows_in_db": rows_after,
+        "db_max_rebalance_date": str(max_rb_s) if max_rb_s else None,
+        "expected_file_rows": int(stats.get("expected_file_rows") or 0) or None,
     }
     db.execute(
         text(

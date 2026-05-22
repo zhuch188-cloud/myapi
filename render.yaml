@@ -7,6 +7,8 @@ services:
     dockerfilePath: ./Dockerfile
     # 轻量探针，避免全量同步/OOM 重启时 /health 因 pyodbc 枚举等拖过 5s 被判失败
     healthCheckPath: /health/live
+    # 导入中断时多留时间收尾（默认 30s）；与 lifespan join 28s 配合
+    maxShutdownDelaySeconds: 120
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.0"

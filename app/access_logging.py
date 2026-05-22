@@ -24,6 +24,10 @@ _SKIP_PATHS: frozenset[str] = frozenset(
 _SKIP_PREFIXES: tuple[str, ...] = (
     "/static/",
     "/api/public/",
+    "/health",
+    "/api/admin/import-jobs",
+    "/api/admin/sync-jobs",
+    "/api/admin/update-jobs",
 )
 
 

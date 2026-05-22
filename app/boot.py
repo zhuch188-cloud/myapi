@@ -100,7 +100,7 @@ def _clear_stale_jobs_on_session(db) -> bool:
                 f"""
                 UPDATE strategy_import_jobs
                 SET status='FAILED', finished_at={sql_now()},
-                    message=COALESCE(message, '') || '（服务重启：导入中断，已标失败；可点续传）'
+                    message=COALESCE(message, '') || '（进程重启/部署中断，已标失败；请点「续传」勿新建全量）'
                 WHERE status IN ('RUNNING', 'QUEUED')
                 """
             )
