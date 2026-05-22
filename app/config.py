@@ -126,6 +126,8 @@ class Settings(BaseSettings):
     strategy_import_progress_every_batches: int = 8
     # 单批 UPSERT 失败时最大重试次数
     strategy_import_batch_retry: int = 5
+    # Excel/库内行数达到该阈值：跳过续传前全表 heal、跳过结束时盲补写；校验复用导入扫描缓存（少遍读 Excel）
+    strategy_import_heavy_row_threshold: int = 8000
 
 
 settings = Settings()

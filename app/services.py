@@ -612,11 +612,10 @@ def _prepare_strategy_import_resume_incremental(
     增量续传：仅删 Excel 文件内 MAX(调仓日) 在库中的该日记录，再从 Excel 写入 >= 该日。
     不删库内全局最新调仓日（避免动到非增量历史）。
     """
-    ex_counts, ex_total = _excel_period_row_counts(file_path)
-    if ex_total <= 0:
+    resume_rb, ex_total = _excel_max_rebalance_date_and_total(file_path)
+    if ex_total <= 0 or resume_rb is None:
         _log.info("import incremental resume %s: Excel 无有效行", sid)
         return None, _strategy_positions_row_count(db, sid)
-    resume_rb = max(date.fromisoformat(d) for d in ex_counts)
     rows_before, db_max = _strategy_positions_import_stats(db, sid)
     from app.db import run_under_turso_stream_lock
 
@@ -658,8 +657,17 @@ def _finalize_strategy_import_job(
     done = set(ret.get("completed_strategy_ids") or [])
     verify_errors: list[str] = []
     row_checks: list[str] = []
+    pre_verified = set(ret.get("verified_strategy_ids") or [])
+    verify_rows = dict(ret.get("verify_rows") or {})
     if all_ids <= done and int(ret.get("failed") or 0) == 0:
         for sid in sorted(done):
+            if sid in pre_verified:
+                hint = verify_rows.get(sid)
+                if hint:
+                    row_checks.append(f"{sid}={hint}")
+                else:
+                    row_checks.append(f"{sid}={_strategy_positions_row_count(db, sid)}")
+                continue
             try:
                 fp = _strategy_config_excel_path(db, sid)
                 db_n, ex_n = _verify_strategy_full_import_row_count(
@@ -881,7 +889,107 @@ def _excel_period_row_counts(file_path: str) -> tuple[dict[str, int], int]:
             counts[k] += 1
             total += 1
         chunk.clear()
+    gc.collect()
     return dict(counts), total
+
+
+def _strategy_import_heavy_row_threshold() -> int:
+    return max(
+        500,
+        int(getattr(settings, "strategy_import_heavy_row_threshold", 8000) or 8000),
+    )
+
+
+def _import_is_heavy(*, excel_rows: int = 0, db_rows: int = 0) -> bool:
+    th = _strategy_import_heavy_row_threshold()
+    return int(excel_rows) >= th or int(db_rows) >= th
+
+
+def _excel_max_rebalance_date_and_total(file_path: str) -> tuple[date | None, int]:
+    """单次扫描：仅求末调仓日与总行数（增量续传删尾日，避免构建整表期次 dict）。"""
+    max_rb: date | None = None
+    total = 0
+    for chunk in _iter_strategy_holdings_excel_batches(file_path):
+        for rb, _code, _hw, _iw in chunk:
+            total += 1
+            if max_rb is None or rb > max_rb:
+                max_rb = rb
+        chunk.clear()
+    gc.collect()
+    return max_rb, total
+
+
+def _excel_period_counts_from_stats(
+    stats: dict[str, int | str] | None,
+) -> tuple[dict[str, int], int] | None:
+    if not stats:
+        return None
+    raw = stats.get("excel_period_counts")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    ex_counts = {str(k): int(v) for k, v in raw.items()}
+    ex_total = int(stats.get("expected_file_rows") or 0) or sum(ex_counts.values())
+    return ex_counts, ex_total
+
+
+def _accumulate_excel_period_counts(
+    stats: dict[str, int | str],
+    chunk: list[tuple[date, str, float | None, float | None]],
+) -> None:
+    """导入扫描时累计各调仓日行数，供结束校验复用，避免再整文件扫一遍。"""
+    if not chunk:
+        return
+    pc = stats.get("excel_period_counts")
+    if pc is None:
+        pc = defaultdict(int)
+        stats["excel_period_counts"] = pc
+    elif not isinstance(pc, defaultdict):
+        pc = defaultdict(int, {str(k): int(v) for k, v in pc.items()})
+        stats["excel_period_counts"] = pc
+    for rb, _code, _hw, _iw in chunk:
+        pc[rb.isoformat()] += 1
+    stats["expected_file_rows"] = int(stats.get("expected_file_rows") or 0) + len(chunk)
+
+
+def _finalize_excel_period_counts_in_stats(stats: dict[str, int | str]) -> None:
+    pc = stats.get("excel_period_counts")
+    if isinstance(pc, defaultdict):
+        stats["excel_period_counts"] = dict(pc)
+
+
+def _db_period_row_counts_for_dates(
+    db: Session, sid: str, dates: list[str]
+) -> dict[str, int]:
+    """仅查询指定调仓日的行数（大表校验切片时用，避免多余逻辑）。"""
+    uniq = sorted({str(d) for d in dates if str(d).strip()})
+    if not uniq:
+        return {}
+    counts: dict[str, int] = {d: 0 for d in uniq}
+    batch = 60
+    for i in range(0, len(uniq), batch):
+        part = uniq[i : i + batch]
+        cmps = [_compact_date(date.fromisoformat(d)) for d in part]
+        in_list = ", ".join(f":c{j}" for j in range(len(cmps)))
+        params: dict[str, Any] = {"sid": sid}
+        for j, c in enumerate(cmps):
+            params[f"c{j}"] = c
+        rows = db.execute(
+            text(
+                f"""
+                SELECT rebalance_date AS rb, COUNT(*) AS cnt
+                FROM strategy_positions
+                WHERE strategy_id=:sid
+                  AND {sql_date_compact_expr("rebalance_date")} IN ({in_list})
+                GROUP BY rebalance_date
+                """
+            ),
+            params,
+        ).mappings().all()
+        for r in rows:
+            d = _row_sql_date(r.get("rb"))
+            if d:
+                counts[d.isoformat()] = int(r.get("cnt") or 0)
+    return counts
 
 
 def _db_period_row_counts(db: Session, sid: str) -> tuple[dict[str, int], int]:
@@ -913,6 +1021,9 @@ def _verify_strategy_positions_exact_match(
     db: Session,
     sid: str,
     file_path: str,
+    *,
+    ex_counts: dict[str, int] | None = None,
+    ex_total: int | None = None,
 ) -> tuple[int, int]:
     """
     全量导入终态校验：总行数与每个调仓日行数均须与 Excel 完全一致（不多不少）。
@@ -920,19 +1031,22 @@ def _verify_strategy_positions_exact_match(
     """
     if not os.path.isfile(file_path):
         raise ValueError(f"{sid} Excel 不存在: {file_path}")
-    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    if ex_counts is None or ex_total is None:
+        ex_counts, ex_total = _excel_period_row_counts(file_path)
+    else:
+        ex_total = int(ex_total)
     if ex_total <= 0:
         raise ValueError(f"{sid} Excel 无有效持仓行")
-    db_counts, db_total = _db_period_row_counts(db, sid)
+    db_total = _strategy_positions_row_count(db, sid)
     if db_total != ex_total:
         raise ValueError(
             f"{sid} 行数不一致：Excel {ex_total} 行，库内 {db_total} 行（差 {db_total - ex_total:+d}）。"
             f"请全量导入并传 confirm_wipe:true 清库后重导。"
         )
-    all_dates = sorted(set(ex_counts) | set(db_counts))
+    db_counts = _db_period_row_counts_for_dates(db, sid, list(ex_counts.keys()))
     bad: list[tuple[str, int, int]] = []
-    for d in all_dates:
-        ec = ex_counts.get(d, 0)
+    for d in sorted(ex_counts):
+        ec = ex_counts[d]
         dc = db_counts.get(d, 0)
         if ec != dc:
             bad.append((d, ec, dc))
@@ -951,6 +1065,9 @@ def _verify_strategy_positions_incremental_match(
     db: Session,
     sid: str,
     file_path: str,
+    *,
+    ex_counts: dict[str, int] | None = None,
+    ex_total: int | None = None,
 ) -> tuple[int, int]:
     """
     增量终态校验：Excel 文件中每个调仓日行数须与库内一致；不要求库总行数=Excel 总行数。
@@ -958,10 +1075,13 @@ def _verify_strategy_positions_incremental_match(
     """
     if not os.path.isfile(file_path):
         raise ValueError(f"{sid} Excel 不存在: {file_path}")
-    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    if ex_counts is None or ex_total is None:
+        ex_counts, ex_total = _excel_period_row_counts(file_path)
+    else:
+        ex_total = int(ex_total)
     if ex_total <= 0:
         raise ValueError(f"{sid} Excel 无有效持仓行")
-    db_counts, _ = _db_period_row_counts(db, sid)
+    db_counts = _db_period_row_counts_for_dates(db, sid, list(ex_counts.keys()))
     bad: list[tuple[str, int, int]] = []
     slice_db = 0
     for d in sorted(ex_counts):
@@ -986,17 +1106,27 @@ def _verify_strategy_positions_incremental_match_with_auto_repair(
     sid: str,
     file_path: str,
     *,
+    ex_counts: dict[str, int] | None = None,
+    ex_total: int | None = None,
     max_repair_rounds: int = 3,
+    heavy: bool = False,
 ) -> tuple[int, int]:
     last_err: ValueError | None = None
-    rounds = max(1, int(max_repair_rounds or 3))
+    rounds = 1 if heavy else max(1, int(max_repair_rounds or 3))
     for rnd in range(rounds):
         try:
-            return _verify_strategy_positions_incremental_match(db, sid, file_path)
+            return _verify_strategy_positions_incremental_match(
+                db,
+                sid,
+                file_path,
+                ex_counts=ex_counts,
+                ex_total=ex_total,
+            )
         except ValueError as ve:
             last_err = ve
-            ex_counts, _ = _excel_period_row_counts(file_path)
-            db_counts, _ = _db_period_row_counts(db, sid)
+            if ex_counts is None or ex_total is None:
+                ex_counts, ex_total = _excel_period_row_counts(file_path)
+            db_counts = _db_period_row_counts_for_dates(db, sid, list(ex_counts.keys()))
             bad = _mismatch_rebalance_dates_in_excel_only(ex_counts, db_counts)
             if not bad:
                 raise
@@ -1004,7 +1134,11 @@ def _verify_strategy_positions_incremental_match_with_auto_repair(
 
             def _repair_once() -> int:
                 return _repair_strategy_positions_against_excel(
-                    db, sid, file_path, bad_dates=bad
+                    db,
+                    sid,
+                    file_path,
+                    bad_dates=bad,
+                    ex_counts=ex_counts,
                 )
 
             n = int(run_under_turso_stream_lock(_repair_once) or 0)
@@ -1026,20 +1160,41 @@ def _verify_strategy_positions_exact_match_with_auto_repair(
     sid: str,
     file_path: str,
     *,
+    ex_counts: dict[str, int] | None = None,
+    ex_total: int | None = None,
     max_repair_rounds: int = 3,
+    heavy: bool = False,
 ) -> tuple[int, int]:
     """终态校验；不一致时按调仓日自动补写后重试，避免中断残留导致误失败。"""
     last_err: ValueError | None = None
-    rounds = max(1, int(max_repair_rounds or 3))
+    rounds = 1 if heavy else max(1, int(max_repair_rounds or 3))
     for rnd in range(rounds):
         try:
-            return _verify_strategy_positions_exact_match(db, sid, file_path)
+            return _verify_strategy_positions_exact_match(
+                db,
+                sid,
+                file_path,
+                ex_counts=ex_counts,
+                ex_total=ex_total,
+            )
         except ValueError as ve:
             last_err = ve
+            if ex_counts is None or ex_total is None:
+                ex_counts, ex_total = _excel_period_row_counts(file_path)
+            db_counts = _db_period_row_counts_for_dates(db, sid, list(ex_counts.keys()))
+            bad = _mismatch_rebalance_dates_in_excel_only(ex_counts, db_counts)
+            if not bad:
+                bad = _mismatch_rebalance_dates(ex_counts, db_counts)
             from app.db import run_under_turso_stream_lock
 
             def _repair_once() -> int:
-                return _repair_strategy_positions_against_excel(db, sid, file_path)
+                return _repair_strategy_positions_against_excel(
+                    db,
+                    sid,
+                    file_path,
+                    bad_dates=bad,
+                    ex_counts=ex_counts,
+                )
 
             n = int(run_under_turso_stream_lock(_repair_once) or 0)
             if n <= 0:
@@ -1064,19 +1219,52 @@ def _heal_positions_gaps_from_excel(
     sync_job_id: int | None = None,
     strategy_import_job_id: int | None = None,
     incremental_slice: bool = False,
+    ex_counts: dict[str, int] | None = None,
+    ex_total: int | None = None,
 ) -> int:
     """
     对比 Excel/库内各调仓日行数，对不一致的日期整期 UPSERT（可修中间残缺，不依赖 confirm_wipe）。
     incremental_slice=True 时仅处理 Excel 中出现的调仓日。
+    大行数时跳过续传前 heal，改由删尾重导 + 结束校验补写，避免多遍读 Excel OOM。
     """
     from app.db import run_under_turso_stream_lock
 
-    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    db_rows = _strategy_positions_row_count(db, sid)
+    cached = _excel_period_counts_from_stats(stats) if stats else None
+    if cached:
+        ex_counts, ex_total = cached
+    elif ex_counts is None:
+        if _import_is_heavy(excel_rows=0, db_rows=db_rows):
+            _log.info(
+                "import %s: skip pre-heal (db %s rows >= threshold %s)",
+                sid,
+                db_rows,
+                _strategy_import_heavy_row_threshold(),
+            )
+            return 0
+        ex_counts, ex_total = _excel_period_row_counts(file_path)
+    else:
+        ex_total = int(ex_total or 0) or sum(ex_counts.values())
+    if _import_is_heavy(excel_rows=ex_total, db_rows=db_rows):
+        if stats is not None and ex_total > 0:
+            stats["expected_file_rows"] = ex_total
+            if ex_counts:
+                stats["excel_period_counts"] = ex_counts
+        _log.info(
+            "import %s: skip pre-heal (%s excel / %s db rows >= threshold %s)",
+            sid,
+            ex_total,
+            db_rows,
+            _strategy_import_heavy_row_threshold(),
+        )
+        return 0
     if stats is not None and ex_total > 0:
         stats["expected_file_rows"] = ex_total
+        if ex_counts:
+            stats["excel_period_counts"] = ex_counts
     if ex_total <= 0:
         return 0
-    db_counts, _ = _db_period_row_counts(db, sid)
+    db_counts = _db_period_row_counts_for_dates(db, sid, list(ex_counts.keys()))
     if incremental_slice:
         bad = _mismatch_rebalance_dates_in_excel_only(ex_counts, db_counts)
     else:
@@ -1086,7 +1274,7 @@ def _heal_positions_gaps_from_excel(
 
     def _do_heal() -> int:
         return _repair_strategy_positions_against_excel(
-            db, sid, file_path, bad_dates=bad
+            db, sid, file_path, bad_dates=bad, ex_counts=ex_counts
         )
 
     n = int(run_under_turso_stream_lock(_do_heal) or 0)
@@ -1112,14 +1300,53 @@ def _verify_strategy_full_import_row_count(
     file_path: str,
     *,
     import_mode: str,
+    ex_counts: dict[str, int] | None = None,
+    ex_total: int | None = None,
+    heavy: bool = False,
 ) -> tuple[int, int]:
     """全量：整表与 Excel 一致；增量：仅 Excel 切片逐期一致。"""
     mode = str(import_mode or "").lower()
+    kw = {
+        "ex_counts": ex_counts,
+        "ex_total": ex_total,
+        "heavy": heavy,
+    }
     if mode == "full":
-        return _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
+        return _verify_strategy_positions_exact_match_with_auto_repair(
+            db, sid, file_path, **kw
+        )
     return _verify_strategy_positions_incremental_match_with_auto_repair(
-        db, sid, file_path
+        db, sid, file_path, **kw
     )
+
+
+def _import_verify_positions_after_write(
+    db: Session,
+    sid: str,
+    file_path: str,
+    import_mode: str,
+    stats: dict[str, int | str],
+) -> tuple[int, int]:
+    """导入写入结束后校验；大行数复用 stats 内 excel_period_counts，避免再扫 Excel。"""
+    cached = _excel_period_counts_from_stats(stats)
+    ex_counts = cached[0] if cached else None
+    ex_total = cached[1] if cached else None
+    heavy = _import_is_heavy(
+        excel_rows=int(ex_total or stats.get("excel_rows") or 0),
+        db_rows=int(stats.get("rows_after") or 0),
+    )
+    db_n, ex_n = _verify_strategy_full_import_row_count(
+        db,
+        sid,
+        file_path,
+        import_mode=import_mode,
+        ex_counts=ex_counts,
+        ex_total=ex_total,
+        heavy=heavy,
+    )
+    stats["verify_slice_db"] = db_n
+    stats["verify_slice_ex"] = ex_n
+    return db_n, ex_n
 
 
 def _strategy_config_excel_path(db: Session, sid: str) -> str:
@@ -1268,9 +1495,6 @@ def _import_strategy_holdings_from_excel(
             )
             if inc_slice:
                 stats["rows_before"] = rows_baseline
-                _, ex_total = _excel_period_row_counts(file_path)
-                if ex_total > 0:
-                    stats["expected_file_rows"] = ex_total
         if delete_all:
             _import_progress_touch(
                 db,
@@ -1298,6 +1522,7 @@ def _import_strategy_holdings_from_excel(
         excel_rows = 0
         for chunk in _iter_strategy_holdings_excel_batches(file_path, meta_out=label_meta):
             excel_rows += len(chunk)
+            _accumulate_excel_period_counts(stats, chunk)
             if cutoff_rb is not None:
                 before = len(chunk)
                 chunk = [
@@ -1365,13 +1590,24 @@ def _import_strategy_holdings_from_excel(
         stats["excel_rows"] = excel_rows
         stats["imported_rows"] = imported_rows
         stats["skipped_rows"] = skipped_rows
+        _finalize_excel_period_counts_in_stats(stats)
+        heavy_import = _import_is_heavy(
+            excel_rows=excel_rows,
+            db_rows=int(stats.get("rows_before") or 0) + imported_rows,
+        )
         from app.db import run_under_turso_stream_lock
 
-        if import_mode == "full":
+        if str(import_mode or "").lower() == "full" and not heavy_import:
 
             def _finish_import() -> None:
                 nonlocal imported_rows
-                repaired = _repair_strategy_positions_against_excel(db, sid, file_path)
+                cached = _excel_period_counts_from_stats(stats)
+                repaired = _repair_strategy_positions_against_excel(
+                    db,
+                    sid,
+                    file_path,
+                    ex_counts=cached[0] if cached else None,
+                )
                 if repaired:
                     stats["repaired_rows"] = int(stats.get("repaired_rows") or 0) + repaired
                     imported_rows += repaired
@@ -1398,12 +1634,10 @@ def _import_strategy_holdings_from_excel(
             repair_last_period=repair_last_period,
             import_mode=import_mode,
         )
-        if str(import_mode or "").lower() == "full":
-            _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
-        else:
-            _verify_strategy_positions_incremental_match_with_auto_repair(
-                db, sid, file_path
-            )
+        _import_verify_positions_after_write(
+            db, sid, file_path, import_mode, stats
+        )
+        stats["positions_verified"] = 1
         _log.info(
             "import_strategy %s streaming done excel=%s imported=%s db=%s skipped=%s mode=%s repair=%s",
             sid,
@@ -1434,6 +1668,11 @@ def _import_strategy_holdings_from_excel(
         )
         label_meta.update({k: v for k, v in (label_meta2 or {}).items() if v})
         stats["excel_rows"] = len(rows_to_write)
+        pc: dict[str, int] = defaultdict(int)
+        for rb, _code, _hw, _iw in rows_to_write:
+            pc[rb.isoformat()] += 1
+        stats["excel_period_counts"] = dict(pc)
+        stats["expected_file_rows"] = len(rows_to_write)
         delete_all = import_mode == "full" and not repair_last_period
         _import_write_positions_one_strategy(
             db,
@@ -1455,12 +1694,10 @@ def _import_strategy_holdings_from_excel(
             repair_last_period=repair_last_period,
             import_mode=import_mode,
         )
-        if str(import_mode or "").lower() == "full":
-            _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
-        else:
-            _verify_strategy_positions_incremental_match_with_auto_repair(
-                db, sid, file_path
-            )
+        _import_verify_positions_after_write(
+            db, sid, file_path, import_mode, stats
+        )
+        stats["positions_verified"] = 1
         rows_to_write.clear()
         del rows_to_write
         gc.collect()
@@ -1606,15 +1843,23 @@ def _repair_strategy_positions_against_excel(
     file_path: str,
     *,
     bad_dates: set[str] | None = None,
+    ex_counts: dict[str, int] | None = None,
 ) -> int:
     """
     按调仓日对比 Excel/库内行数，对不一致的日期整期 UPSERT 补写。
     返回补写行数。
     """
     if bad_dates is None:
-        ex_counts, _ = _excel_period_row_counts(file_path)
-        db_counts, _ = _db_period_row_counts(db, sid)
-        bad_dates = _mismatch_rebalance_dates(ex_counts, db_counts)
+        if ex_counts is None:
+            ex_counts, _ = _excel_period_row_counts(file_path)
+        db_total = _strategy_positions_row_count(db, sid)
+        ex_total = sum(ex_counts.values())
+        if db_total != ex_total:
+            db_counts = _db_period_row_counts(db, sid)
+            bad_dates = _mismatch_rebalance_dates(ex_counts, db_counts)
+        else:
+            db_counts = _db_period_row_counts_for_dates(db, sid, list(ex_counts.keys()))
+            bad_dates = _mismatch_rebalance_dates_in_excel_only(ex_counts, db_counts)
     if not bad_dates:
         return 0
     _log.info(
@@ -1637,10 +1882,11 @@ def _repair_strategy_positions_against_excel(
     if buf:
         _commit_positions_chunk_resilient(db, sid, buf, batch_no=0)
         repaired += len(buf)
-    ex_counts2, _ = _excel_period_row_counts(file_path)
-    db_counts2, _ = _db_period_row_counts(db, sid)
+    if ex_counts is None:
+        ex_counts, _ = _excel_period_row_counts(file_path)
+    db_counts2 = _db_period_row_counts_for_dates(db, sid, list(bad_dates))
     still = [
-        d for d in bad_dates if db_counts2.get(d, 0) != ex_counts2.get(d, 0)
+        d for d in bad_dates if db_counts2.get(d, 0) != ex_counts.get(d, 0)
     ]
     if still:
         _log.warning(
@@ -2983,6 +3229,8 @@ def import_strategy_files(
     failed = 0
     errors: list[str] = []
     completed: set[str] = set(skip)
+    verified_strategy_ids: list[str] = []
+    verify_rows: dict[str, str] = {}
 
     if selected_set:
         found_set = {str(c.get("strategy_id") or "").strip() for c in configs}
@@ -3071,6 +3319,11 @@ def import_strategy_files(
             rows_to_write = None
             gc.collect()
             completed.add(sid)
+            if int(import_stats.get("positions_verified") or 0):
+                verified_strategy_ids.append(sid)
+                ex_n = int(import_stats.get("verify_slice_ex") or import_stats.get("excel_rows") or 0)
+                db_n = int(import_stats.get("verify_slice_db") or import_stats.get("rows_after") or 0)
+                verify_rows[sid] = f"{db_n}/{ex_n}" if ex_n else str(db_n)
             try:
                 from app.strategy_list_metrics import refresh_strategy_list_metrics_one
 
@@ -3142,6 +3395,8 @@ def import_strategy_files(
         "failed": failed,
         "errors": errors[:50],
         "completed_strategy_ids": sorted(completed),
+        "verified_strategy_ids": verified_strategy_ids,
+        "verify_rows": verify_rows,
         "resumable": resumable,
     }
 
