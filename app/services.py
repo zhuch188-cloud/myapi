@@ -566,6 +566,13 @@ def _mismatch_rebalance_dates(
     return {d for d in keys if ex_counts.get(d, 0) != db_counts.get(d, 0)}
 
 
+def _mismatch_rebalance_dates_in_excel_only(
+    ex_counts: dict[str, int], db_counts: dict[str, int]
+) -> set[str]:
+    """增量切片：只比对 Excel 中出现的调仓日，不触碰/不要求库内其它日期。"""
+    return {d for d in ex_counts if ex_counts.get(d, 0) != db_counts.get(d, 0)}
+
+
 def _prepare_strategy_import_resume_from_db_max(
     db: Session, sid: str
 ) -> tuple[date | None, int]:
@@ -598,26 +605,173 @@ def _prepare_strategy_import_resume_from_db_max(
     return max_rb, rows_after
 
 
+def _prepare_strategy_import_resume_incremental(
+    db: Session, sid: str, file_path: str
+) -> tuple[date | None, int]:
+    """
+    增量续传：仅删 Excel 文件内 MAX(调仓日) 在库中的该日记录，再从 Excel 写入 >= 该日。
+    不删库内全局最新调仓日（避免动到非增量历史）。
+    """
+    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    if ex_total <= 0:
+        _log.info("import incremental resume %s: Excel 无有效行", sid)
+        return None, _strategy_positions_row_count(db, sid)
+    resume_rb = max(date.fromisoformat(d) for d in ex_counts)
+    rows_before, db_max = _strategy_positions_import_stats(db, sid)
+    from app.db import run_under_turso_stream_lock
+
+    def _del_tail() -> None:
+        _delete_strategy_positions_rebalance_period(db, sid, resume_rb)
+        db.commit()
+
+    run_under_turso_stream_lock(_del_tail)
+    rows_after, max_after = _strategy_positions_import_stats(db, sid)
+    _log.info(
+        "import incremental resume %s: Excel 末调仓日 %s（删前 %s 行，库 MAX=%s）"
+        "→ 已删该日全部记录；删后 %s 行 MAX=%s；从 Excel >=%s 重导",
+        sid,
+        resume_rb.isoformat(),
+        rows_before,
+        db_max.isoformat() if db_max else "—",
+        rows_after,
+        max_after.isoformat() if max_after else "—",
+        resume_rb.isoformat(),
+    )
+    return resume_rb, rows_after
+
+
+def _import_job_message_indicates_import_done(message: str | None) -> bool:
+    """import_strategy_files 已写入「已完成 … 失败 0」但终态尚未落库时的进度文案。"""
+    m = str(message or "")
+    return "已完成" in m and "失败 0" in m
+
+
+def _finalize_strategy_import_job(
+    db: Session,
+    job_id: int,
+    ret: dict[str, Any],
+    import_mode: str,
+    strategy_ids: list[str],
+) -> None:
+    """根据 import_strategy_files 返回值与校验结果写入任务终态（SUCCESS/FAILED）。"""
+    all_ids = {str(x).strip() for x in strategy_ids if str(x or "").strip()}
+    done = set(ret.get("completed_strategy_ids") or [])
+    verify_errors: list[str] = []
+    row_checks: list[str] = []
+    if all_ids <= done and int(ret.get("failed") or 0) == 0:
+        for sid in sorted(done):
+            try:
+                fp = _strategy_config_excel_path(db, sid)
+                db_n, ex_n = _verify_strategy_full_import_row_count(
+                    db, sid, fp, import_mode=import_mode
+                )
+                if ex_n > 0:
+                    row_checks.append(f"{sid}={db_n}/{ex_n}")
+                else:
+                    row_checks.append(f"{sid}={db_n}")
+            except ValueError as ve:
+                done.discard(sid)
+                verify_errors.append(str(ve))
+    for sid in sorted(all_ids):
+        if sid not in done and not any(sid in e for e in verify_errors):
+            cnt = _strategy_positions_row_count(db, sid)
+            row_checks.append(f"{sid}={cnt}")
+    errors_out = list(ret.get("errors") or []) + verify_errors
+    ok = all_ids <= done and not errors_out
+    st = "SUCCESS" if ok else "FAILED"
+    rows_hint = "；".join(row_checks) if row_checks else ""
+    msg = (
+        f"完成：成功 {len(done)}/{len(all_ids)} 个策略（{rows_hint}）"
+        if ok
+        else f"未完成 {len(done)}/{len(all_ids)}，失败 {max(len(errors_out), int(ret.get('failed') or 0))}，可点「续传」或全量清库。{rows_hint}"
+    )
+    db.execute(
+        text(
+            f"""
+            UPDATE strategy_import_jobs
+            SET status=:st, finished_at={sql_now()}, message=:msg,
+                imported_count=:ic, failed_count=:fc, errors_json=:ej,
+                completed_strategy_ids_json=:cj
+            WHERE id=:id AND status <> 'ABANDONED'
+            """
+        ),
+        {
+            "st": st,
+            "msg": msg[:6000],
+            "ic": len(done),
+            "fc": max(len(errors_out), int(ret.get("failed") or 0)),
+            "ej": json.dumps(errors_out[:50], ensure_ascii=False),
+            "cj": json.dumps(sorted(done), ensure_ascii=False),
+            "id": job_id,
+        },
+    )
+
+
 def mark_running_strategy_import_jobs_interrupted(*, reason: str) -> None:
-    """进程关闭前将 RUNNING 导入标为失败，避免界面仍显示执行中。"""
+    """
+    进程关闭前处理仍 RUNNING 的导入任务。
+    若进度已显示「已完成 … 失败 0」而线程未及写 SUCCESS，补标成功而非误标失败。
+    """
     from app.db import SessionLocalFactory
 
     if SessionLocalFactory is None:
         return
     db = SessionLocalFactory()
     try:
-        suffix = f"（{reason}）"
-        db.execute(
+        rows = db.execute(
             text(
-                f"""
-                UPDATE strategy_import_jobs
-                SET status='FAILED', finished_at={sql_now()},
-                    message=COALESCE(message, '') || :suf
+                """
+                SELECT id, message, errors_json, strategy_ids_json, import_mode
+                FROM strategy_import_jobs
                 WHERE status='RUNNING'
                 """
-            ),
-            {"suf": suffix[:500]},
-        )
+            )
+        ).mappings().all()
+        suffix_fail = f"（{reason}）"
+        for row in rows:
+            jid = int(row["id"])
+            msg = str(row.get("message") or "")
+            ej = str(row.get("errors_json") or "[]")
+            if _import_job_message_indicates_import_done(msg) and ej.strip() in (
+                "[]",
+                "",
+                "null",
+            ):
+                ids = _json_str_list(row.get("strategy_ids_json"))
+                try:
+                    _finalize_strategy_import_job(
+                        db,
+                        jid,
+                        {
+                            "completed_strategy_ids": ids,
+                            "failed": 0,
+                            "errors": [],
+                            "resumable": False,
+                        },
+                        str(row.get("import_mode") or "full"),
+                        ids,
+                    )
+                    _log.info(
+                        "strategy_import job %s: import done, promoted to SUCCESS on shutdown",
+                        jid,
+                    )
+                    continue
+                except Exception:
+                    _log.exception(
+                        "strategy_import job %s: promote SUCCESS on shutdown failed",
+                        jid,
+                    )
+            db.execute(
+                text(
+                    f"""
+                    UPDATE strategy_import_jobs
+                    SET status='FAILED', finished_at={sql_now()},
+                        message=COALESCE(message, '') || :suf
+                    WHERE id=:id AND status='RUNNING'
+                    """
+                ),
+                {"suf": suffix_fail[:500], "id": jid},
+            )
         db.commit()
     except Exception:
         db.rollback()
@@ -652,23 +806,34 @@ def _import_cutoff_plan(
     import_mode: str,
     *,
     repair_last_period: bool,
+    file_path: str = "",
 ) -> tuple[date | None, bool, bool, int]:
     """
     返回 (cutoff_rb, cutoff_inclusive, delete_all, rows_baseline_after_cutoff)。
     首次全量：清空后整表重导。
-    续传：库内 MAX(调仓日) 删该日全部记录，Excel 导入 >= 该日。
-    首次增量：只追加 > MAX(rebalance_date)。
+    全量续传：库内 MAX(调仓日) 删该日全部记录，Excel 导入 >= 该日。
+    首次增量：只追加 > MAX(rebalance_date)；库内更早调仓日不写不改。
+    增量续传：删 Excel 末调仓日，从 Excel 导入 >= 该日（文件可仅含新增调仓）。
     """
     rows_baseline = 0
-    if import_mode == "full" and not repair_last_period:
+    mode = str(import_mode or "").lower()
+    if mode == "full" and not repair_last_period:
         return None, False, True, rows_baseline
     cutoff_rb: date | None = None
     cutoff_inclusive = False
     if repair_last_period:
-        cutoff_rb, rows_baseline = _prepare_strategy_import_resume_from_db_max(db, sid)
+        if mode == "incremental" and file_path and os.path.isfile(file_path):
+            cutoff_rb, rows_baseline = _prepare_strategy_import_resume_incremental(
+                db, sid, file_path
+            )
+        else:
+            cutoff_rb, rows_baseline = _prepare_strategy_import_resume_from_db_max(
+                db, sid
+            )
         cutoff_inclusive = cutoff_rb is not None
-    elif import_mode != "full":
+    elif mode == "incremental":
         cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
+        rows_baseline = _strategy_positions_row_count(db, sid)
     return cutoff_rb, cutoff_inclusive, False, rows_baseline
 
 
@@ -782,6 +947,80 @@ def _verify_strategy_positions_exact_match(
     return db_total, ex_total
 
 
+def _verify_strategy_positions_incremental_match(
+    db: Session,
+    sid: str,
+    file_path: str,
+) -> tuple[int, int]:
+    """
+    增量终态校验：Excel 文件中每个调仓日行数须与库内一致；不要求库总行数=Excel 总行数。
+    返回 (库内该切片行数, Excel 行数)。
+    """
+    if not os.path.isfile(file_path):
+        raise ValueError(f"{sid} Excel 不存在: {file_path}")
+    ex_counts, ex_total = _excel_period_row_counts(file_path)
+    if ex_total <= 0:
+        raise ValueError(f"{sid} Excel 无有效持仓行")
+    db_counts, _ = _db_period_row_counts(db, sid)
+    bad: list[tuple[str, int, int]] = []
+    slice_db = 0
+    for d in sorted(ex_counts):
+        ec = ex_counts[d]
+        dc = db_counts.get(d, 0)
+        slice_db += dc
+        if ec != dc:
+            bad.append((d, ec, dc))
+    if bad:
+        d0, e0, b0 = bad[0]
+        extra = f"；另有 {len(bad) - 1} 个调仓日" if len(bad) > 1 else ""
+        raise ValueError(
+            f"{sid} 增量切片与 Excel 不一致：共 {len(bad)} 期{extra}。"
+            f"首期差异 {d0}（Excel {e0} / 库内 {b0}）。"
+            f"请点「续传」或检查增量文件是否仅含新增调仓。"
+        )
+    return slice_db, ex_total
+
+
+def _verify_strategy_positions_incremental_match_with_auto_repair(
+    db: Session,
+    sid: str,
+    file_path: str,
+    *,
+    max_repair_rounds: int = 3,
+) -> tuple[int, int]:
+    last_err: ValueError | None = None
+    rounds = max(1, int(max_repair_rounds or 3))
+    for rnd in range(rounds):
+        try:
+            return _verify_strategy_positions_incremental_match(db, sid, file_path)
+        except ValueError as ve:
+            last_err = ve
+            ex_counts, _ = _excel_period_row_counts(file_path)
+            db_counts, _ = _db_period_row_counts(db, sid)
+            bad = _mismatch_rebalance_dates_in_excel_only(ex_counts, db_counts)
+            if not bad:
+                raise
+            from app.db import run_under_turso_stream_lock
+
+            def _repair_once() -> int:
+                return _repair_strategy_positions_against_excel(
+                    db, sid, file_path, bad_dates=bad
+                )
+
+            n = int(run_under_turso_stream_lock(_repair_once) or 0)
+            if n <= 0:
+                raise
+            _log.info(
+                "import incremental %s: 切片校验第 %s 轮不一致，已补写 %s 行",
+                sid,
+                rnd + 1,
+                n,
+            )
+    if last_err is not None:
+        raise last_err
+    raise ValueError(f"{sid} 增量导入校验失败")
+
+
 def _verify_strategy_positions_exact_match_with_auto_repair(
     db: Session,
     sid: str,
@@ -824,9 +1063,11 @@ def _heal_positions_gaps_from_excel(
     stats: dict[str, int | str] | None = None,
     sync_job_id: int | None = None,
     strategy_import_job_id: int | None = None,
+    incremental_slice: bool = False,
 ) -> int:
     """
     对比 Excel/库内各调仓日行数，对不一致的日期整期 UPSERT（可修中间残缺，不依赖 confirm_wipe）。
+    incremental_slice=True 时仅处理 Excel 中出现的调仓日。
     """
     from app.db import run_under_turso_stream_lock
 
@@ -836,7 +1077,10 @@ def _heal_positions_gaps_from_excel(
     if ex_total <= 0:
         return 0
     db_counts, _ = _db_period_row_counts(db, sid)
-    bad = _mismatch_rebalance_dates(ex_counts, db_counts)
+    if incremental_slice:
+        bad = _mismatch_rebalance_dates_in_excel_only(ex_counts, db_counts)
+    else:
+        bad = _mismatch_rebalance_dates(ex_counts, db_counts)
     if not bad:
         return 0
 
@@ -869,11 +1113,13 @@ def _verify_strategy_full_import_row_count(
     *,
     import_mode: str,
 ) -> tuple[int, int]:
-    """全量完成后与 Excel 逐期完全一致；增量模式不在此做全表比对。"""
-    if str(import_mode or "").lower() != "full":
-        db_n = _strategy_positions_row_count(db, sid)
-        return db_n, 0
-    return _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
+    """全量：整表与 Excel 一致；增量：仅 Excel 切片逐期一致。"""
+    mode = str(import_mode or "").lower()
+    if mode == "full":
+        return _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
+    return _verify_strategy_positions_incremental_match_with_auto_repair(
+        db, sid, file_path
+    )
 
 
 def _strategy_config_excel_path(db: Session, sid: str) -> str:
@@ -902,7 +1148,8 @@ def _validate_strategy_import_result(
     imported = int(stats.get("imported_rows") or 0)
     excel_rows = int(stats.get("excel_rows") or 0)
     expected_total = int(stats.get("expected_file_rows") or 0) or excel_rows
-    need_complete = delete_all or (repair_last_period and import_mode == "full")
+    mode = str(import_mode or "").lower()
+    need_complete = delete_all or (repair_last_period and mode == "full")
     if need_complete and expected_total > 0:
         if rows_after != expected_total:
             gap = expected_total - rows_after
@@ -921,6 +1168,13 @@ def _validate_strategy_import_result(
             raise ValueError(f"{sid} 全量导入后库内 0 行")
         return
     if repair_last_period:
+        if mode == "incremental":
+            if rows_after + 200 < rows_before:
+                raise ValueError(
+                    f"{sid} 增量续传后总行数异常减少 {rows_before} → {rows_after}，"
+                    f"请再点「续传」；历史调仓日应未被改动"
+                )
+            return
         exp = int(stats.get("expected_file_rows") or 0) or excel_rows
         if rows_before > 0 and imported <= 0 and exp > 0 and rows_after != exp:
             raise ValueError(
@@ -958,6 +1212,7 @@ def _import_strategy_holdings_from_excel(
         cutoff_inclusive = False
         delete_all = False
         rows_baseline = 0
+        inc_slice = str(import_mode or "").lower() == "incremental"
         if repair_last_period:
             healed_pre = _heal_positions_gaps_from_excel(
                 db,
@@ -966,6 +1221,7 @@ def _import_strategy_holdings_from_excel(
                 stats=stats,
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
+                incremental_slice=inc_slice,
             )
             if healed_pre:
                 stats["healed_rows"] = int(stats.get("healed_rows") or 0) + healed_pre
@@ -974,17 +1230,30 @@ def _import_strategy_holdings_from_excel(
                 sid,
                 import_mode,
                 repair_last_period=True,
+                file_path=file_path,
             )
             resume_cutoff = cutoff_rb
             stats["rows_before"] = rows_baseline
             resume_from = resume_cutoff
+            if inc_slice:
+                resume_msg = (
+                    f"阶段1/3 {sid}：增量续传 — 已补写 Excel 内不一致调仓日"
+                    f"{f'（{healed_pre} 行）' if healed_pre else ''}；"
+                    f"已删 Excel 末调仓日 {resume_from.isoformat() if resume_from else '（无）'}"
+                    f" 全部记录，从 Excel 写入 >= 该日（库内更早调仓日不动）；"
+                    f"删后基线 {stats['rows_before']} 行…"
+                )
+            else:
+                resume_msg = (
+                    f"阶段1/3 {sid}：续传 — 已自动补写残缺调仓日"
+                    f"{f'（{healed_pre} 行）' if healed_pre else ''}；"
+                    f"库内最新调仓日 {resume_from.isoformat() if resume_from else '（无）'}"
+                    f"，已删该日全部记录，从 Excel 写入 >= 该日；"
+                    f"删后基线 {stats['rows_before']} 行…"
+                )
             _import_progress_touch(
                 db,
-                f"阶段1/3 {sid}：续传 — 已自动补写残缺调仓日"
-                f"{f'（{healed_pre} 行）' if healed_pre else ''}；"
-                f"库内最新调仓日 {resume_from.isoformat() if resume_from else '（无）'}"
-                f"，已删该日全部记录，从 Excel 写入 >= 该日；"
-                f"删后基线 {stats['rows_before']} 行…",
+                resume_msg,
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=False,
@@ -995,7 +1264,13 @@ def _import_strategy_holdings_from_excel(
                 sid,
                 import_mode,
                 repair_last_period=False,
+                file_path=file_path,
             )
+            if inc_slice:
+                stats["rows_before"] = rows_baseline
+                _, ex_total = _excel_period_row_counts(file_path)
+                if ex_total > 0:
+                    stats["expected_file_rows"] = ex_total
         if delete_all:
             _import_progress_touch(
                 db,
@@ -1123,8 +1398,12 @@ def _import_strategy_holdings_from_excel(
             repair_last_period=repair_last_period,
             import_mode=import_mode,
         )
-        if import_mode == "full":
+        if str(import_mode or "").lower() == "full":
             _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
+        else:
+            _verify_strategy_positions_incremental_match_with_auto_repair(
+                db, sid, file_path
+            )
         _log.info(
             "import_strategy %s streaming done excel=%s imported=%s db=%s skipped=%s mode=%s repair=%s",
             sid,
@@ -1176,8 +1455,12 @@ def _import_strategy_holdings_from_excel(
             repair_last_period=repair_last_period,
             import_mode=import_mode,
         )
-        if import_mode == "full":
+        if str(import_mode or "").lower() == "full":
             _verify_strategy_positions_exact_match_with_auto_repair(db, sid, file_path)
+        else:
+            _verify_strategy_positions_incremental_match_with_auto_repair(
+                db, sid, file_path
+            )
         rows_to_write.clear()
         del rows_to_write
         gc.collect()
@@ -2202,11 +2485,19 @@ def _import_write_positions_one_strategy(
     file_path: str = "",
 ) -> None:
     """单策略：删/增 strategy_positions，可选更新 strategy_configs 元数据（不含 commit）。"""
+    if repair_last_period and file_path and str(import_mode or "").lower() == "incremental":
+        _heal_positions_gaps_from_excel(
+            db,
+            sid,
+            file_path,
+            incremental_slice=True,
+        )
     cutoff_rb, cutoff_inclusive, delete_all, _baseline = _import_cutoff_plan(
         db,
         sid,
         import_mode,
         repair_last_period=repair_last_period,
+        file_path=file_path,
     )
     if delete_all:
         db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
@@ -6124,13 +6415,18 @@ def execute_admin_sync_pipeline(
             )
             completed_import = set(imp.get("completed_strategy_ids") or [])
             verify_errors: list[str] = []
-            if import_mode == "full" and completed_import:
+            if completed_import:
                 for sid in sorted(completed_import):
                     try:
                         fp = _strategy_config_excel_path(db, sid)
-                        _verify_strategy_positions_exact_match_with_auto_repair(
-                            db, sid, fp
-                        )
+                        if str(import_mode or "").lower() == "full":
+                            _verify_strategy_positions_exact_match_with_auto_repair(
+                                db, sid, fp
+                            )
+                        else:
+                            _verify_strategy_positions_incremental_match_with_auto_repair(
+                                db, sid, fp
+                            )
                     except ValueError as ve:
                         completed_import.discard(sid)
                         verify_errors.append(str(ve))
@@ -6413,59 +6709,7 @@ def _run_strategy_import_background_task_impl(
             strategy_import_job_id=job_id,
             resume=resume,
         )
-        all_ids = set(ids)
-        done = set(ret.get("completed_strategy_ids") or [])
-        verify_errors: list[str] = []
-        row_checks: list[str] = []
-        if all_ids <= done and int(ret.get("failed") or 0) == 0:
-            for sid in sorted(done):
-                try:
-                    fp = _strategy_config_excel_path(db, sid)
-                    db_n, ex_n = _verify_strategy_full_import_row_count(
-                        db, sid, fp, import_mode=import_mode
-                    )
-                    if ex_n > 0:
-                        row_checks.append(f"{sid}={db_n}/{ex_n}")
-                    else:
-                        row_checks.append(f"{sid}={db_n}")
-                except ValueError as ve:
-                    done.discard(sid)
-                    verify_errors.append(str(ve))
-        for sid in sorted(all_ids):
-            if sid not in done and not any(sid in e for e in verify_errors):
-                cnt = _strategy_positions_row_count(db, sid)
-                row_checks.append(f"{sid}={cnt}")
-        errors_out = list(ret.get("errors") or []) + verify_errors
-        ok = all_ids <= done and not errors_out
-        st = "SUCCESS" if ok else "FAILED"
-        if not ok and (ret.get("resumable") or verify_errors):
-            st = "FAILED"
-        rows_hint = "；".join(row_checks) if row_checks else ""
-        msg = (
-            f"完成：成功 {len(done)}/{len(all_ids)} 个策略（{rows_hint}）"
-            if ok
-            else f"未完成 {len(done)}/{len(all_ids)}，失败 {max(len(errors_out), int(ret.get('failed') or 0))}，可点「续传」或全量清库。{rows_hint}"
-        )
-        db.execute(
-            text(
-                f"""
-                UPDATE strategy_import_jobs
-                SET status=:st, finished_at={sql_now()}, message=:msg,
-                    imported_count=:ic, failed_count=:fc, errors_json=:ej,
-                    completed_strategy_ids_json=:cj
-                WHERE id=:id AND status <> 'ABANDONED'
-                """
-            ),
-            {
-                "st": st,
-                "msg": msg[:6000],
-                "ic": len(done),
-                "fc": max(len(errors_out), int(ret.get("failed") or 0)),
-                "ej": json.dumps(errors_out[:50], ensure_ascii=False),
-                "cj": json.dumps(sorted(done), ensure_ascii=False),
-                "id": job_id,
-            },
-        )
+        _finalize_strategy_import_job(db, job_id, ret, import_mode, ids)
         db.commit()
     except Exception as ex:
         _log.exception("strategy_import job %s failed", job_id)
