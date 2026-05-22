@@ -3355,6 +3355,33 @@ def _codes_for_nav_segment(
     return sorted(codes)
 
 
+def _nav_ensure_anchor_eod_in_day_map(
+    wind: Any,
+    db: Session,
+    day_map: dict[str, dict[str, tuple[float | None, float | None]]],
+    codes: list[str],
+    anchor_c: str,
+) -> Any:
+    """
+    分段 EOD 首段起点可能早于末净值日（如新调仓前移 eod_start）；
+    单独拉取锚点日复权价，保证 bootstrap 与全量重算同价体系。
+    """
+    anchor_c = str(anchor_c or "").strip()[:8]
+    if len(anchor_c) < 8 or not codes:
+        return wind
+    if _eod_day_map_has_trade(day_map, anchor_c, codes):
+        return wind
+    chunk_sz = wind_bulk.eod_stock_chunk_size()
+    for i in range(0, len(codes), chunk_sz):
+        part = codes[i : i + chunk_sz]
+        if not part:
+            continue
+        wind, eod_part = wind_bulk.load_eod_by_code(wind, part, anchor_c, anchor_c, db)
+        _merge_eod_into_day_map(day_map, eod_part)
+        eod_part.clear()
+    return wind
+
+
 def _merge_eod_into_day_map(
     day_map: dict[str, dict[str, tuple[float | None, float | None]]],
     eod_part: dict[str, list],
@@ -3783,15 +3810,14 @@ def _nav_shares_from_holding_snapshot(
             w = pw / tw if tw > 0 else 0.0
         if w <= 0:
             continue
-        try:
-            px = float(r.get("latest_price") or 0.0)
-        except (TypeError, ValueError):
-            px = 0.0
+        px = _adj_close_td_ff(day_map, sc, td_compact, last_close_fill)
         if px is None or px <= 0:
-            px = _adj_close_td_ff(day_map, sc, td_compact, last_close_fill) or 0.0
-        if px > 0:
-            last_close_fill[sc] = float(px)
-            shares[sc] = prev_mv * w / px
+            try:
+                px = float(r.get("latest_price") or 0.0)
+            except (TypeError, ValueError):
+                px = 0.0
+        if px is not None and px > 0:
+            shares[sc] = prev_mv * w / float(px)
     return shares if shares else None
 
 
@@ -3932,6 +3958,9 @@ def _nav_init_state_from_last_row(
         shares = _nav_snap_shares_from_holdings(
             holdings0, prev_mv, day_map, append_after_c, last_close_fill
         )
+    prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
+        append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
+    )
     if shares and prev_mv is not None and prev_mv > 0:
         shares = _nav_rescale_shares_to_notional(
             shares, prev_mv, day_map, append_after_c, last_close_fill
@@ -4241,6 +4270,9 @@ def _rebuild_nav_incremental_from_current_period(
             if bench_code and seg_bench_dm:
                 bench_day_map.update(seg_bench_dm)
             if not state_inited:
+                wind = _nav_ensure_anchor_eod_in_day_map(
+                    wind, db, day_map, period_codes, append_after_c
+                )
                 ok_eod, eod_reason = _nav_incremental_eod_ready(
                     db,
                     sid,
@@ -4272,13 +4304,6 @@ def _rebuild_nav_incremental_from_current_period(
                     row_last,
                     bench_code,
                 )
-                prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
-                    append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
-                )
-                if shares and prev_mv is not None and prev_mv > 0:
-                    shares = _nav_rescale_shares_to_notional(
-                        shares, prev_mv, day_map, append_after_c, last_close_fill
-                    )
                 if not _nav_init_matches_last_row(
                     row_last, shares, day_map, append_after_c, last_close_fill, ic0
                 ):
@@ -4416,13 +4441,6 @@ def _rebuild_nav_incremental_from_current_period(
         row_last,
         bench_code,
     )
-    prev_mv, bench_nav_acc = _nav_align_sim_state_to_db_last(
-        append_after_c, row_last, ic0, prev_mv, bench_nav_acc, bench_code
-    )
-    if shares and prev_mv is not None and prev_mv > 0:
-        shares = _nav_rescale_shares_to_notional(
-            shares, prev_mv, day_map, append_after_c, last_close_fill
-        )
     if not _nav_init_matches_last_row(
         row_last, shares, day_map, append_after_c, last_close_fill, ic0
     ):
