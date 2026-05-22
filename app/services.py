@@ -5449,47 +5449,46 @@ def execute_admin_sync_pipeline(
 
     if import_pending:
         _log.info("admin_sync job %s: stage1 import begin", sync_job_id)
-        with turso_stream_lock():
-            db = SessionLocalFactory()
-            try:
-                p(
-                    "import",
-                    f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}"
-                    f"{f'，续传跳过 {len(completed_import)} 个' if completed_import else ''}）…",
-                )
-                imp = import_strategy_files(
-                    db,
-                    selected_strategy_ids=ids,
-                    import_mode=import_mode,
-                    do_commit=True,
-                    skip_strategy_ids=completed_import,
-                    sync_job_id=sync_job_id,
-                    resume=resume,
-                )
-                completed_import = set(imp.get("completed_strategy_ids") or [])
-                if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
-                    return {
-                        "ok": False,
-                        "stage": "import",
-                        "resumable": True,
-                        **imp,
-                    }
-            except Exception as ex:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-                _log.exception("admin_sync job %s stage1 import failed", sync_job_id)
+        db = SessionLocalFactory()
+        try:
+            p(
+                "import",
+                f"阶段1/3：从 Excel 导入（{len(ids)} 个策略，{import_mode}"
+                f"{f'，续传跳过 {len(completed_import)} 个' if completed_import else ''}）…",
+            )
+            imp = import_strategy_files(
+                db,
+                selected_strategy_ids=ids,
+                import_mode=import_mode,
+                do_commit=True,
+                skip_strategy_ids=completed_import,
+                sync_job_id=sync_job_id,
+                resume=resume,
+            )
+            completed_import = set(imp.get("completed_strategy_ids") or [])
+            if int(imp.get("failed") or 0) > 0 and not ids_set <= completed_import:
                 return {
                     "ok": False,
                     "stage": "import",
-                    "imported": (imp or {}).get("imported", 0),
-                    "nav_rebuilt": 0,
-                    "failed": len(ids),
-                    "errors": [str(ex)],
+                    "resumable": True,
+                    **imp,
                 }
-            finally:
-                db.close()
+        except Exception as ex:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            _log.exception("admin_sync job %s stage1 import failed", sync_job_id)
+            return {
+                "ok": False,
+                "stage": "import",
+                "imported": (imp or {}).get("imported", 0),
+                "nav_rebuilt": 0,
+                "failed": len(ids),
+                "errors": [str(ex)],
+            }
+        finally:
+            db.close()
         _log.info(
             "admin_sync job %s: stage1 import done imported=%s failed=%s",
             sync_job_id,
@@ -5694,89 +5693,89 @@ def run_strategy_import_background_task(
     *,
     resume: bool = False,
 ) -> None:
-    from app.db import SessionLocalFactory, turso_stream_lock
+    """守护线程中执行；勿整段 turso_stream_lock，避免阻塞轮询 API 与 /health。"""
+    from app.db import SessionLocalFactory
 
-    with turso_stream_lock():
-        db = SessionLocalFactory()
+    db = SessionLocalFactory()
+    try:
+        job = get_strategy_import_job_row(db, job_id)
+        if not job:
+            return
+        if str(job.get("status") or "").upper() == "ABANDONED":
+            return
+        ids = _json_str_list(job.get("strategy_ids_json"))
+        import_mode = str(job.get("import_mode") or "full")
+        skip = set(_json_str_list(job.get("completed_strategy_ids_json"))) if resume else set()
+        db.execute(
+            text(
+                f"""
+                UPDATE strategy_import_jobs
+                SET status='RUNNING', started_at={sql_now()}, message=:m, progress_at={sql_now()}
+                WHERE id=:id AND status <> 'ABANDONED'
+                """
+            ),
+            {
+                "m": "续传执行中…" if resume else "后台导入执行中…",
+                "id": job_id,
+            },
+        )
+        db.commit()
+        ret = import_strategy_files(
+            db,
+            selected_strategy_ids=ids,
+            import_mode=import_mode,
+            do_commit=True,
+            skip_strategy_ids=skip,
+            strategy_import_job_id=job_id,
+            resume=resume,
+        )
+        all_ids = set(ids)
+        done = set(ret.get("completed_strategy_ids") or [])
+        ok = all_ids <= done and int(ret.get("failed") or 0) == 0
+        st = "SUCCESS" if ok else "FAILED"
+        if not ok and ret.get("resumable"):
+            st = "FAILED"
+        msg = (
+            f"完成：成功 {len(done)}/{len(all_ids)} 个策略"
+            if ok
+            else f"部分完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」"
+        )
+        db.execute(
+            text(
+                f"""
+                UPDATE strategy_import_jobs
+                SET status=:st, finished_at={sql_now()}, message=:msg,
+                    imported_count=:ic, failed_count=:fc, errors_json=:ej,
+                    completed_strategy_ids_json=:cj
+                WHERE id=:id AND status <> 'ABANDONED'
+                """
+            ),
+            {
+                "st": st,
+                "msg": msg[:6000],
+                "ic": len(done),
+                "fc": int(ret.get("failed") or 0),
+                "ej": json.dumps(ret.get("errors") or [], ensure_ascii=False),
+                "cj": json.dumps(sorted(done), ensure_ascii=False),
+                "id": job_id,
+            },
+        )
+        db.commit()
+    except Exception as ex:
+        _log.exception("strategy_import job %s failed", job_id)
         try:
-            job = get_strategy_import_job_row(db, job_id)
-            if not job:
-                return
-            if str(job.get("status") or "").upper() == "ABANDONED":
-                return
-            ids = _json_str_list(job.get("strategy_ids_json"))
-            import_mode = str(job.get("import_mode") or "full")
-            skip = set(_json_str_list(job.get("completed_strategy_ids_json"))) if resume else set()
             db.execute(
                 text(
                     f"""
                     UPDATE strategy_import_jobs
-                    SET status='RUNNING', started_at={sql_now()}, message=:m, progress_at={sql_now()}
+                    SET status='FAILED', finished_at={sql_now()}, message=:m
                     WHERE id=:id AND status <> 'ABANDONED'
                     """
                 ),
-                {
-                    "m": "续传执行中…" if resume else "后台导入执行中…",
-                    "id": job_id,
-                },
+                {"m": f"异常：{str(ex)[:5900]}", "id": job_id},
             )
             db.commit()
-            ret = import_strategy_files(
-                db,
-                selected_strategy_ids=ids,
-                import_mode=import_mode,
-                do_commit=True,
-                skip_strategy_ids=skip,
-                strategy_import_job_id=job_id,
-                resume=resume,
-            )
-            all_ids = set(ids)
-            done = set(ret.get("completed_strategy_ids") or [])
-            ok = all_ids <= done and int(ret.get("failed") or 0) == 0
-            st = "SUCCESS" if ok else "FAILED"
-            if not ok and ret.get("resumable"):
-                st = "FAILED"
-            msg = (
-                f"完成：成功 {len(done)}/{len(all_ids)} 个策略"
-                if ok
-                else f"部分完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」"
-            )
-            db.execute(
-                text(
-                    f"""
-                    UPDATE strategy_import_jobs
-                    SET status=:st, finished_at={sql_now()}, message=:msg,
-                        imported_count=:ic, failed_count=:fc, errors_json=:ej,
-                        completed_strategy_ids_json=:cj
-                    WHERE id=:id AND status <> 'ABANDONED'
-                    """
-                ),
-                {
-                    "st": st,
-                    "msg": msg[:6000],
-                    "ic": len(done),
-                    "fc": int(ret.get("failed") or 0),
-                    "ej": json.dumps(ret.get("errors") or [], ensure_ascii=False),
-                    "cj": json.dumps(sorted(done), ensure_ascii=False),
-                    "id": job_id,
-                },
-            )
-            db.commit()
-        except Exception as ex:
-            _log.exception("strategy_import job %s failed", job_id)
-            try:
-                db.execute(
-                    text(
-                        f"""
-                        UPDATE strategy_import_jobs
-                        SET status='FAILED', finished_at={sql_now()}, message=:m
-                        WHERE id=:id AND status <> 'ABANDONED'
-                        """
-                    ),
-                    {"m": f"异常：{str(ex)[:5900]}", "id": job_id},
-                )
-                db.commit()
-            except Exception:
-                db.rollback()
-        finally:
-            db.close()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()

@@ -3983,7 +3983,12 @@ def admin_import(
             },
         )
         db.commit()
-        background_tasks.add_task(run_strategy_import_background_task, job_id, resume=True)
+        spawn_daemon(
+            f"strategy-import-{job_id}",
+            run_strategy_import_background_task,
+            job_id,
+            resume=True,
+        )
         return {
             "ok": True,
             "queued": True,
@@ -4005,7 +4010,12 @@ def admin_import(
             triggered_by=str(user.get("username") or "admin"),
         )
         db.commit()
-        background_tasks.add_task(run_strategy_import_background_task, job_id, resume=False)
+        spawn_daemon(
+            f"strategy-import-{job_id}",
+            run_strategy_import_background_task,
+            job_id,
+            resume=False,
+        )
         return {
             "ok": True,
             "queued": True,
