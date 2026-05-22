@@ -81,6 +81,22 @@ async function summaryFor(sid) {
     }
   }
   const ret = (a, b) => (b > 0 ? a / b - 1 : null);
+  const tdCmp = cmp(lastTd);
+  const stockCnt = (
+    await db.execute({
+      sql: `SELECT COUNT(DISTINCT h.stock_code) AS c
+            FROM strategy_holding_daily h
+            WHERE h.strategy_id = ?
+              AND REPLACE(SUBSTR(h.trade_date, 1, 10), '-', '') = ?
+              AND REPLACE(SUBSTR(h.rebalance_date, 1, 10), '-', '') = (
+                SELECT MAX(REPLACE(SUBSTR(x.rebalance_date, 1, 10), '-', ''))
+                FROM strategy_holding_daily x
+                WHERE x.strategy_id = ?
+                  AND REPLACE(SUBSTR(x.trade_date, 1, 10), '-', '') = ?
+              )`,
+      args: [sid, tdCmp, sid, tdCmp],
+    })
+  ).rows[0]?.c;
   return {
     latest_nav: Math.round(lastNav * 100) / 100,
     last_1d: last1d,
@@ -90,6 +106,7 @@ async function summaryFor(sid) {
     year: anchorY > 0 ? ret(lastNav, anchorY) : null,
     last_td: lastTd,
     period_rb: periodRb,
+    stock_count: stockCnt != null ? Number(stockCnt) : null,
   };
 }
 
@@ -125,6 +142,7 @@ for (const sid of sids) {
         month_return=excluded.month_return,
         year_return=excluded.year_return,
         last_trade_date=excluded.last_trade_date,
+        stock_count_on_last_date=excluded.stock_count_on_last_date,
         period_rebalance_date=excluded.period_rebalance_date,
         updated_at=excluded.updated_at`,
       args: [
@@ -136,7 +154,7 @@ for (const sid of sids) {
         s.month,
         s.year,
         s.last_td,
-        null,
+        s.stock_count,
         s.period_rb,
       ],
     });

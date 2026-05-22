@@ -1409,17 +1409,21 @@ def _api_trade_date_iso(val: object | None) -> str | None:
 
 
 def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> dict[str, dict]:
-    """净值表最后交易日 + 该日「当前调仓期」持仓股票数（与净值行 rebalance_date 一致，否则取该日最大 rebalance_date）。"""
+    """净值表最后交易日 + 该日最新调仓期持仓股票数（日期比较用 compact，与排行榜一致）。"""
     if not strategy_ids:
         return {}
     quoted = ",".join("'" + s.replace("'", "''") + "'" for s in strategy_ids)
+    td_h = sql_date_compact_expr("h.trade_date")
+    td_n = sql_date_compact_expr("n.last_trade_date")
+    rb_h = sql_date_compact_expr("h.rebalance_date")
+    rb_x = sql_date_compact_expr("x.rebalance_date")
     rows = db.execute(
         text(
             f"""
-            SELECT n.strategy_id AS strategy_id, n.td AS last_trade_date,
+            SELECT n.strategy_id AS strategy_id, n.last_trade_date AS last_trade_date,
                    COUNT(DISTINCT h.stock_code) AS stock_cnt
             FROM (
-                SELECT nd.strategy_id, nd.trade_date AS td, nd.rebalance_date AS nav_rb
+                SELECT nd.strategy_id, nd.trade_date AS last_trade_date
                 FROM strategy_nav_daily nd
                 INNER JOIN (
                     SELECT strategy_id, {sql_max_date_expr("trade_date")} AS mx
@@ -1431,16 +1435,14 @@ def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> di
             ) n
             LEFT JOIN strategy_holding_daily h
               ON h.strategy_id = n.strategy_id
-             AND h.trade_date = n.td
-             AND h.rebalance_date = COALESCE(
-                    n.nav_rb,
-                    (
-                        SELECT MAX(x.rebalance_date)
-                        FROM strategy_holding_daily x
-                        WHERE x.strategy_id = n.strategy_id AND x.trade_date = n.td
-                    )
+             AND {td_h} = {td_n}
+             AND {rb_h} = (
+                    SELECT MAX({rb_x})
+                    FROM strategy_holding_daily x
+                    WHERE x.strategy_id = n.strategy_id
+                      AND {sql_date_compact_expr("x.trade_date")} = {td_n}
                   )
-            GROUP BY n.strategy_id, n.td
+            GROUP BY n.strategy_id, n.last_trade_date
             """
         )
     ).mappings().all()
@@ -2580,6 +2582,25 @@ def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_se
     ).mappings().all()
     sids = [str(r["strategy_id"]) for r in rows]
     metrics_by_sid = load_strategy_list_metrics_batch(db, sids)
+    need_stock = [
+        s
+        for s in sids
+        if s not in metrics_by_sid
+        or metrics_by_sid[s].get("stock_count_on_last_date") is None
+    ]
+    if need_stock:
+        stock_meta = _batch_nav_last_date_stock_count(db, need_stock)
+        for sid in need_stock:
+            sm = stock_meta.get(sid) or {}
+            base = dict(metrics_by_sid.get(sid) or {})
+            cnt = sm.get("stock_count")
+            if cnt is not None:
+                base["stock_count_on_last_date"] = cnt
+            ltd = sm.get("last_trade_date")
+            if ltd and not base.get("last_trade_date"):
+                base["last_trade_date"] = ltd
+            if base:
+                metrics_by_sid[sid] = base
 
     username = user["username"]
     follow_rows = db.execute(
