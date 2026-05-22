@@ -20,5 +20,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Render 注入 PORT（默认 10000）
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Render 注入 PORT（默认 10000）；exec 便于进程收 SIGTERM；启动 echo 便于区分新旧容器日志
+CMD ["sh", "-c", "echo render-start uvicorn port=${PORT:-10000} && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000} --log-level info"]

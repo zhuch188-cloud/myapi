@@ -97,6 +97,11 @@ async def _app_lifespan(_app: FastAPI):
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
+    _log.info(
+        "app lifespan start pid=%s port=%s (Render 部署日志应出现本行，否则新版本未启动)",
+        os.getpid(),
+        os.environ.get("PORT", ""),
+    )
     start_background_boot(scheduler, _scheduled_update)
     yield
     if scheduler.running:
