@@ -597,18 +597,36 @@ def _import_cutoff_plan(
 ) -> tuple[date | None, bool, bool]:
     """
     返回 (cutoff_rb, cutoff_inclusive, delete_all)。
-    全量：始终清空该策略持仓后整表重导（含续传）；增量：按 cutoff 追加/续传删最后一期。
+    首次全量：清空后整表重导；续传（full/incremental）：删最后一期并从该期继续，不从头清空。
+    首次增量：只追加 > MAX(rebalance_date) 的行。
     """
-    if import_mode == "full":
+    if import_mode == "full" and not repair_last_period:
         return None, False, True
     cutoff_rb: date | None = None
     cutoff_inclusive = False
     if repair_last_period:
         cutoff_rb = _prepare_strategy_import_resume_last_period(db, sid)
         cutoff_inclusive = cutoff_rb is not None
-    else:
+    elif import_mode != "full":
         cutoff_rb = _strategy_positions_max_rebalance_date(db, sid)
     return cutoff_rb, cutoff_inclusive, False
+
+
+def _strategy_positions_import_stats(db: Session, sid: str) -> tuple[int, date | None]:
+    row = db.execute(
+        text(
+            f"""
+            SELECT COUNT(*) AS n, {sql_max_date_expr("rebalance_date")} AS max_rb
+            FROM strategy_positions WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": sid},
+    ).mappings().first()
+    if not row:
+        return 0, None
+    n = int(row.get("n") or 0)
+    max_rb = _row_sql_date(row.get("max_rb"))
+    return n, max_rb
 
 
 def _import_strategy_holdings_from_excel(
@@ -624,17 +642,30 @@ def _import_strategy_holdings_from_excel(
     """导入单策略 Excel 持仓；大文件走流式，返回 label_meta。"""
     label_meta: dict[str, str] = {}
     if _strategy_excel_use_streaming(file_path):
+        prior_rows, prior_max_rb = (0, None)
+        if repair_last_period:
+            prior_rows, prior_max_rb = _strategy_positions_import_stats(db, sid)
         cutoff_rb, cutoff_inclusive, delete_all = _import_cutoff_plan(
             db, sid, import_mode, repair_last_period=repair_last_period
         )
         if delete_all:
+            _import_progress_touch(
+                db,
+                f"阶段1/3 {sid}：全量首次导入，清空旧持仓后从 Excel 首行写入…",
+                sync_job_id=sync_job_id,
+                strategy_import_job_id=strategy_import_job_id,
+                do_commit=False,
+            )
             db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
             db.commit()
             _import_after_batch_commit(db)
-        elif repair_last_period and cutoff_rb:
+        elif repair_last_period:
+            resume_from = cutoff_rb or prior_max_rb
             _import_progress_touch(
                 db,
-                f"阶段1/3 {sid}：续传已删最后一期 {cutoff_rb.isoformat()}，重导该期及之后…",
+                f"阶段1/3 {sid}：续传（{import_mode}）库内已有 {prior_rows} 行"
+                f"{f'至 {prior_max_rb.isoformat()}' if prior_max_rb else ''}，"
+                f"从 {resume_from.isoformat() if resume_from else '首行'} 继续（非从头）…",
                 sync_job_id=sync_job_id,
                 strategy_import_job_id=strategy_import_job_id,
                 do_commit=False,
@@ -643,7 +674,7 @@ def _import_strategy_holdings_from_excel(
         batch_no = 0
         skipped_rows = 0
         for chunk in _iter_strategy_holdings_excel_batches(file_path, meta_out=label_meta):
-            if import_mode != "full" and cutoff_rb is not None:
+            if cutoff_rb is not None:
                 before = len(chunk)
                 chunk = [
                     x
@@ -669,7 +700,7 @@ def _import_strategy_holdings_from_excel(
                 do_commit=False,
             )
             chunk.clear()
-        if imported_rows == 0 and import_mode == "full":
+        if imported_rows == 0 and import_mode == "full" and not repair_last_period:
             raise ValueError("无有效行（请检查「调整日期」「证券代码」是否为空）")
         _log.info(
             "import_strategy %s streaming done rows=%s skipped=%s batches=%s mode=%s repair=%s",
@@ -2104,7 +2135,7 @@ def import_strategy_files(
                 do_commit=do_commit,
             )
         try:
-            repair_last_period = bool(resume) and import_mode != "full"
+            repair_last_period = bool(resume)
             for attempt in range(4):
                 try:
                     if stream:

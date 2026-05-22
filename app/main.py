@@ -3979,7 +3979,7 @@ def admin_import(
             ),
             {
                 "id": job_id,
-                "m": f"续传已入队（{resume_ts}，模式 {im}；全量续传仍清空后重导，增量续传删最后一期）",
+                "m": f"续传已入队（{resume_ts}，模式 {im}；从断点继续，非从头导入）",
             },
         )
         db.commit()
