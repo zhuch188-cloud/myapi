@@ -677,6 +677,57 @@ def _strategy_positions_row_count(db: Session, sid: str) -> int:
     return int(row.get("n") or 0) if row else 0
 
 
+def _count_strategy_excel_data_rows(file_path: str) -> int:
+    """统计 Excel 有效行数（与流式导入相同规则）。"""
+    n = 0
+    for chunk in _iter_strategy_holdings_excel_batches(file_path):
+        n += len(chunk)
+        chunk.clear()
+    return n
+
+
+def _verify_strategy_full_import_row_count(
+    db: Session,
+    sid: str,
+    file_path: str,
+    *,
+    import_mode: str,
+) -> tuple[int, int]:
+    """
+    全量/续传(full) 完成后：库内行数须 ≥ Excel 有效行数 98%。
+    返回 (db_rows, excel_rows)；不达标则抛错（防止任务误标 SUCCESS）。
+    """
+    if str(import_mode or "").lower() != "full":
+        db_n = _strategy_positions_row_count(db, sid)
+        return db_n, 0
+    if not os.path.isfile(file_path):
+        raise ValueError(f"{sid} Excel 不存在: {file_path}")
+    excel_n = _count_strategy_excel_data_rows(file_path)
+    db_n = _strategy_positions_row_count(db, sid)
+    if excel_n <= 0:
+        raise ValueError(f"{sid} Excel 无有效持仓行")
+    min_n = int(excel_n * 0.98)
+    if db_n < min_n:
+        raise ValueError(
+            f"{sid} 导入后校验失败：Excel 约 {excel_n} 行，库内 {db_n} 行（差 {excel_n - db_n}）。"
+            f"中间调仓日残缺时「续传」只重做库内最后一天，无法补全；"
+            f"请全量导入并传 confirm_wipe:true 清库后重导。"
+        )
+    return db_n, excel_n
+
+
+def _strategy_config_excel_path(db: Session, sid: str) -> str:
+    row = db.execute(
+        text(
+            "SELECT file_dir, file_name FROM strategy_configs WHERE strategy_id=:sid LIMIT 1"
+        ),
+        {"sid": sid},
+    ).mappings().first()
+    if not row:
+        raise ValueError(f"{sid} 配置不存在")
+    return _strategy_excel_path(row.get("file_dir"), row["file_name"])
+
+
 def _validate_strategy_import_result(
     sid: str,
     stats: dict[str, int],
@@ -695,10 +746,17 @@ def _validate_strategy_import_result(
     if need_complete and expected_total > 0:
         min_rows = int(expected_total * 0.98)
         if rows_after < min_rows:
+            gap = expected_total - rows_after
+            scanned_all = excel_rows >= int(expected_total * 0.95)
+            if repair_last_period and scanned_all and gap > expected_total * 0.15:
+                raise ValueError(
+                    f"{sid} 已扫完 Excel 但库内仅 {rows_after} 行（约 {expected_total} 行），"
+                    f"中间多期不完整，仅靠「续传」无法补全。"
+                    f"请一次全量导入并传 confirm_wipe:true 清库后重导。"
+                )
             raise ValueError(
-                f"{sid} 持仓不完整：Excel 有效约 {expected_total} 行，库内 {rows_after} 行"
-                f"（差 {expected_total - rows_after}）。"
-                f"进程可能在 Render 上被重启/部署中断，请点「续传」继续，不要新建全量。"
+                f"{sid} 持仓不完整：Excel 有效约 {expected_total} 行，库内 {rows_after} 行（差 {gap}）。"
+                f"{'进程可能在 Render 重启前未写完，请再点「续传」。' if not scanned_all else '请再点「续传」或全量清库重来。'}"
             )
     if delete_all:
         if rows_after <= 0:
@@ -6005,19 +6063,36 @@ def run_strategy_import_background_task(
         )
         all_ids = set(ids)
         done = set(ret.get("completed_strategy_ids") or [])
+        verify_errors: list[str] = []
         row_checks: list[str] = []
+        if all_ids <= done and int(ret.get("failed") or 0) == 0:
+            for sid in sorted(done):
+                try:
+                    fp = _strategy_config_excel_path(db, sid)
+                    db_n, ex_n = _verify_strategy_full_import_row_count(
+                        db, sid, fp, import_mode=import_mode
+                    )
+                    if ex_n > 0:
+                        row_checks.append(f"{sid}={db_n}/{ex_n}")
+                    else:
+                        row_checks.append(f"{sid}={db_n}")
+                except ValueError as ve:
+                    done.discard(sid)
+                    verify_errors.append(str(ve))
         for sid in sorted(all_ids):
-            cnt = _strategy_positions_row_count(db, sid)
-            row_checks.append(f"{sid}={cnt}")
-        ok = all_ids <= done and int(ret.get("failed") or 0) == 0
+            if sid not in done and not any(sid in e for e in verify_errors):
+                cnt = _strategy_positions_row_count(db, sid)
+                row_checks.append(f"{sid}={cnt}")
+        errors_out = list(ret.get("errors") or []) + verify_errors
+        ok = all_ids <= done and not errors_out
         st = "SUCCESS" if ok else "FAILED"
-        if not ok and ret.get("resumable"):
+        if not ok and (ret.get("resumable") or verify_errors):
             st = "FAILED"
         rows_hint = "；".join(row_checks) if row_checks else ""
         msg = (
             f"完成：成功 {len(done)}/{len(all_ids)} 个策略（{rows_hint}）"
             if ok
-            else f"未完成 {len(done)}/{len(all_ids)}，失败 {ret.get('failed', 0)}，可点「续传」。{rows_hint}"
+            else f"未完成 {len(done)}/{len(all_ids)}，失败 {max(len(errors_out), int(ret.get('failed') or 0))}，可点「续传」或全量清库。{rows_hint}"
         )
         db.execute(
             text(
@@ -6033,8 +6108,8 @@ def run_strategy_import_background_task(
                 "st": st,
                 "msg": msg[:6000],
                 "ic": len(done),
-                "fc": int(ret.get("failed") or 0),
-                "ej": json.dumps(ret.get("errors") or [], ensure_ascii=False),
+                "fc": max(len(errors_out), int(ret.get("failed") or 0)),
+                "ej": json.dumps(errors_out[:50], ensure_ascii=False),
                 "cj": json.dumps(sorted(done), ensure_ascii=False),
                 "id": job_id,
             },
