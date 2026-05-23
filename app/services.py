@@ -1888,7 +1888,7 @@ def _repair_strategy_positions_against_excel(
         db_total = _strategy_positions_row_count(db, sid)
         ex_total = sum(ex_counts.values())
         if db_total != ex_total:
-            db_counts = _db_period_row_counts(db, sid)
+            db_counts, _ = _db_period_row_counts(db, sid)
             bad_dates = _mismatch_rebalance_dates(ex_counts, db_counts)
         else:
             db_counts = _db_period_row_counts_for_dates(db, sid, list(ex_counts.keys()))
