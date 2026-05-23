@@ -1,4 +1,4 @@
-{# 客户端页专用：fetch 错误脱敏，不展示服务商/路径/IP/邮箱等 #}
+{# Client-surface fetch error sanitizer. Keep implementation details out of shipped text. #}
 window.__FP_CLIENT_SURFACE__ = true;
 function sanitizeClientMessage(raw) {
   const fb = "操作未能完成，请稍后重试。若持续失败请联系管理员。";
@@ -7,16 +7,17 @@ function sanitizeClientMessage(raw) {
   if (!s) return fb;
   const low = s.toLowerCase();
   const bad = [
-    "turso", "libsql", "hrana", "sqlalchemy", "odbc", "sql server", "winddb", "wind_sql",
-    "render.com", "smtp", "server-data", "traceback", "savepoint", "sqlite error",
-    "operationalerror", "connection refused", "18456", "msodbcsql", "volces", "ark.cn",
-    "auth_token", "jwt_secret", ":\\\\", "/users/", "/home/", ".xlsx", ".env"
+    "traceback", "exception", "operationalerror", "connection refused",
+    "password", "token", "secret", "credential", "internal", "endpoint"
   ];
   if (bad.some((k) => low.includes(k))) return fb;
   s = s.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gi, "[已隐藏]");
   s = s.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[已隐藏]");
   s = s.replace(/https?:\/\/[^\s"'<>]+/gi, "[链接已隐藏]");
-  if (s.length > 200) s = s.slice(0, 200) + "…";
+  if (/[A-Za-z]:\\|\/(?:Users|home|var|opt|srv)\//i.test(s)) return fb;
+  if (/\b[A-Z0-9_]{3,}_(?:URL|HOST|USER|TOKEN|SECRET|KEY|PASSWORD)\b/i.test(s)) return fb;
+  if (/\.(?:xlsx|xls|csv|db|sqlite|env)\b/i.test(s)) return fb;
+  if (s.length > 200) s = s.slice(0, 200) + "...";
   return s || fb;
 }
 function formatFetchError(err) {

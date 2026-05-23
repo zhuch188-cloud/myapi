@@ -58,7 +58,7 @@ from app.sql_dialect import (
 )
 from app.mail import send_contact_us_message, send_password_reset_email, smtp_send_test
 from app.client_messages import insert_client_submission, list_client_submissions
-from app.client_safe import public_message
+from app.client_safe import is_client_surface_path, public_message, sanitize_client_message
 from app.auth import SlidingJWTAccessMiddleware, create_access_token, get_current_user, require_roles, norm_user_status
 from app import ark_client, stock_trend, wind_holders, wind_income, wind_sql
 from app.services import (
@@ -140,13 +140,33 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
 @app.exception_handler(DatabaseNotReadyError)
-def _database_not_ready_handler(_request: Request, exc: DatabaseNotReadyError):
-    return JSONResponse(status_code=503, content={"detail": str(exc)})
+def _database_not_ready_handler(request: Request, exc: DatabaseNotReadyError):
+    path = request.url.path if request and request.url else ""
+    if is_client_surface_path(path):
+        _log.warning("client-surface startup unavailable path=%s: %s", path, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": public_message("unavailable")},
+        )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": sanitize_client_message(str(exc), fallback=str(exc)[:500])},
+    )
 
 
 @app.exception_handler(TursoStreamBusyError)
-def _turso_stream_busy_handler(_request: Request, exc: TursoStreamBusyError):
-    return JSONResponse(status_code=503, content={"detail": str(exc)})
+def _turso_stream_busy_handler(request: Request, exc: TursoStreamBusyError):
+    path = request.url.path if request and request.url else ""
+    if is_client_surface_path(path):
+        _log.warning("client-surface storage busy path=%s: %s", path, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": public_message("unavailable")},
+        )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": sanitize_client_message(str(exc), fallback=str(exc)[:500])},
+    )
 
 
 _SID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")

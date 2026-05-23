@@ -1,4 +1,6 @@
 import hashlib
+import threading
+import time
 from datetime import timedelta, timezone
 from jose import jwt, JWTError
 from fastapi import Depends, HTTPException, status, Request
@@ -16,6 +18,10 @@ from app.timeutil import utc_now
 # 响应头：携带 JWT 的成功请求由中间件写入新令牌，前端 fetch 包装器写入 localStorage
 ACCESS_TOKEN_RENEWAL_HEADER = "X-Access-Token-Renewal"
 _SLIDING_RENEW_LEEWAY_SECONDS = 120
+_VIEWER_ACTIVITY_CACHE_MAX = 4096
+_activity_lock = threading.Lock()
+_usage_touch_cache: dict[tuple[int, str], float] = {}
+_device_touch_cache: dict[tuple[int, str], float] = {}
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -33,22 +39,60 @@ def _client_ip(request: Request) -> str:
     return str(host or "")[:64]
 
 
+def _touch_allowed(
+    cache: dict[tuple[int, str], float],
+    key: tuple[int, str],
+    interval_seconds: int,
+) -> bool:
+    now_ts = time.monotonic()
+    interval = max(0, int(interval_seconds or 0))
+    with _activity_lock:
+        last = cache.get(key)
+        if last is not None and now_ts - last < interval:
+            return False
+        cache[key] = now_ts
+        if len(cache) > _VIEWER_ACTIVITY_CACHE_MAX:
+            cutoff = now_ts - max(interval, 3600)
+            stale = [k for k, ts in cache.items() if ts < cutoff]
+            for k in stale:
+                cache.pop(k, None)
+            if len(cache) > _VIEWER_ACTIVITY_CACHE_MAX:
+                overflow = len(cache) - _VIEWER_ACTIVITY_CACHE_MAX
+                for k in list(cache.keys())[:overflow]:
+                    cache.pop(k, None)
+        return True
+
+
 def _record_viewer_activity(db: Session, user_id: int, request: Request) -> None:
     """viewer 每次带 JWT 的请求记一次自然日用量；可选 X-Device-Token 刷新设备最近活跃。"""
+    usage_date = utc_now().astimezone(timezone(timedelta(hours=8))).date().isoformat()
+    should_write_usage = _touch_allowed(
+        _usage_touch_cache,
+        (int(user_id), usage_date),
+        int(getattr(settings, "viewer_usage_write_interval_seconds", 300) or 300),
+    )
+    raw_dt = (request.headers.get("x-device-token") or "").strip()
+    device_hash = hashlib.sha256(raw_dt.encode("utf-8")).hexdigest() if raw_dt else ""
+    should_write_device = bool(device_hash) and _touch_allowed(
+        _device_touch_cache,
+        (int(user_id), device_hash),
+        int(getattr(settings, "viewer_device_seen_write_interval_seconds", 600) or 600),
+    )
+    if not should_write_usage and not should_write_device:
+        return
     try:
-        db.execute(
-            text(
-                f"""
-                INSERT INTO user_usage_daily (user_id, usage_date, api_requests)
-                VALUES (:uid, {sql_curdate()}, 1)
-                ON CONFLICT(user_id, usage_date) DO UPDATE SET api_requests = api_requests + 1
-                """
-            ),
-            {"uid": user_id},
-        )
-        raw_dt = (request.headers.get("x-device-token") or "").strip()
-        if raw_dt:
-            h = hashlib.sha256(raw_dt.encode("utf-8")).hexdigest()
+        if should_write_usage:
+            db.execute(
+                text(
+                    f"""
+                    INSERT INTO user_usage_daily (user_id, usage_date, api_requests)
+                    VALUES (:uid, {sql_curdate()}, 1)
+                    ON CONFLICT(user_id, usage_date) DO UPDATE SET api_requests = api_requests + 1
+                    """
+                ),
+                {"uid": user_id},
+            )
+        if should_write_device:
             ip = _client_ip(request)
             ua = (request.headers.get("user-agent", "") or "")[:512]
             db.execute(
@@ -59,7 +103,7 @@ def _record_viewer_activity(db: Session, user_id: int, request: Request) -> None
                     WHERE user_id=:uid AND device_token_hash=:h AND revoked_at IS NULL
                     """
                 ),
-                {"uid": user_id, "h": h, "ip": ip, "ua": ua},
+                {"uid": user_id, "h": device_hash, "ip": ip, "ua": ua},
             )
         db.commit()
     except Exception:

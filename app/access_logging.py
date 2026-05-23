@@ -116,6 +116,8 @@ class UserAccessLogMiddleware(BaseHTTPMiddleware):
             if request.method == "OPTIONS":
                 return response
             path = request.url.path or ""
+            if not (path.startswith("/api/admin") or path.startswith("/admin")):
+                return response
             if _should_skip_path(path):
                 return response
             auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""

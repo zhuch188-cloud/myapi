@@ -630,6 +630,10 @@ def import_company_profile_excel(
     chunk = _import_row_chunk()
     pending: list[dict[str, Any]] = []
     last_processed_row = resume_from_row
+    progress_every = max(
+        1, int(getattr(settings, "supplement_import_progress_every_batches", 4) or 4)
+    )
+    batch_seq = 0
 
     try:
         for row_idx, (_, ser) in enumerate(df.iterrows()):
@@ -651,9 +655,11 @@ def import_company_profile_excel(
             pending.append(params)
             if len(pending) >= chunk:
                 n = len(pending)
+                batch_seq += 1
                 batch_from = row_idx - n + 2
                 batch_to = row_idx + 1
-                if batch_id:
+                should_touch_progress = batch_seq % progress_every == 0
+                if batch_id and should_touch_progress:
                     _touch_import_batch_progress(
                         db,
                         batch_id,
@@ -673,10 +679,10 @@ def import_company_profile_excel(
                     )
                 _flush_upsert_batch(db, upsert_sql, pending)
                 rows_ok += n
-                if batch_id:
-                    next_row = row_idx + 1
-                    last_processed_row = next_row
-                    resume_from_row = next_row
+                next_row = row_idx + 1
+                last_processed_row = next_row
+                resume_from_row = next_row
+                if batch_id and should_touch_progress:
                     _touch_import_batch_progress(
                         db,
                         batch_id,

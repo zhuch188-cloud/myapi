@@ -119,9 +119,14 @@ class Settings(BaseSettings):
     # 兼容旧配置：>0 且未设 MAX 时作为动态月数上限；不再固定为每段 1 个月
     nav_rebuild_eod_months: int = 0
     # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
-    skip_startup_date_normalization: bool = False
+    skip_startup_date_normalization: bool = True
     # 管理端 API 等待 Turso 流锁的最长时间（秒）；全量同步跑净值时其它接口可能排队
     turso_stream_lock_api_timeout_seconds: int = 90
+    # 免费 Turso 下减少无谓写入：viewer 活跃度与设备 last_seen 至少间隔 N 秒才写库
+    viewer_usage_write_interval_seconds: int = 300
+    viewer_device_seen_write_interval_seconds: int = 600
+    # 补充数据导入进度每 N 批写一次，避免远程库进度刷新造成写放大
+    supplement_import_progress_every_batches: int = 4
     # 策略 Excel 导入：每 N 批写一次进度/checkpoint（降低 Turso 请求频率）
     strategy_import_progress_every_batches: int = 8
     # 单批 UPSERT 失败时最大重试次数
