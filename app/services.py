@@ -17,6 +17,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from app.config import settings
 from app import wind_bulk, wind_sql
+from app.bg_threads import ShutdownRequested, raise_if_shutting_down
 from app.sql_dialect import (
     sql_date_compact_expr,
     sql_max_date_expr,
@@ -1554,6 +1555,8 @@ def _import_strategy_holdings_from_excel(
         scan_batch_no = 0
         excel_rows = 0
         for chunk in _iter_strategy_holdings_excel_batches(file_path, meta_out=label_meta):
+            if batch_no % 8 == 0:
+                raise_if_shutting_down()
             excel_rows += len(chunk)
             _accumulate_excel_period_counts(stats, chunk)
             if cutoff_rb is not None:
@@ -3275,6 +3278,7 @@ def import_strategy_files(
     total_targets = len(selected_set) if selected_set else len(configs)
 
     for c in configs:
+        raise_if_shutting_down()
         file_path = _strategy_excel_path(c.get("file_dir"), c["file_name"])
         sid = str(c.get("strategy_id") or "").strip()
         if not sid:
@@ -4312,6 +4316,7 @@ def _load_segment_wind_maps(
     day_map: dict[str, dict[str, tuple[float | None, float | None]]] = {}
     chunk_sz = wind_bulk.eod_stock_chunk_size()
     for i in range(0, len(codes), chunk_sz):
+        raise_if_shutting_down()
         part = codes[i : i + chunk_sz]
         if not part:
             continue
@@ -5587,6 +5592,7 @@ def _rebuild_nav_for_strategy_yearly(
             wind, bench_quads = _load_bench_quads(db)
 
     for seg_i, (seg_st, seg_ed) in enumerate(time_segs, start=1):
+        raise_if_shutting_down()
         seg_days = [d for d in trade_days_all if seg_st <= d <= seg_ed]
         if not seg_days:
             continue
@@ -5649,6 +5655,8 @@ def _rebuild_nav_for_strategy_yearly(
                 )
 
         for td in seg_days:
+            if td_i % 15 == 0:
+                raise_if_shutting_down()
             if not nav_full_rebuild and append_after_c and td <= append_after_c:
                 continue
             td_i += 1
@@ -6274,6 +6282,7 @@ def rebuild_nav_series(
     completed_nav = sorted(skip)
     total_nav = len(sids)
     for sid in sids:
+        raise_if_shutting_down()
         if sid in skip:
             continue
         nav_seq = len(completed_nav) + 1
@@ -6776,6 +6785,7 @@ def execute_admin_sync_pipeline(
             len(completed_import),
             int((imp or {}).get("failed") or 0),
         )
+        raise_if_shutting_down()
     else:
         imp = {
             "imported": len(completed_import),
@@ -6792,6 +6802,7 @@ def execute_admin_sync_pipeline(
     gc.collect()
 
     try:
+        raise_if_shutting_down()
         if ids_set <= completed_nav:
             nav_ret = {
                 "rebuilt": len(completed_nav),
@@ -6871,6 +6882,7 @@ def execute_admin_sync_pipeline(
 
     cap = int(getattr(settings, "admin_sync_wait_idle_update_seconds", 180) or 0)
     step = 3
+    raise_if_shutting_down()
     p("wait_idle", "阶段3/3 前：等待进程内数据更新互斥锁释放…", detached=True)
     if cap > 0:
         t0 = time.monotonic()
@@ -6880,6 +6892,7 @@ def execute_admin_sync_pipeline(
             if elapsed - last_touch >= 9:
                 last_touch = float(elapsed)
                 p("wait_idle", f"等待其它数据更新结束… 已等待 {elapsed}s / 上限 {cap}s", detached=True)
+            raise_if_shutting_down()
             time.sleep(step)
     if _job_running:
         wait_hint = f"已等待 {cap} 秒" if cap > 0 else "未配置等待（ADMIN_SYNC_WAIT_IDLE_UPDATE_SECONDS=0）"
@@ -6895,6 +6908,7 @@ def execute_admin_sync_pipeline(
         }
 
     p("holding_update", "阶段3/3：写入最新交易日持仓快照（可能较久）…", detached=True)
+    raise_if_shutting_down()
     db2: Session | None = None
     try:
         db2 = SessionLocalFactory()
@@ -6953,6 +6967,20 @@ def run_admin_sync_background_task(
             username, selected_ids, import_mode, sync_job_id=job_id, resume=resume
         )
         _finalize_admin_sync_job(job_id, ret)
+    except ShutdownRequested as ex:
+        _log.warning("admin_sync job %s paused for shutdown: %s", job_id, ex)
+        _finalize_admin_sync_job(
+            job_id,
+            {
+                "ok": False,
+                "stage": "shutdown",
+                "resumable": True,
+                "imported": 0,
+                "nav_rebuilt": 0,
+                "failed": len(selected_ids),
+                "errors": [str(ex)],
+            },
+        )
     except Exception as ex:
         _log.exception("admin_sync job %s failed", job_id)
         _finalize_admin_sync_job(
@@ -7023,6 +7051,22 @@ def _run_strategy_import_background_task_impl(
         )
         _finalize_strategy_import_job(db, job_id, ret, import_mode, ids)
         db.commit()
+    except ShutdownRequested as ex:
+        _log.warning("strategy_import job %s paused for shutdown: %s", job_id, ex)
+        try:
+            db.execute(
+                text(
+                    f"""
+                    UPDATE strategy_import_jobs
+                    SET status='FAILED', finished_at={sql_now()}, message=:m
+                    WHERE id=:id AND status <> 'ABANDONED'
+                    """
+                ),
+                {"m": f"service shutdown requested; resume this task: {str(ex)[:500]}", "id": job_id},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
     except Exception as ex:
         _log.exception("strategy_import job %s failed", job_id)
         all_ids = {str(x).strip() for x in ids if str(x).strip()}

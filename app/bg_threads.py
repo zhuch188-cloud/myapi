@@ -1,8 +1,9 @@
-"""在独立线程中执行长任务，避免阻塞 FastAPI 事件循环。"""
+"""Run long background jobs without blocking the FastAPI event loop."""
 
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 from collections.abc import Callable
@@ -12,10 +13,35 @@ _log = logging.getLogger(__name__)
 _lock = threading.Lock()
 _active: dict[str, threading.Thread] = {}
 _sigterm_logged = False
+_shutdown_requested = threading.Event()
+_previous_handlers: dict[int, Any] = {}
+
+
+class ShutdownRequested(RuntimeError):
+    """Raised by long-running background work when the process is draining."""
+
+
+def is_shutting_down() -> bool:
+    return _shutdown_requested.is_set()
+
+
+def raise_if_shutting_down() -> None:
+    if is_shutting_down():
+        raise ShutdownRequested("service shutdown requested; resume the task after restart")
+
+
+def _delegate_signal(signum: int, frame: Any) -> None:
+    prev = _previous_handlers.get(signum)
+    if callable(prev) and prev is not _on_sigterm:
+        prev(signum, frame)
+    elif prev in (signal.SIG_DFL, None):
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
 
 
 def _on_sigterm(signum: int, frame: Any) -> None:
     global _sigterm_logged
+    _shutdown_requested.set()
     if not _sigterm_logged:
         _sigterm_logged = True
         alive = [n for n, t in _active.items() if t.is_alive()]
@@ -26,16 +52,18 @@ def _on_sigterm(signum: int, frame: Any) -> None:
         except Exception:
             rid = ""
         _log.warning(
-            "收到 SIGTERM（Render 部署/手动 Restart/健康检查失败60s/平台维护，不一定来自 git push）"
-            "%s；活动后台线程: %s",
+            "shutdown signal received; background threads=%s%s",
+            alive or [],
             f" [{rid}]" if rid else "",
-            alive or "(无)",
         )
+    _delegate_signal(signum, frame)
 
 
 def register_shutdown_signals() -> None:
-    """主线程注册一次；部署时便于区分 OOM 与正常滚动发布。"""
+    """Log shutdowns, set a drain flag, then let the server's handler run."""
     try:
+        _previous_handlers[signal.SIGTERM] = signal.getsignal(signal.SIGTERM)
+        _previous_handlers[signal.SIGINT] = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGTERM, _on_sigterm)
         signal.signal(signal.SIGINT, _on_sigterm)
     except (ValueError, OSError):
@@ -44,8 +72,8 @@ def register_shutdown_signals() -> None:
 
 def spawn_daemon(name: str, target: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
     """
-    启动后台线程。导入/同步等长任务使用非 daemon，以便进程收到 SIGTERM 时
-    lifespan 可短暂 join，减少「写到一半直接被掐掉」。
+    Start a non-daemon background thread so shutdown can wait briefly for cleanup.
+    Long jobs should poll `raise_if_shutting_down()` between expensive phases.
     """
 
     def _wrapper() -> None:
@@ -53,6 +81,8 @@ def spawn_daemon(name: str, target: Callable[..., Any], /, *args: Any, **kwargs:
         try:
             target(*args, **kwargs)
             _log.info("thread %s: done", name)
+        except ShutdownRequested as ex:
+            _log.warning("thread %s: stopping for shutdown: %s", name, ex)
         except Exception:
             _log.exception("thread %s: failed", name)
         finally:
@@ -71,13 +101,13 @@ def active_background_thread_names() -> list[str]:
 
 
 def join_background_threads(*, timeout: float = 28.0) -> None:
-    """应用关闭时等待长任务收尾（Render 部署宽限期通常 ≤30s）。"""
+    """Wait briefly for long jobs during app shutdown."""
     with _lock:
         threads = [(n, t) for n, t in _active.items() if t.is_alive()]
     if not threads:
         return
     _log.warning(
-        "应用关闭：等待 %s 个后台线程（最多 %.0fs）…",
+        "application shutdown: waiting for %s background thread(s), max %.0fs",
         len(threads),
         timeout,
     )
@@ -85,4 +115,4 @@ def join_background_threads(*, timeout: float = 28.0) -> None:
     for name, t in threads:
         t.join(timeout=per)
         if t.is_alive():
-            _log.warning("thread %s: 未在时限内结束（部署将强制杀进程）", name)
+            _log.warning("thread %s did not finish before shutdown deadline", name)
