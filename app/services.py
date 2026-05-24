@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import defaultdict
 from datetime import date, datetime
@@ -29,9 +30,54 @@ from app.sql_dialect import (
 
 _log = logging.getLogger(__name__)
 _job_running = False
+_progress_log_lock = threading.Lock()
+_progress_log_last: dict[str, float] = {}
 # 单批越小，Wind SQL Server 上「多表 OUTER APPLY」越不易被对端掐断(10054)；过大会整批失败
 _WIND_QUOTE_CHUNK = 30
 _SID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _process_rss_mb() -> float | None:
+    """Best-effort peak RSS for logs; no psutil dependency."""
+    try:
+        import resource
+
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if rss <= 0:
+            return None
+        return rss / (1024 * 1024) if rss > 10_000_000 else rss / 1024
+    except Exception:
+        return None
+
+
+def _runtime_suffix() -> str:
+    parts: list[str] = []
+    rss = _process_rss_mb()
+    if rss is not None:
+        parts.append(f"rss_peak={rss:.1f}MB")
+    try:
+        g0, g1, g2 = gc.get_count()
+        parts.append(f"gc={g0}/{g1}/{g2}")
+    except Exception:
+        pass
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _log_runtime_progress(
+    key: str,
+    message: str,
+    *,
+    min_interval: float = 30.0,
+    force: bool = False,
+) -> None:
+    """Throttled stdout progress that avoids extra DB reads/writes."""
+    now_m = time.monotonic()
+    with _progress_log_lock:
+        last = float(_progress_log_last.get(key) or 0.0)
+        if not force and now_m - last < min_interval:
+            return
+        _progress_log_last[key] = now_m
+    _log.info("%s%s", message, _runtime_suffix())
 
 
 def _strategy_excel_path(file_dir: str | None, file_name: str) -> str:
@@ -1554,6 +1600,11 @@ def _import_strategy_holdings_from_excel(
         skipped_rows = 0
         scan_batch_no = 0
         excel_rows = 0
+        _log_runtime_progress(
+            f"import:{sid}",
+            f"import {sid}: streaming start mode={import_mode} file={Path(file_path).name}",
+            force=True,
+        )
         for chunk in _iter_strategy_holdings_excel_batches(file_path, meta_out=label_meta):
             if batch_no % 8 == 0:
                 raise_if_shutting_down()
@@ -1594,6 +1645,14 @@ def _import_strategy_holdings_from_excel(
             stats["skipped_rows"] = skipped_rows
             stats["excel_rows"] = excel_rows
             stats["rows_after"] = int(stats.get("rows_before") or 0) + imported_rows
+            _log_runtime_progress(
+                f"import:{sid}",
+                (
+                    f"import {sid}: batch={batch_no} scanned={excel_rows} "
+                    f"imported={imported_rows} skipped={skipped_rows} "
+                    f"est_rows={stats['rows_after']}"
+                ),
+            )
             prog_iv = _strategy_import_progress_interval()
             if batch_no % prog_iv == 0:
                 from app.db import run_under_turso_stream_lock
@@ -1683,6 +1742,14 @@ def _import_strategy_holdings_from_excel(
             skipped_rows,
             import_mode,
             repair_last_period,
+        )
+        _log_runtime_progress(
+            f"import:{sid}",
+            (
+                f"import {sid}: done excel={excel_rows} imported={imported_rows} "
+                f"db={stats['rows_after']} skipped={skipped_rows}"
+            ),
+            force=True,
         )
     else:
         # .xls 等：pandas 仅读必要列；行数过多时仍可能 OOM，建议另存为 .xlsx
@@ -5496,6 +5563,16 @@ def _rebuild_nav_for_strategy_yearly(
         latest_n * eod_step_months,
         len(time_segs),
     )
+    _log_runtime_progress(
+        f"nav:{sid}",
+        (
+            f"nav {sid}: plan mode={'full' if nav_full_rebuild else 'incremental'} "
+            f"range={start_c}..{latest_trade_c} segments={len(time_segs)} "
+            f"latest_stocks={latest_n} union_codes={n_codes_union} "
+            f"step_months={eod_step_months}"
+        ),
+        force=True,
+    )
     append_after_c = _nav_persist_after_compact(db, sid, nav_full_rebuild)
     if append_after_c and append_after_c >= latest_trade_c:
         _log.info("nav incremental %s: already through %s", sid, append_after_c)
@@ -5599,6 +5676,14 @@ def _rebuild_nav_for_strategy_yearly(
         seg_codes = _codes_for_nav_segment(rb_sorted, rb_map, shares, seg_st, seg_ed)
         if not seg_codes:
             continue
+        _log_runtime_progress(
+            f"nav:{sid}:seg",
+            (
+                f"nav {sid}: segment {seg_i}/{len(time_segs)} load "
+                f"{seg_st}..{seg_ed} days={len(seg_days)} codes={len(seg_codes)}"
+            ),
+            force=True,
+        )
         if sync_job_id is not None or progress_cb:
             _nav_progress_touch(
                 f"阶段2/3 {sid}：行情段 {seg_i}/{len(time_segs)}（{seg_st}~{seg_ed}，{len(seg_codes)} 只股票）…",
@@ -5620,6 +5705,14 @@ def _rebuild_nav_for_strategy_yearly(
                     seg_db.close()
         else:
             wind, day_map, _ = _load_maps(db)
+        _log_runtime_progress(
+            f"nav:{sid}:seg",
+            (
+                f"nav {sid}: segment {seg_i}/{len(time_segs)} loaded "
+                f"day_map_codes={len(day_map)} pending_rows={len(nav_accum)}"
+            ),
+            force=True,
+        )
 
         if (
             not nav_full_rebuild
@@ -5669,6 +5762,15 @@ def _rebuild_nav_for_strategy_yearly(
                         db=None if turso_remote else db,
                         turso_remote=turso_remote,
                     )
+            if td_i % 30 == 0:
+                _log_runtime_progress(
+                    f"nav:{sid}",
+                    (
+                        f"nav {sid}: calc td={td} day={td_i} "
+                        f"segment={seg_i}/{len(time_segs)} pending_rows={len(nav_accum)} "
+                        f"shares={len(shares)}"
+                    ),
+                )
             rb_idx_at_start = rb_idx
             td_date = datetime.strptime(td, "%Y%m%d").date()
             while rb_idx + 1 < len(rb_sorted) and rb_sorted[rb_idx + 1] <= td_date:
@@ -5732,6 +5834,11 @@ def _rebuild_nav_for_strategy_yearly(
                     sess.commit()
 
                 _locked_db_op(_flush_chunk)
+                _log_runtime_progress(
+                    f"nav:{sid}",
+                    f"nav {sid}: flushed {len(batch)} rows through {td}",
+                    force=True,
+                )
                 nav_accum.clear()
 
         day_map.clear()
@@ -5756,6 +5863,11 @@ def _rebuild_nav_for_strategy_yearly(
             sess.commit()
 
         _locked_db_op(_flush_tail)
+        _log_runtime_progress(
+            f"nav:{sid}",
+            f"nav {sid}: flushed tail {len(batch)} rows",
+            force=True,
+        )
         nav_accum.clear()
     shares.clear()
     last_close_fill.clear()
