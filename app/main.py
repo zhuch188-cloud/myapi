@@ -4445,17 +4445,24 @@ def admin_update(
 
 
 @app.get("/api/admin/update-jobs")
-def update_jobs(user=Depends(require_roles("admin", "editor")), db: Session = Depends(get_session)):
+def update_jobs(
+    limit: int = 50,
+    user=Depends(require_roles("admin", "editor")),
+    db: Session = Depends(get_session),
+):
     _ = user
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
     rows = db.execute(
         text(
             """
             SELECT id, job_type, status, triggered_by, started_at, finished_at, message, progress_at
             FROM strategy_update_jobs
             ORDER BY id DESC
-            LIMIT 50
+            LIMIT :lim
             """
-        )
+        ),
+        {"lim": int(limit)},
     ).mappings().all()
     return {"items": [dict(r) for r in rows]}
 

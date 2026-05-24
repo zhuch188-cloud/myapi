@@ -270,7 +270,7 @@
       let lastStrategyListRefreshAt = 0;
       async function maybeRefreshStrategyListDuringPoll() {
         const now = Date.now();
-        if (now - lastStrategyListRefreshAt < 60000) return;
+        if (now - lastStrategyListRefreshAt < 15000) return;
         lastStrategyListRefreshAt = now;
         await refreshStrategyListAfterJob();
       }
@@ -554,7 +554,8 @@
       function esc(s) {
         return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       }
-      const JOB_POLL_MS = 5000;
+      const JOB_POLL_MS = 1000;
+      const JOB_LOG_LIMIT = 5;
       let jobTableAutoTimer = null;
       function jobMsgCell(j) {
         const at = j.progress_at ? `<div class="job-msg-time">${esc(j.progress_at)}</div>` : "";
@@ -567,14 +568,14 @@
       }
       async function refreshJobTablesIfActive() {
         try {
+          const [imp, sync, upd] = await Promise.all([
+            api(`/api/admin/import-jobs?limit=${JOB_LOG_LIMIT}`),
+            api(`/api/admin/sync-jobs?limit=${JOB_LOG_LIMIT}`),
+            api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() }),
+          ]);
           await loadImportJobs();
           await loadSyncJobs();
           await loadUpdateJobs();
-          const [imp, sync, upd] = await Promise.all([
-            api("/api/admin/import-jobs?limit=5"),
-            api("/api/admin/sync-jobs?limit=5"),
-            api("/api/admin/update-jobs", { headers: authHeaders() }),
-          ]);
           const active =
             jobTablesHaveActive(imp.items) ||
             jobTablesHaveActive(sync.items) ||
@@ -688,8 +689,8 @@
         <col style="width:8%" /><col style="width:54%" /><col style="width:9%" /><col style="width:9%" />
       </colgroup>`;
       async function loadImportJobs() {
-        const d = await api("/api/admin/import-jobs?limit=30");
-        const items = d.items || [];
+        const d = await api(`/api/admin/import-jobs?limit=${JOB_LOG_LIMIT}`);
+        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("importJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
@@ -750,8 +751,8 @@
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
       async function loadUpdateJobs() {
-        const d = await api("/api/admin/update-jobs", { headers: authHeaders() });
-        const items = d.items || [];
+        const d = await api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() });
+        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("updateJobTb").innerHTML = `
           ${JOB_TABLE_COL_6}
           <thead><tr>
@@ -769,8 +770,8 @@
             </tr>`).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
       }
       async function loadSyncJobs() {
-        const d = await api("/api/admin/sync-jobs?limit=20");
-        const items = d.items || [];
+        const d = await api(`/api/admin/sync-jobs?limit=${JOB_LOG_LIMIT}`);
+        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("syncJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
@@ -810,7 +811,7 @@
           ensureJobTableAutoRefresh();
           const deadline = Date.now() + 45 * 60 * 1000;
           while (Date.now() < deadline) {
-            const jobs = await api("/api/admin/update-jobs", { headers: authHeaders() });
+            const jobs = await api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() });
             const j = (jobs.items || []).find((x) => x.id === targetId);
             if (!j) {
               msg.textContent = `未找到任务 #${targetId}，稍后重试轮询…`;
