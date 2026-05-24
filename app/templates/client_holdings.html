@@ -207,7 +207,7 @@
         setPeriodButtons();
         latestTradeDate = m.latest_trade_date ? String(m.latest_trade_date).slice(0, 10) : "";
         updateDataEndDate();
-        document.getElementById("holdingsMeta").textContent = m ? "行情日：" + dateFmt(m.latest_trade_date) : "";
+        document.getElementById("holdingsMeta").textContent = "";
         const rowsHtml = (data.items || []).map(function (i) {
           const stockUrl = "/client/strategy/" + encodeURIComponent(STRATEGY_ID) + "/stock/" + encodeURIComponent(i.stock_code || "");
           return (
