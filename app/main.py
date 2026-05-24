@@ -1544,26 +1544,22 @@ def _nav_list_period_rebalance_date(
     db: Session, strategy_id: str, last_td: date
 ) -> date | None:
     """列表「本期」：截至最新净值日的有效调仓日（与净值增量锚定一致，取自 strategy_positions）。"""
-    rb_rows = db.execute(
+    row = db.execute(
         text(
-            """
-            SELECT DISTINCT rebalance_date
+            f"""
+            SELECT rebalance_date
             FROM strategy_positions
             WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("rebalance_date")} <= :td_cmp
+            ORDER BY {sql_order_date_desc("rebalance_date")}
+            LIMIT 1
             """
         ),
-        {"sid": strategy_id},
-    ).mappings().all()
-    rb_sorted: list[date] = []
-    for r in rb_rows:
-        d = _row_sql_date(r.get("rebalance_date"))
-        if d is not None:
-            rb_sorted.append(d)
-    if not rb_sorted:
+        {"sid": strategy_id, "td_cmp": last_td.strftime("%Y%m%d")},
+    ).mappings().first()
+    if not row:
         return None
-    rb_sorted.sort()
-    _, current_rb = _nav_rb_idx_on_date(rb_sorted, last_td)
-    return current_rb
+    return _row_sql_date(row.get("rebalance_date"))
 
 
 def _nav_unit_trading_days_offset(
@@ -2632,72 +2628,31 @@ def public_feedback_submit(
 
 @app.get("/api/strategies")
 def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_session)):
-    from app.strategy_list_metrics import (
-        load_strategy_list_metrics_batch,
-        metrics_fields_from_row,
-    )
-
+    username = user["username"]
     rows = db.execute(
         text(
             """
             SELECT c.strategy_id, c.strategy_name, c.benchmark_code, c.benchmark_name,
-                   c.strategy_intro, c.strategy_category, c.rebalance_frequency
+                   c.strategy_intro, c.strategy_category, c.rebalance_frequency,
+                   m.latest_nav, m.last_1d_return, m.last_5d_return,
+                   m.period_since_rebalance_return, m.month_return, m.year_return,
+                   m.last_trade_date, m.stock_count_on_last_date,
+                   CASE WHEN f.strategy_id IS NULL THEN 0 ELSE 1 END AS is_followed
             FROM strategy_configs c
+            LEFT JOIN strategy_list_metrics m ON m.strategy_id = c.strategy_id
+            LEFT JOIN user_strategy_follows f
+              ON f.strategy_id = c.strategy_id AND f.username = :username
             WHERE c.is_visible=1 AND c.status='enabled'
             ORDER BY c.updated_at DESC
             """
-        )
-    ).mappings().all()
-    sids = [str(r["strategy_id"]) for r in rows]
-    metrics_by_sid = load_strategy_list_metrics_batch(db, sids)
-    need_stock = [
-        s
-        for s in sids
-        if s not in metrics_by_sid
-        or metrics_by_sid[s].get("stock_count_on_last_date") is None
-    ]
-    if need_stock:
-        stock_meta = _batch_nav_last_date_stock_count(db, need_stock)
-        for sid in need_stock:
-            sm = stock_meta.get(sid) or {}
-            base = dict(metrics_by_sid.get(sid) or {})
-            cnt = sm.get("stock_count")
-            if cnt is not None:
-                base["stock_count_on_last_date"] = cnt
-            ltd = sm.get("last_trade_date")
-            if ltd and not base.get("last_trade_date"):
-                base["last_trade_date"] = ltd
-            if base:
-                metrics_by_sid[sid] = base
-
-    username = user["username"]
-    follow_rows = db.execute(
-        text(
-            """
-            SELECT strategy_id FROM user_strategy_follows WHERE username=:u
-            """
         ),
-        {"u": username},
+        {"username": username},
     ).mappings().all()
-    followed_set = {str(r["strategy_id"]) for r in follow_rows}
     items = []
     for r in rows:
         d = dict(r)
-        sid = str(d["strategy_id"])
-        for k in (
-            "latest_nav",
-            "last_1d_return",
-            "last_5d_return",
-            "period_since_rebalance_return",
-            "month_return",
-            "year_return",
-            "last_trade_date",
-            "stock_count_on_last_date",
-        ):
-            d.pop(k, None)
-        d["is_followed"] = sid in followed_set
+        d["is_followed"] = bool(d.get("is_followed"))
         d["display_category"] = _display_strategy_category(d.get("strategy_category"))
-        d.update(metrics_fields_from_row(metrics_by_sid.get(sid)))
         items.append(d)
     followed = [x for x in items if x["is_followed"]]
     return {"items": items, "followed": followed, "role": user["role"]}

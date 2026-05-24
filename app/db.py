@@ -794,6 +794,8 @@ _SCHEMA_STATEMENTS = [
         updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_strategy_configs_visible_status_updated "
+    "ON strategy_configs (is_visible, status, updated_at)",
     """
     CREATE TABLE IF NOT EXISTS strategy_positions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

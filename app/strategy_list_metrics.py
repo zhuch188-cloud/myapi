@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
 from typing import Any
 
 from sqlalchemy import text
@@ -66,7 +65,7 @@ def _upsert_metrics_rows(
     *,
     do_commit: bool = True,
 ) -> int:
-    from app.main import _NAV_LIST_SUMMARY_EMPTY, _nav_list_period_rebalance_date
+    from app.main import _NAV_LIST_SUMMARY_EMPTY
 
     now_expr = sql_now()
     upsert = text(
@@ -97,16 +96,9 @@ def _upsert_metrics_rows(
     for sid in strategy_ids:
         s = summaries.get(sid) or dict(_NAV_LIST_SUMMARY_EMPTY)
         m = nav_meta.get(sid) or {}
-        period_rb_str: str | None = None
-        last_td_str = m.get("last_trade_date")
-        if last_td_str:
-            try:
-                last_td = date.fromisoformat(str(last_td_str)[:10])
-                period_rb = _nav_list_period_rebalance_date(db, sid, last_td)
-                if period_rb is not None:
-                    period_rb_str = period_rb.isoformat()
-            except (TypeError, ValueError):
-                pass
+        period_rb_raw = s.get("period_rebalance_date")
+        period_rb_str = str(period_rb_raw)[:10] if period_rb_raw else None
+        last_td_str = m.get("last_trade_date") or s.get("last_trade_date")
         db.execute(
             upsert,
             {

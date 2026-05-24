@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.services import _nav_rb_idx_on_date, _row_sql_date
+from app.services import _row_sql_date
 from app.sql_dialect import sql_date_compact_expr, sql_order_date_asc, sql_order_date_desc
 
 _log = logging.getLogger(__name__)
@@ -21,6 +21,8 @@ LIST_METRICS_EMPTY: dict[str, Any] = {
     "period_since_rebalance_return": None,
     "month_return": None,
     "year_return": None,
+    "last_trade_date": None,
+    "period_rebalance_date": None,
 }
 
 
@@ -148,26 +150,22 @@ def rolling_window_returns(
 
 
 def _period_rebalance_date(db: Session, strategy_id: str, last_td: date) -> date | None:
-    rb_rows = db.execute(
+    row = db.execute(
         text(
-            """
-            SELECT DISTINCT rebalance_date
+            f"""
+            SELECT rebalance_date
             FROM strategy_positions
             WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("rebalance_date")} <= :td_cmp
+            ORDER BY {sql_order_date_desc("rebalance_date")}
+            LIMIT 1
             """
         ),
-        {"sid": strategy_id},
-    ).mappings().all()
-    rb_sorted: list[date] = []
-    for r in rb_rows:
-        d = _row_sql_date(r.get("rebalance_date"))
-        if d is not None:
-            rb_sorted.append(d)
-    if not rb_sorted:
+        {"sid": strategy_id, "td_cmp": last_td.strftime("%Y%m%d")},
+    ).mappings().first()
+    if not row:
         return None
-    rb_sorted.sort()
-    _, current_rb = _nav_rb_idx_on_date(rb_sorted, last_td)
-    return current_rb
+    return _row_sql_date(row.get("rebalance_date"))
 
 
 def _period_start_nav_unit(db: Session, strategy_id: str, period_rb: date) -> float | None:
@@ -243,6 +241,8 @@ def compute_strategy_list_metrics_snapshot(
         "period_since_rebalance_return": period_ret,
         "month_return": rolling["month_return"],
         "year_return": rolling["year_return"],
+        "last_trade_date": last_td.isoformat(),
+        "period_rebalance_date": max_rb.isoformat() if max_rb is not None else None,
     }
     mr = out.get("month_return")
     yr = out.get("year_return")
