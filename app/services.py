@@ -6670,6 +6670,8 @@ def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
         if ok
         else ("失败：" + ("；".join(str(x) for x in errs)[:1800]))
     )
+    if (not ok) and bool(result.get("resumable")) and str(result.get("stage") or "") in ("shutdown", "interrupted"):
+        summary = "\u540e\u53f0\u4efb\u52a1\u88ab\u4e2d\u65ad\uff0c\u53ef\u70b9\u300c\u7eed\u4f20\u300d\u7ee7\u7eed\u3002"
     body = json.dumps(result, ensure_ascii=False)
     with turso_stream_lock():
         db = SessionLocalFactory()
@@ -6822,7 +6824,7 @@ def execute_admin_sync_pipeline(
                 "imported": 0,
                 "nav_rebuilt": 0,
                 "failed": len(ids),
-                "errors": [str(ex)],
+                "errors": ["?????????????????"],
             }
         finally:
             db.close()
@@ -6891,7 +6893,7 @@ def execute_admin_sync_pipeline(
                 "imported": (imp or {}).get("imported", 0),
                 "nav_rebuilt": 0,
                 "failed": len(ids),
-                "errors": [str(ex)],
+                "errors": ["\u540e\u53f0\u4efb\u52a1\u88ab\u4e2d\u65ad\uff0c\u8bf7\u70b9\u300c\u7eed\u4f20\u300d\u7ee7\u7eed\u3002"],
             }
         finally:
             db.close()
@@ -7089,7 +7091,7 @@ def run_admin_sync_background_task(
             job_id,
             {
                 "ok": False,
-                "stage": "shutdown",
+                "stage": "interrupted",
                 "resumable": True,
                 "imported": 0,
                 "nav_rebuilt": 0,
@@ -7178,7 +7180,7 @@ def _run_strategy_import_background_task_impl(
                     WHERE id=:id AND status <> 'ABANDONED'
                     """
                 ),
-                {"m": f"service shutdown requested; resume this task: {str(ex)[:500]}", "id": job_id},
+                {"m": "\u540e\u53f0\u4efb\u52a1\u88ab\u4e2d\u65ad\uff0c\u8bf7\u70b9\u300c\u7eed\u4f20\u300d\u7ee7\u7eed\u3002", "id": job_id},
             )
             db.commit()
         except Exception:

@@ -554,7 +554,7 @@
       function esc(s) {
         return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       }
-      const JOB_POLL_MS = 1000;
+      const JOB_POLL_MS = 5000;
       const JOB_LOG_LIMIT = 5;
       let jobTableAutoTimer = null;
       function jobMsgCell(j) {

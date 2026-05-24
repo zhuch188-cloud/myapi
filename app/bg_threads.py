@@ -27,7 +27,7 @@ def is_shutting_down() -> bool:
 
 def raise_if_shutting_down() -> None:
     if is_shutting_down():
-        raise ShutdownRequested("service shutdown requested; resume the task after restart")
+        raise ShutdownRequested("\u540e\u53f0\u4efb\u52a1\u88ab\u4e2d\u65ad\uff0c\u8bf7\u5728\u4efb\u52a1\u8868\u70b9\u51fb\u300c\u7eed\u4f20\u300d\u7ee7\u7eed")
 
 
 def _delegate_signal(signum: int, frame: Any) -> None:
