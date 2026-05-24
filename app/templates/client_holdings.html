@@ -65,6 +65,8 @@
           <button class="secondary" type="button" id="nextPeriodBtn" onclick="nextPeriod()">下一期</button>
           <label>调仓日</label>
           <select id="rebalanceSel" onchange="onRebalanceChange()"></select>
+          <label>数据截止日</label>
+          <span id="dataEndDate" class="muted">-</span>
         </div>
         <p id="holdingsMeta" class="muted meta-line"></p>
         <div class="scroll"><table id="holdingsTable"></table></div>
@@ -78,6 +80,7 @@
       let token = localStorage.getItem("token") || "";
       let rebalanceDates = [];
       let currentRebalanceDate = "";
+      let latestTradeDate = "";
       function authHeaders(extra) {
         const h = Object.assign({}, extra || {});
         if (token) h.Authorization = "Bearer " + token;
@@ -140,10 +143,20 @@
       function priceFmt(v) { return v == null ? "-" : Number(v).toFixed(2); }
       function num2(v) { return v == null ? "-" : Number(v).toFixed(2); }
       function mvYi(wan) { return wan == null ? "-" : (Number(wan) / 10000).toFixed(1); }
+      function dateFmt(v) {
+        const s = String(v || "").trim();
+        if (/^\d{8}$/.test(s)) return s.slice(0, 4) + "-" + s.slice(4, 6) + "-" + s.slice(6, 8);
+        return s || "-";
+      }
       function setPeriodButtons() {
         const idx = rebalanceDates.indexOf(currentRebalanceDate);
         document.getElementById("prevPeriodBtn").disabled = idx < 0 || idx >= rebalanceDates.length - 1;
         document.getElementById("nextPeriodBtn").disabled = idx <= 0;
+      }
+      function updateDataEndDate() {
+        const idx = rebalanceDates.indexOf(currentRebalanceDate);
+        const endDate = idx > 0 ? rebalanceDates[idx - 1] : latestTradeDate;
+        document.getElementById("dataEndDate").textContent = dateFmt(endDate);
       }
       async function loadRebalanceDates() {
         const data = await api("/api/strategies/" + encodeURIComponent(STRATEGY_ID) + "/rebalance-dates");
@@ -153,10 +166,12 @@
         if (!currentRebalanceDate && rebalanceDates.length) currentRebalanceDate = rebalanceDates[0];
         if (currentRebalanceDate && rebalanceDates.includes(currentRebalanceDate)) sel.value = currentRebalanceDate;
         setPeriodButtons();
+        updateDataEndDate();
       }
       function onRebalanceChange() {
         currentRebalanceDate = document.getElementById("rebalanceSel").value || "";
         setPeriodButtons();
+        updateDataEndDate();
         reloadHoldings();
       }
       function prevPeriod() {
@@ -165,6 +180,7 @@
           currentRebalanceDate = rebalanceDates[idx + 1];
           document.getElementById("rebalanceSel").value = currentRebalanceDate;
           setPeriodButtons();
+          updateDataEndDate();
           reloadHoldings();
         }
       }
@@ -174,6 +190,7 @@
           currentRebalanceDate = rebalanceDates[idx - 1];
           document.getElementById("rebalanceSel").value = currentRebalanceDate;
           setPeriodButtons();
+          updateDataEndDate();
           reloadHoldings();
         }
       }
@@ -188,7 +205,9 @@
           if (rebalanceDates.includes(currentRebalanceDate)) document.getElementById("rebalanceSel").value = currentRebalanceDate;
         }
         setPeriodButtons();
-        document.getElementById("holdingsMeta").textContent = m ? "行情日：" + (m.latest_trade_date || "—") : "";
+        latestTradeDate = m.latest_trade_date ? String(m.latest_trade_date).slice(0, 10) : "";
+        updateDataEndDate();
+        document.getElementById("holdingsMeta").textContent = m ? "行情日：" + dateFmt(m.latest_trade_date) : "";
         const rowsHtml = (data.items || []).map(function (i) {
           const stockUrl = "/client/strategy/" + encodeURIComponent(STRATEGY_ID) + "/stock/" + encodeURIComponent(i.stock_code || "");
           return (
