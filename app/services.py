@@ -4286,7 +4286,9 @@ def resolve_nav_rebuild_eod_months(latest_period_stock_count: int) -> int:
     开算净值前动态月数：latest_n * months <= nav_rebuild_stock_month_budget（至少 1 个月）。
     可选 nav_rebuild_eod_months_max / 旧 nav_rebuild_eod_months>0 作为上限。
     """
-    budget = max(1, int(getattr(settings, "nav_rebuild_stock_month_budget", 300) or 300))
+    configured_budget = max(1, int(getattr(settings, "nav_rebuild_stock_month_budget", 300) or 300))
+    budget_floor = max(0, int(getattr(settings, "nav_rebuild_stock_month_budget_floor", 360) or 0))
+    budget = max(configured_budget, budget_floor)
     n = max(1, int(latest_period_stock_count or 1))
     months = max(1, budget // n)
     cap = int(getattr(settings, "nav_rebuild_eod_months_max", 0) or 0)
@@ -5552,18 +5554,21 @@ def _rebuild_nav_for_strategy_yearly(
     nav_persist_chunk = max(50, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
     latest_n = _latest_rebalance_stock_count(rb_map)
     eod_step_months = resolve_nav_rebuild_eod_months(latest_n)
-    budget = int(getattr(settings, "nav_rebuild_stock_month_budget", 300) or 300)
+    configured_budget = max(1, int(getattr(settings, "nav_rebuild_stock_month_budget", 300) or 300))
+    budget_floor = max(0, int(getattr(settings, "nav_rebuild_stock_month_budget_floor", 360) or 0))
+    budget = max(configured_budget, budget_floor)
     time_segs = _nav_eod_time_segments(
         start_c, latest_trade_c, step_months=eod_step_months
     )
     n_codes_union = len({c for lst in rb_map.values() for c, _ in lst if c})
     _log.info(
         "nav rebuild %s: latest_period_stocks=%s eod_step_months=%s "
-        "(budget=%s, product<=%s) segments=%s",
+        "(budget=%s, configured=%s, product<=%s) segments=%s",
         sid,
         latest_n,
         eod_step_months,
         budget,
+        configured_budget,
         latest_n * eod_step_months,
         len(time_segs),
     )

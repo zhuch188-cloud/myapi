@@ -114,6 +114,8 @@ class Settings(BaseSettings):
     holding_eod_desc_max_bars: int = 65
     # 净值 EOD 动态分段：最新一期成分股数 × 每段月数 <= budget（阶段2 开算前按 CL1 最新期成分重算）
     nav_rebuild_stock_month_budget: int = 300
+    # Render 上小预算会把 150 只左右策略切成 1 月/段，Wind 往返过多；用温和下限减少分段数。
+    nav_rebuild_stock_month_budget_floor: int = 360
     # 动态月数上限（0=不设顶，仅受 budget 约束）；对应环境变量 NAV_REBUILD_EOD_MONTHS_MAX
     nav_rebuild_eod_months_max: int = 0
     # 兼容旧配置：>0 且未设 MAX 时作为动态月数上限；不再固定为每段 1 个月
