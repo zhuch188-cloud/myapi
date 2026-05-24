@@ -1600,6 +1600,10 @@ def _import_strategy_holdings_from_excel(
         skipped_rows = 0
         scan_batch_no = 0
         excel_rows = 0
+        # Pre-heal may populate Excel counts before the real import scan. Rebuild
+        # them from this pass so resume/full validation does not double-count.
+        stats["expected_file_rows"] = 0
+        stats["excel_period_counts"] = defaultdict(int)
         _log_runtime_progress(
             f"import:{sid}",
             f"import {sid}: streaming start mode={import_mode} file={Path(file_path).name}",
