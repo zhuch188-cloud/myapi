@@ -6664,6 +6664,27 @@ def _admin_sync_job_touch(
             own.close()
 
 
+def _clear_update_running_flag_if_stale() -> bool:
+    """Clear the process-local update lock when no update job is RUNNING in DB."""
+    global _job_running
+    if not _job_running:
+        return False
+    from app.db import SessionLocalFactory
+
+    db = SessionLocalFactory()
+    try:
+        row = db.execute(
+            text("SELECT id FROM strategy_update_jobs WHERE status='RUNNING' LIMIT 1")
+        ).first()
+        if row is not None:
+            return False
+        _log.warning("clearing stale in-process update lock: no RUNNING strategy_update_jobs")
+        _job_running = False
+        return True
+    finally:
+        db.close()
+
+
 def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
     from app.db import SessionLocalFactory, turso_stream_lock
 
@@ -7011,6 +7032,9 @@ def execute_admin_sync_pipeline(
         t0 = time.monotonic()
         last_touch = 0.0
         while _job_running and (time.monotonic() - t0) < cap:
+            if _clear_update_running_flag_if_stale():
+                p("wait_idle", "阶段3/3 前：已清理残留的数据更新占用标记，继续写入持仓快照…", detached=True)
+                break
             elapsed = int(time.monotonic() - t0)
             if elapsed - last_touch >= 9:
                 last_touch = float(elapsed)
@@ -7025,6 +7049,7 @@ def execute_admin_sync_pipeline(
             "imported": (imp or {}).get("imported", 0),
             "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
             "failed": len(ids),
+            "resumable": True,
             "errors": [
                 f"其它数据更新仍占用进程（{wait_hint}）。请待「立即更新」或定时任务结束后再点同步；导入与净值已提交。"
             ],
