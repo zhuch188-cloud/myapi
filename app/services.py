@@ -1576,6 +1576,9 @@ def _import_strategy_holdings_from_excel(
             if inc_slice:
                 stats["rows_before"] = rows_baseline
         if delete_all:
+            stage_token = _strategy_import_stage_token(
+                sid, strategy_import_job_id, sync_job_id
+            )
             _import_progress_touch(
                 db,
                 f"阶段1/3 {sid}：全量首次导入，清空旧持仓后从 Excel 首行写入…",
@@ -1586,15 +1589,14 @@ def _import_strategy_holdings_from_excel(
             from app.db import run_under_turso_stream_lock
 
             def _wipe() -> None:
-                db.execute(
-                    text("DELETE FROM strategy_positions WHERE strategy_id=:sid"),
-                    {"sid": sid},
-                )
+                _cleanup_strategy_import_stage(db, sid)
                 db.commit()
 
             run_under_turso_stream_lock(_wipe)
             _import_after_batch_commit(db)
             stats["rows_before"] = 0
+        else:
+            stage_token = None
         imported_rows = 0
         batch_no = 0
         skipped_rows = 0
@@ -1639,7 +1641,13 @@ def _import_strategy_holdings_from_excel(
                     )
                 continue
             batch_no += 1
-            _commit_positions_chunk_resilient(db, sid, chunk, batch_no=batch_no)
+            _commit_positions_chunk_resilient(
+                db,
+                sid,
+                chunk,
+                batch_no=batch_no,
+                stage_token=stage_token,
+            )
             imported_rows += len(chunk)
             _import_after_batch_commit(db)
             batch_max_rb = max((x[0] for x in chunk), default=None)
@@ -1696,7 +1704,26 @@ def _import_strategy_holdings_from_excel(
         )
         from app.db import run_under_turso_stream_lock
 
-        if str(import_mode or "").lower() == "full" and not heavy_import:
+        if stage_token:
+
+            def _finish_stage_import() -> None:
+                cached = _excel_period_counts_from_stats(stats)
+                if not cached:
+                    raise ValueError(f"{sid} staging 缺少 Excel 期数缓存，无法安全替换")
+                ex_counts, ex_total = cached
+                promoted = _verify_strategy_import_stage_exact(
+                    db, sid, stage_token, ex_counts, ex_total
+                )
+                stats["rows_after"] = _promote_strategy_import_stage(
+                    db, sid, stage_token
+                )
+                if int(stats["rows_after"]) != promoted:
+                    raise ValueError(
+                        f"{sid} staging 替换异常：暂存 {promoted} 行，正式 {stats['rows_after']} 行"
+                    )
+
+            run_under_turso_stream_lock(_finish_stage_import)
+        elif str(import_mode or "").lower() == "full" and not heavy_import:
 
             def _finish_import() -> None:
                 nonlocal imported_rows
@@ -1832,6 +1859,17 @@ _POSITION_UPSERT_SQL = text(
     """
 )
 
+_POSITION_STAGE_UPSERT_SQL = text(
+    """
+    INSERT INTO strategy_positions_import_stage
+    (import_token, strategy_id, rebalance_date, stock_code, holding_weight, industry_neutral_weight)
+    VALUES (:token, :sid, :rdate, :scode, :hw, :iw)
+    ON CONFLICT(import_token, strategy_id, rebalance_date, stock_code) DO UPDATE SET
+      holding_weight=excluded.holding_weight,
+      industry_neutral_weight=excluded.industry_neutral_weight
+    """
+)
+
 
 def _read_strategy_holdings_excel(
     file_path: str,
@@ -1902,12 +1940,140 @@ def _import_positions_batch(
         )
 
 
+def _import_positions_stage_batch(
+    db: Session,
+    token: str,
+    sid: str,
+    write_rows: list[tuple[date, str, float | None, float | None]],
+) -> None:
+    batch = _strategy_import_position_batch_size()
+    for i in range(0, len(write_rows), batch):
+        chunk = write_rows[i : i + batch]
+        db.execute(
+            _POSITION_STAGE_UPSERT_SQL,
+            [
+                {
+                    "token": token,
+                    "sid": sid,
+                    "rdate": rebalance,
+                    "scode": code,
+                    "hw": holding,
+                    "iw": industry_w,
+                }
+                for rebalance, code, holding, industry_w in chunk
+            ],
+        )
+
+
+def _strategy_import_stage_token(
+    sid: str, strategy_import_job_id: int | None, sync_job_id: int | None
+) -> str:
+    base = strategy_import_job_id if strategy_import_job_id is not None else f"sync{sync_job_id or 0}"
+    return f"{sid}:{base}:{int(time.time() * 1000)}"
+
+
+def _cleanup_strategy_import_stage(db: Session, sid: str, token: str | None = None) -> None:
+    if token:
+        db.execute(
+            text(
+                """
+                DELETE FROM strategy_positions_import_stage
+                WHERE import_token=:token AND strategy_id=:sid
+                """
+            ),
+            {"token": token, "sid": sid},
+        )
+        return
+    db.execute(
+        text("DELETE FROM strategy_positions_import_stage WHERE strategy_id=:sid"),
+        {"sid": sid},
+    )
+
+
+def _strategy_import_stage_row_count(db: Session, sid: str, token: str) -> int:
+    row = db.execute(
+        text(
+            """
+            SELECT COUNT(*) AS n
+            FROM strategy_positions_import_stage
+            WHERE import_token=:token AND strategy_id=:sid
+            """
+        ),
+        {"token": token, "sid": sid},
+    ).mappings().first()
+    return int(row.get("n") or 0) if row else 0
+
+
+def _stage_period_row_counts(db: Session, sid: str, token: str) -> tuple[dict[str, int], int]:
+    rows = db.execute(
+        text(
+            """
+            SELECT rebalance_date AS rb, COUNT(*) AS cnt
+            FROM strategy_positions_import_stage
+            WHERE import_token=:token AND strategy_id=:sid
+            GROUP BY rebalance_date
+            """
+        ),
+        {"token": token, "sid": sid},
+    ).mappings().all()
+    counts: dict[str, int] = {}
+    total = 0
+    for r in rows:
+        d = _row_sql_date(r.get("rb"))
+        if not d:
+            continue
+        k = d.isoformat()
+        c = int(r.get("cnt") or 0)
+        counts[k] = c
+        total += c
+    return counts, total
+
+
+def _verify_strategy_import_stage_exact(
+    db: Session,
+    sid: str,
+    token: str,
+    ex_counts: dict[str, int],
+    ex_total: int,
+) -> int:
+    stage_counts, stage_total = _stage_period_row_counts(db, sid, token)
+    bad = _mismatch_rebalance_dates(ex_counts, stage_counts)
+    if stage_total != ex_total or bad:
+        sample = ", ".join(sorted(bad)[:8])
+        raise ValueError(
+            f"{sid} staging 校验失败：Excel {ex_total} 行，暂存 {stage_total} 行"
+            + (f"，不一致调仓日 {len(bad)} 个：{sample}" if bad else "")
+        )
+    return stage_total
+
+
+def _promote_strategy_import_stage(db: Session, sid: str, token: str) -> int:
+    db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": sid})
+    db.execute(
+        text(
+            """
+            INSERT INTO strategy_positions
+            (strategy_id, rebalance_date, stock_code, holding_weight, industry_neutral_weight)
+            SELECT strategy_id, rebalance_date, stock_code, holding_weight, industry_neutral_weight
+            FROM strategy_positions_import_stage
+            WHERE import_token=:token AND strategy_id=:sid
+            """
+        ),
+        {"token": token, "sid": sid},
+    )
+    promoted = _strategy_import_stage_row_count(db, sid, token)
+    _cleanup_strategy_import_stage(db, sid, token)
+    db.commit()
+    return promoted
+
+
 def _commit_positions_chunk_resilient(
     db: Session,
     sid: str,
     chunk: list[tuple[date, str, float | None, float | None]],
     *,
     batch_no: int = 0,
+    stage_token: str | None = None,
 ) -> None:
     """
     写入并 commit（短持 Turso 流锁）。不在每批 COUNT；失败仅按 OperationalError 重试。
@@ -1920,7 +2086,10 @@ def _commit_positions_chunk_resilient(
     max_attempts = _strategy_import_batch_retry_max()
 
     def _write_once() -> None:
-        _import_positions_batch(db, sid, chunk)
+        if stage_token:
+            _import_positions_stage_batch(db, stage_token, sid, chunk)
+        else:
+            _import_positions_batch(db, sid, chunk)
         db.commit()
 
     for attempt in range(max_attempts):

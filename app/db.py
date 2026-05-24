@@ -809,6 +809,22 @@ _SCHEMA_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_pos_date ON strategy_positions (strategy_id, rebalance_date)",
     """
+    CREATE TABLE IF NOT EXISTS strategy_positions_import_stage (
+        import_token TEXT NOT NULL,
+        strategy_id TEXT NOT NULL,
+        rebalance_date TEXT NOT NULL,
+        stock_code TEXT NOT NULL,
+        holding_weight REAL NULL,
+        industry_neutral_weight REAL NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        PRIMARY KEY (import_token, strategy_id, rebalance_date, stock_code)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pos_stage_sid_token "
+    "ON strategy_positions_import_stage (strategy_id, import_token)",
+    "CREATE INDEX IF NOT EXISTS idx_pos_stage_date "
+    "ON strategy_positions_import_stage (import_token, strategy_id, rebalance_date)",
+    """
     CREATE TABLE IF NOT EXISTS strategy_holding_daily (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         strategy_id TEXT NOT NULL,
