@@ -2816,6 +2816,20 @@ def _flush_rebalance_holding_period(
     """计算 drift/目标权重并写入本期持仓快照。返回写入条数。"""
     snap_target_weights = False
     rb_d = _row_sql_date(rebalance)
+    rb_cmp = _compact_date(rebalance)
+    td_cmp = _compact_date(trade_date)
+    if rb_cmp and td_cmp:
+        db.execute(
+            text(
+                f"""
+                DELETE FROM strategy_holding_daily
+                WHERE strategy_id = :sid
+                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
+                  AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
+                """
+            ),
+            {"sid": sid, "td_cmp": td_cmp, "rb_cmp": rb_cmp},
+        )
     if i_rb == 1 and rb_d is not None and total_weight > 0:
         mx = db.execute(
             text(
@@ -3242,8 +3256,56 @@ def _sync_save_checkpoint(
         db.commit()
 
 
+def _sync_update_rb_key(strategy_id: str, rb_compact: str) -> str:
+    sid = str(strategy_id or "").strip()
+    rb_key = str(rb_compact or "").strip().replace("-", "")[:8]
+    return f"{sid}:{rb_key}" if sid and rb_key else rb_key
+
+
+def _sync_normalize_update_rb_done(values: Any) -> set[str]:
+    done: set[str] = set()
+    for raw in values or []:
+        val = str(raw or "").strip()
+        if not val:
+            continue
+        if ":" in val:
+            sid, rb = val.split(":", 1)
+            key = _sync_update_rb_key(sid, rb)
+        else:
+            key = val.replace("-", "")[:8]
+        if key:
+            done.add(key)
+    return done
+
+
+def _sync_update_rb_done_for_strategy(
+    done: set[str] | None,
+    strategy_id: str,
+    *,
+    allow_legacy_dates: bool,
+) -> set[str]:
+    sid = str(strategy_id or "").strip()
+    prefix = f"{sid}:"
+    out: set[str] = set()
+    for raw in done or set():
+        val = str(raw or "").strip()
+        if not val:
+            continue
+        if ":" in val:
+            if val.startswith(prefix):
+                rb = val.split(":", 1)[1].replace("-", "")[:8]
+                if rb:
+                    out.add(rb)
+        elif allow_legacy_dates:
+            rb = val.replace("-", "")[:8]
+            if rb:
+                out.add(rb)
+    return out
+
+
 def _sync_mark_update_rb_done(
     sync_job_id: int,
+    strategy_id: str,
     rb_compact: str,
     *,
     db: Session | None = None,
@@ -3253,6 +3315,7 @@ def _sync_mark_update_rb_done(
     rb_key = str(rb_compact or "").strip().replace("-", "")[:8]
     if not rb_key:
         return
+    done_key = _sync_update_rb_key(strategy_id, rb_key)
 
     def _apply(sess: Session) -> None:
         row = (
@@ -3264,8 +3327,8 @@ def _sync_mark_update_rb_done(
             .first()
         )
         cp = _sync_load_checkpoint(row.get("checkpoint_json") if row else None)
-        done = set(cp.get("completed_update_rb") or [])
-        done.add(rb_key)
+        done = _sync_normalize_update_rb_done(cp.get("completed_update_rb") or [])
+        done.add(done_key)
         _sync_save_checkpoint(
             sess,
             sync_job_id,
@@ -4077,27 +4140,11 @@ def run_update(
                 )
 
             eod_local = eod_by_code if wind_merged is None and not rb_chunked_eod else None
-            td_cmp = _compact_date(trade_date)
-            for attempt in range(4):
-                try:
-                    db.execute(
-                        text(
-                            f"""
-                            DELETE FROM strategy_holding_daily
-                            WHERE strategy_id = :sid
-                              AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                            """
-                        ),
-                        {"sid": sid, "td_cmp": td_cmp},
-                    )
-                    break
-                except OperationalError as oe:
-                    if not _mysql_lock_contention(oe) or attempt >= 3 or not do_commit:
-                        raise
-                    if do_commit:
-                        db.rollback()
-                    time.sleep(0.25 * (2**attempt))
-            skip_rb = skip_update_rebalance_dates or set()
+            skip_rb = _sync_update_rb_done_for_strategy(
+                skip_update_rebalance_dates or set(),
+                sid,
+                allow_legacy_dates=(len(selected_set) <= 1),
+            )
             if hold_start_idx > 0 and anchor_rb_hold is not None and not full_refresh:
                 prior_td = _holding_prior_trade_date(db, sid, trade_date)
                 rb_copy: list[date] = []
@@ -4156,6 +4203,7 @@ def run_update(
                 if sync_job_id is not None and rb_compact:
                     _sync_mark_update_rb_done(
                         sync_job_id,
+                        sid,
                         rb_compact,
                         db=db,
                         do_commit=False,
@@ -6779,6 +6827,17 @@ def rebuild_nav_series(
                             _log.exception(
                                 "strategy_list_metrics refresh after nav sid=%s", sid
                             )
+                    else:
+                        failed += 1
+                        errors.append(f"{sid}: nav rebuild incomplete")
+                        if sync_job_id is not None:
+                            _admin_sync_job_touch(
+                                sync_job_id,
+                                "nav",
+                                f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] {sid} 未完成",
+                                db=sdb,
+                                do_commit=do_commit,
+                            )
                 finally:
                     if low_mem:
                         try:
@@ -6830,6 +6889,17 @@ def rebuild_nav_series(
                     except Exception:
                         _log.exception(
                             "strategy_list_metrics refresh after nav sid=%s", sid
+                        )
+                else:
+                    failed += 1
+                    errors.append(f"{sid}: nav rebuild incomplete")
+                    if sync_job_id is not None:
+                        _admin_sync_job_touch(
+                            sync_job_id,
+                            "nav",
+                            f"阶段2/3 净值 [{len(completed_nav)}/{total_nav}] {sid} 未完成",
+                            db=db,
+                            do_commit=do_commit,
                         )
         except Exception as ex:
             failed += 1
@@ -7058,11 +7128,9 @@ def execute_admin_sync_pipeline(
                 cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
                 completed_import = set(cp.get("completed_import") or [])
                 completed_nav = set(cp.get("completed_nav") or [])
-                completed_update_rb = {
-                    str(x).strip().replace("-", "")[:8]
-                    for x in (cp.get("completed_update_rb") or [])
-                    if str(x).strip()
-                }
+                completed_update_rb = _sync_normalize_update_rb_done(
+                    cp.get("completed_update_rb") or []
+                )
                 if completed_import:
                     p(
                         "resume",
@@ -7245,15 +7313,19 @@ def execute_admin_sync_pipeline(
                 sync_job_id=sync_job_id,
             )
             completed_nav = set(nav_ret.get("completed_nav_ids") or [])
-        if int(nav_ret.get("failed") or 0) > 0 and not ids_set <= completed_nav:
+        if not ids_set <= completed_nav:
+            nav_errors = list(nav_ret.get("errors") or [])
+            missing_nav = sorted(ids_set - completed_nav)
+            if missing_nav:
+                nav_errors.append("净值未完成策略：" + ",".join(missing_nav))
             return {
                 "ok": False,
                 "stage": "nav",
                 "resumable": True,
                 "imported": imp.get("imported", 0),
                 "nav_rebuilt": nav_ret.get("rebuilt", 0),
-                "failed": nav_ret.get("failed", 0),
-                "errors": nav_ret.get("errors", []),
+                "failed": max(int(nav_ret.get("failed") or 0), len(missing_nav)),
+                "errors": nav_errors,
             }
         if sync_job_id is not None:
             with turso_stream_lock():
