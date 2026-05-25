@@ -1656,7 +1656,12 @@ def _import_strategy_holdings_from_excel(
             stats["imported_rows"] = imported_rows
             stats["skipped_rows"] = skipped_rows
             stats["excel_rows"] = excel_rows
-            stats["rows_after"] = int(stats.get("rows_before") or 0) + imported_rows
+            if stage_token:
+                stats["rows_after"] = _strategy_import_stage_row_count(
+                    db, sid, stage_token
+                )
+            else:
+                stats["rows_after"] = int(stats.get("rows_before") or 0) + imported_rows
             _log_runtime_progress(
                 f"import:{sid}",
                 (
@@ -2029,6 +2034,49 @@ def _stage_period_row_counts(db: Session, sid: str, token: str) -> tuple[dict[st
     return counts, total
 
 
+def _stage_existing_keys_for_dates(
+    db: Session, sid: str, token: str, dates: list[date]
+) -> set[tuple[str, str]]:
+    uniq = sorted({d.isoformat() for d in dates})
+    if not uniq:
+        return set()
+    out: set[tuple[str, str]] = set()
+    for i in range(0, len(uniq), 60):
+        part = uniq[i : i + 60]
+        in_list = ", ".join(f":d{j}" for j in range(len(part)))
+        params: dict[str, Any] = {"token": token, "sid": sid}
+        for j, d in enumerate(part):
+            params[f"d{j}"] = d
+        rows = db.execute(
+            text(
+                f"""
+                SELECT rebalance_date AS rb, stock_code
+                FROM strategy_positions_import_stage
+                WHERE import_token=:token
+                  AND strategy_id=:sid
+                  AND rebalance_date IN ({in_list})
+                """
+            ),
+            params,
+        ).mappings().all()
+        for r in rows:
+            d = _row_sql_date(r.get("rb"))
+            code = str(r.get("stock_code") or "").strip()
+            if d and code:
+                out.add((d.isoformat(), code))
+    return out
+
+
+def _stage_missing_rows(
+    db: Session,
+    sid: str,
+    token: str,
+    rows: list[tuple[date, str, float | None, float | None]],
+) -> list[tuple[date, str, float | None, float | None]]:
+    existing = _stage_existing_keys_for_dates(db, sid, token, [r[0] for r in rows])
+    return [r for r in rows if (r[0].isoformat(), r[1]) not in existing]
+
+
 def _verify_strategy_import_stage_exact(
     db: Session,
     sid: str,
@@ -2067,6 +2115,39 @@ def _promote_strategy_import_stage(db: Session, sid: str, token: str) -> int:
     return promoted
 
 
+def _write_stage_chunk_verified(
+    db: Session,
+    sid: str,
+    token: str,
+    chunk: list[tuple[date, str, float | None, float | None]],
+    *,
+    batch_no: int,
+    max_attempts: int,
+) -> None:
+    pending = list(chunk)
+    for attempt in range(max_attempts):
+        _import_positions_stage_batch(db, token, sid, pending)
+        db.commit()
+        pending = _stage_missing_rows(db, sid, token, chunk)
+        if not pending:
+            return
+        _log.warning(
+            "import %s stage batch %s: %s/%s rows missing after commit, retry %s/%s",
+            sid,
+            batch_no,
+            len(pending),
+            len(chunk),
+            attempt + 1,
+            max_attempts,
+        )
+        time.sleep(0.2 * (2**attempt))
+    sample = ", ".join(f"{r[0].isoformat()}|{r[1]}" for r in pending[:8])
+    raise ValueError(
+        f"{sid} stage batch {batch_no} 写入确认失败：仍缺 {len(pending)} 行"
+        + (f"（示例 {sample}）" if sample else "")
+    )
+
+
 def _commit_positions_chunk_resilient(
     db: Session,
     sid: str,
@@ -2087,10 +2168,17 @@ def _commit_positions_chunk_resilient(
 
     def _write_once() -> None:
         if stage_token:
-            _import_positions_stage_batch(db, stage_token, sid, chunk)
+            _write_stage_chunk_verified(
+                db,
+                sid,
+                stage_token,
+                chunk,
+                batch_no=batch_no,
+                max_attempts=max_attempts,
+            )
         else:
             _import_positions_batch(db, sid, chunk)
-        db.commit()
+            db.commit()
 
     for attempt in range(max_attempts):
         try:
