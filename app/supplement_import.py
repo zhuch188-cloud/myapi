@@ -470,8 +470,9 @@ def abandon_older_data_import_batches(
         text(
             f"""
             UPDATE data_import_batches
-            SET status='ABANDONED',
+            SET status='FAILED',
                 checkpoint_json=NULL,
+                resume_from_row=0,
                 message='已有更新的导入任务，旧断点已自动作废'
             WHERE id <> :keep
               AND status='FAILED'

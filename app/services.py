@@ -3498,6 +3498,8 @@ def strategy_import_job_is_resumable(job: dict[str, Any]) -> bool:
     st = str(job.get("status") or "").upper()
     if st in ("SUCCESS", "ABANDONED"):
         return False
+    if "Superseded by a newer" in str(job.get("message") or ""):
+        return False
     return st in ("FAILED", "RUNNING", "QUEUED", "PARTIAL")
 
 
@@ -3506,8 +3508,9 @@ def abandon_older_strategy_import_jobs(db: Session, *, keep_job_id: int) -> None
         text(
             f"""
             UPDATE strategy_import_jobs
-            SET status='ABANDONED',
+            SET status='FAILED',
                 finished_at={sql_now()},
+                checkpoint_json=NULL,
                 message='Superseded by a newer strategy import job'
             WHERE id <> :keep
               AND status IN ('FAILED', 'PARTIAL')
@@ -3522,8 +3525,9 @@ def abandon_older_admin_sync_jobs(db: Session, *, keep_job_id: int) -> None:
         text(
             f"""
             UPDATE admin_sync_jobs
-            SET status='ABANDONED',
+            SET status='FAILED',
                 checkpoint_json=NULL,
+                result_json='{{"resumable":false,"superseded":true}}',
                 finished_at={sql_now()},
                 message='Superseded by a newer sync job'
             WHERE id <> :keep
@@ -3623,8 +3627,9 @@ def abandon_admin_sync_job(db: Session, job_id: int) -> None:
         text(
             f"""
             UPDATE admin_sync_jobs
-            SET status='ABANDONED',
+            SET status='FAILED',
                 checkpoint_json=NULL,
+                result_json='{{"resumable":false,"abandoned":true}}',
                 finished_at={sql_now()},
                 message=:m
             WHERE id=:id
