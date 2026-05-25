@@ -24,6 +24,37 @@
       th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; }
       .scroll { overflow-x: auto; }
       td.msg-cell { white-space: normal; word-break: break-word; max-width: 420px; }
+      #batchTb { table-layout: fixed; min-width: 980px; }
+      #batchTb th, #batchTb td { vertical-align: top; }
+      #batchTb .batch-id { width: 48px; }
+      #batchTb .batch-type { width: 120px; }
+      #batchTb .batch-status { width: 86px; }
+      #batchTb .batch-scanned { width: 130px; }
+      #batchTb .batch-count { width: 78px; }
+      #batchTb .batch-time { width: 150px; }
+      #batchTb .batch-summary { width: auto; }
+      #batchTb .batch-actions {
+        position: sticky;
+        right: 0;
+        z-index: 1;
+        width: 128px;
+        min-width: 128px;
+        background: #fff;
+        box-shadow: -8px 0 10px rgba(255,255,255,.9);
+      }
+      #batchTb thead .batch-actions { background: #f8fafc; }
+      .batch-action-buttons {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .batch-action-buttons button.secondary {
+        width: 100%;
+        margin: 0;
+        padding: 6px 8px;
+        font-size: 12px;
+        white-space: nowrap;
+      }
       th[title] { cursor: help; text-decoration: underline dotted #94a3b8; text-underline-offset: 2px; }
       .status-badge {
         display: inline-block;
@@ -319,29 +350,29 @@
       function renderBatches(items) {
         document.getElementById("batchTb").innerHTML = `
           <thead><tr>
-            <th>ID</th><th>类型</th><th>状态</th>
-            <th title="Excel 已扫描到的行号（含唯一键无效、未写入的行）">已扫行</th>
-            <th title="唯一键有效且已 UPSERT 的行数；不等于 supplement_company_profiles 表总行数">写入成功</th>
-            <th title="唯一键为空或拼不出，未写入">跳过</th>
-            <th>时间</th><th>摘要</th><th>操作</th>
+            <th class="batch-id">ID</th><th class="batch-type">类型</th><th class="batch-status">状态</th>
+            <th class="batch-scanned" title="Excel 已扫描到的行号（含唯一键无效、未写入的行）">已扫行</th>
+            <th class="batch-count" title="唯一键有效且已 UPSERT 的行数；不等于 supplement_company_profiles 表总行数">写入成功</th>
+            <th class="batch-count" title="唯一键为空或拼不出，未写入">跳过</th>
+            <th class="batch-time">时间</th><th class="batch-summary">摘要</th><th class="batch-actions">操作</th>
           </tr></thead>
           <tbody>${items.map(b => {
             const hi = highlightBatchId && Number(b.id) === Number(highlightBatchId);
             const rowStyle = hi ? ' style="background:#eef4ff"' : "";
             const resumeBtn = b.resumable
-              ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px;margin-right:4px" onclick="resumeBatch(${b.id})">续传</button>`
-                + `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="abandonBatch(${b.id})">放弃</button>`
+              ? `<div class="batch-action-buttons"><button type="button" class="secondary" onclick="resumeBatch(${b.id})">续传</button>`
+                + `<button type="button" class="secondary" onclick="abandonBatch(${b.id})">放弃</button></div>`
               : "";
             return `<tr${rowStyle}>
-            <td>${b.id}</td>
-            <td>${esc(b.definition_code)}</td>
-            <td>${statusBadge(b.status)}</td>
-            <td>${scannedCell(b)}</td>
-            <td>${b.rows_ok ?? 0}</td>
-            <td>${b.rows_fail ?? 0}</td>
-            <td>${esc(b.created_at)}</td>
-            <td class="msg-cell" title="${esc(b.message || "")}">${esc(shortMessage(b.message)) || "—"}</td>
-            <td>${resumeBtn}</td>
+            <td class="batch-id">${b.id}</td>
+            <td class="batch-type">${esc(b.definition_code)}</td>
+            <td class="batch-status">${statusBadge(b.status)}</td>
+            <td class="batch-scanned">${scannedCell(b)}</td>
+            <td class="batch-count">${b.rows_ok ?? 0}</td>
+            <td class="batch-count">${b.rows_fail ?? 0}</td>
+            <td class="batch-time">${esc(b.created_at)}</td>
+            <td class="msg-cell batch-summary" title="${esc(b.message || "")}">${esc(shortMessage(b.message)) || "—"}</td>
+            <td class="batch-actions">${resumeBtn}</td>
           </tr>`;
           }).join("") || "<tr><td colspan='9' class='muted'>暂无批次</td></tr>"}</tbody>`;
       }
