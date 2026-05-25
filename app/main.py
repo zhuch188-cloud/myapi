@@ -75,6 +75,8 @@ from app.services import (
     find_resumable_strategy_import_job,
     count_strategy_positions_rows,
     admin_sync_job_is_resumable,
+    abandon_older_admin_sync_jobs,
+    abandon_older_strategy_import_jobs,
     abandon_strategy_import_job,
     abandon_admin_sync_job,
     reconcile_stale_admin_sync_jobs,
@@ -87,6 +89,7 @@ from app.supplement_import import (
     DataImportBatchNotFoundError,
     DataImportBatchNotResumableError,
     ImportDefinitionNotFoundError,
+    abandon_older_data_import_batches,
     abandon_data_import_batch,
     batch_is_resumable,
     default_company_profile_xlsx_path,
@@ -3997,6 +4000,7 @@ def admin_import(
                 "m": f"续传已入队（{resume_ts}，模式 {im}；从断点继续，非从头导入）",
             },
         )
+        abandon_older_strategy_import_jobs(db, keep_job_id=job_id)
         db.commit()
         _log.info("strategy import RESUME job=%s mode=%s", job_id, im)
         spawn_daemon(
@@ -4149,6 +4153,7 @@ def admin_sync(
     job_id = executed_rowid(db, res)
     if not job_id:
         raise HTTPException(status_code=500, detail="创建同步任务失败")
+    abandon_older_admin_sync_jobs(db, keep_job_id=job_id)
     db.commit()
 
     spawn_daemon(
@@ -4272,6 +4277,7 @@ def admin_sync_job_resume(
         ),
         {"id": job_id, "m": f"续传已入队（{resume_ts}，模式 {import_mode}）"},
     )
+    abandon_older_admin_sync_jobs(db, keep_job_id=job_id)
     db.commit()
     spawn_daemon(
         f"admin-sync-resume-{job_id}",
@@ -4975,6 +4981,11 @@ def admin_data_import_resume(
             "id": batch_id,
         },
     )
+    abandon_older_data_import_batches(
+        db,
+        keep_batch_id=batch_id,
+        definition_code=str(batch.get("definition_code") or ""),
+    )
     db.commit()
     spawn_daemon(
         f"data-import-resume-{batch_id}",
@@ -5093,6 +5104,11 @@ def admin_data_import_run(
         if payload.background:
             batch_id, resolved_path = _enqueue_data_import_batch(
                 db, code=code, file_path=fp, actor_user_id=actor_id
+            )
+            abandon_older_data_import_batches(
+                db,
+                keep_batch_id=batch_id,
+                definition_code=code,
             )
             _audit_log(
                 db,

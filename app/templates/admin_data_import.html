@@ -122,7 +122,7 @@
           支持 <strong>.xlsx / .xls / .xlsm / .csv</strong>。任务在<strong>后台</strong>执行。
           <strong>已扫行</strong> = 文件读到第几行；<strong>写入成功</strong> = 唯一键有效且已入库（≠ 库表总行数，相同键只更新）。
           纯远程 Turso 时单批写入约 0.5～2 分钟，<strong>已扫行/写入成功 暂时不变属正常</strong>，摘会出现「正在写入远程库…」。
-          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，可点<strong>续传</strong>；若不再继续可点<strong>放弃</strong>，该批次不可续传。
+          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，仅最近一条可续传批次显示<strong>续传</strong>；新批次产生后，旧断点会自动作废。
           Render 部署请配置 <code>SERVER_UPLOAD_ROOT</code>，先上传再导入（同区写 Turso）。
         </p>
         <div class="row">
@@ -378,17 +378,6 @@
           msg.textContent = formatFetchError(e);
         }
       }
-      async function abandonBatch(batchId) {
-        if (!confirm(`确定放弃批次 #${batchId}？放弃后不可续传。`)) return;
-        const msg = document.getElementById("runMsg");
-        try {
-          const ret = await api(`/api/admin/data-import/batches/${batchId}/abandon`, { method: "POST" });
-          msg.textContent = ret.message || `批次 #${batchId} 已放弃`;
-          await loadBatches();
-        } catch (e) {
-          msg.textContent = formatFetchError(e);
-        }
-      }
       let highlightBatchId = 0;
 
       async function fetchBatchById(batchId) {
@@ -400,6 +389,7 @@
         renderBatches(d.items || []);
       }
       function renderBatches(items) {
+        const latestResumableId = ((items || []).find((b) => !!b.resumable) || {}).id;
         document.getElementById("batchTb").innerHTML = `
           <thead><tr>
             <th class="batch-id">ID</th><th class="batch-type">类型</th><th class="batch-status">状态</th>
@@ -411,9 +401,8 @@
           <tbody>${items.map(b => {
             const hi = highlightBatchId && Number(b.id) === Number(highlightBatchId);
             const rowStyle = hi ? ' style="background:#eef4ff"' : "";
-            const resumeBtn = b.resumable
-              ? `<div class="batch-action-buttons"><button type="button" class="secondary" onclick="resumeBatch(${b.id})">续传</button>`
-                + `<button type="button" class="secondary" onclick="abandonBatch(${b.id})">放弃</button></div>`
+            const resumeBtn = b.resumable && Number(b.id) === Number(latestResumableId)
+              ? `<div class="batch-action-buttons"><button type="button" class="secondary" onclick="resumeBatch(${b.id})">续传</button></div>`
               : "";
             return `<tr${rowStyle}>
             <td class="batch-id">${b.id}</td>

@@ -3469,6 +3469,7 @@ def create_strategy_import_job(
     job_id = executed_rowid(db, res)
     if not job_id:
         raise RuntimeError("创建策略导入任务失败")
+    abandon_older_strategy_import_jobs(db, keep_job_id=job_id)
     return job_id
 
 
@@ -3498,6 +3499,39 @@ def strategy_import_job_is_resumable(job: dict[str, Any]) -> bool:
     if st in ("SUCCESS", "ABANDONED"):
         return False
     return st in ("FAILED", "RUNNING", "QUEUED", "PARTIAL")
+
+
+def abandon_older_strategy_import_jobs(db: Session, *, keep_job_id: int) -> None:
+    db.execute(
+        text(
+            f"""
+            UPDATE strategy_import_jobs
+            SET status='ABANDONED',
+                finished_at={sql_now()},
+                message='Superseded by a newer strategy import job'
+            WHERE id <> :keep
+              AND status IN ('FAILED', 'PARTIAL')
+            """
+        ),
+        {"keep": int(keep_job_id)},
+    )
+
+
+def abandon_older_admin_sync_jobs(db: Session, *, keep_job_id: int) -> None:
+    db.execute(
+        text(
+            f"""
+            UPDATE admin_sync_jobs
+            SET status='ABANDONED',
+                checkpoint_json=NULL,
+                finished_at={sql_now()},
+                message='Superseded by a newer sync job'
+            WHERE id <> :keep
+              AND status='FAILED'
+            """
+        ),
+        {"keep": int(keep_job_id)},
+    )
 
 
 def find_resumable_strategy_import_job(

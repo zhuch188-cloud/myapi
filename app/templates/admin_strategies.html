@@ -191,7 +191,7 @@
           <span id="jobMsg" class="muted"></span>
         </div>
         <p class="muted" style="margin:0;font-size:12px;line-height:1.45;">
-          「导入并提取」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：失败后在下方任务表点「续传」；若不再继续可点「放弃」，该任务将终止且不可续传。全量/增量指导入持仓表的方式，与是否重建净值无关（「导入并提取」会额外做净值与快照）。
+          「导入并提取」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：仅最近一条可续传任务显示「续传」；新任务产生后，旧断点会自动作废。全量/增量指导入持仓表的方式，与是否重建净值无关（「导入并提取」会额外做净值与快照）。
         </p>
       </div>
       <div class="card">
@@ -717,10 +717,9 @@
           }
         }
       }
-      function resumableJobButtons(resumeFn, abandonFn, id) {
+      function resumableJobButtons(resumeFn, id) {
         return `<div class="job-task-actions">`
           + `<button type="button" class="secondary" onclick="${resumeFn}(${id})">续传</button>`
-          + `<button type="button" class="secondary" onclick="${abandonFn}(${id})">放弃</button>`
           + `</div>`;
       }
       async function resumeImportJob(jobId) {
@@ -737,15 +736,6 @@
           }
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
-      async function abandonImportJob(jobId) {
-        if (!confirm(`确定放弃策略导入任务 #${jobId}？放弃后不可续传。`)) return;
-        const msg = document.getElementById("jobMsg");
-        try {
-          const ret = await api(`/api/admin/import-jobs/${jobId}/abandon`, { method: "POST" });
-          msg.textContent = ret.message || `任务 #${jobId} 已放弃`;
-          await loadImportJobs();
-        } catch (e) { msg.textContent = formatFetchError(e); }
-      }
       const JOB_TABLE_COL_7 = `<colgroup>
         <col style="width:4%" /><col style="width:7%" /><col style="width:9%" />
         <col style="width:12%" /><col style="width:5%" /><col style="width:53%" /><col style="width:10%" />
@@ -760,6 +750,7 @@
       }
       function renderImportJobs(rows) {
         const items = (rows || []).slice(0, JOB_LOG_LIMIT);
+        const latestResumableId = (items.find((j) => !!j.resumable) || {}).id;
         document.getElementById("importJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
@@ -768,7 +759,7 @@
           <tbody>${items.map(j => {
             const all = parseJsonArrayLength(j.strategy_ids_json, "?");
             const done = parseJsonArrayLength(j.completed_strategy_ids_json, 0);
-            const btn = j.resumable ? resumableJobButtons("resumeImportJob", "abandonImportJob", j.id) : "";
+            const btn = j.resumable && Number(j.id) === Number(latestResumableId) ? resumableJobButtons("resumeImportJob", j.id) : "";
             return `<tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.import_mode)}</td>
@@ -814,15 +805,6 @@
           await pollSyncJob(jobId);
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
-      async function abandonSyncJob(jobId) {
-        if (!confirm(`确定放弃「导入并提取」任务 #${jobId}？放弃后不可续传。`)) return;
-        const msg = document.getElementById("jobMsg");
-        try {
-          const ret = await api(`/api/admin/sync-jobs/${jobId}/abandon`, { method: "POST" });
-          msg.textContent = ret.message || `同步任务 #${jobId} 已放弃`;
-          await loadSyncJobs();
-        } catch (e) { msg.textContent = formatFetchError(e); }
-      }
       async function loadUpdateJobs() {
         const d = await api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() });
         renderUpdateJobs(d.items || []);
@@ -851,13 +833,14 @@
       }
       function renderSyncJobs(rows) {
         const items = (rows || []).slice(0, JOB_LOG_LIMIT);
+        const latestResumableId = (items.find((j) => !!j.resumable) || {}).id;
         document.getElementById("syncJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
             <th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>阶段</th><th>说明</th><th>操作</th>
           </tr></thead>
           <tbody>${items.map(j => {
-            const btn = j.resumable ? resumableJobButtons("resumeSyncJob", "abandonSyncJob", j.id) : "";
+            const btn = j.resumable && Number(j.id) === Number(latestResumableId) ? resumableJobButtons("resumeSyncJob", j.id) : "";
             return `<tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.import_mode)}</td>

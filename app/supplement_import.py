@@ -455,6 +455,34 @@ def batch_is_resumable(batch: dict[str, Any]) -> bool:
     return bool(_resolve_batch_source_path(batch))
 
 
+def abandon_older_data_import_batches(
+    db: Session,
+    *,
+    keep_batch_id: int,
+    definition_code: str | None = None,
+) -> None:
+    params: dict[str, Any] = {"keep": int(keep_batch_id)}
+    extra = ""
+    if definition_code:
+        extra = "AND definition_code = :dc"
+        params["dc"] = str(definition_code)
+    db.execute(
+        text(
+            f"""
+            UPDATE data_import_batches
+            SET status='ABANDONED',
+                checkpoint_json=NULL,
+                message='已有更新的导入任务，旧断点已自动作废'
+            WHERE id <> :keep
+              AND status='FAILED'
+              AND COALESCE(resume_from_row, 0) > 0
+              {extra}
+            """
+        ),
+        params,
+    )
+
+
 def abandon_data_import_batch(db: Session, batch_id: int) -> None:
     batch = get_data_import_batch_row(db, batch_id)
     if not batch:
