@@ -1951,22 +1951,35 @@ def _import_positions_stage_batch(
     sid: str,
     write_rows: list[tuple[date, str, float | None, float | None]],
 ) -> None:
-    batch = _strategy_import_position_batch_size()
+    batch = min(_strategy_import_position_batch_size(), 60)
     for i in range(0, len(write_rows), batch):
         chunk = write_rows[i : i + batch]
+        values: list[str] = []
+        params: dict[str, Any] = {}
+        for j, (rebalance, code, holding, industry_w) in enumerate(chunk):
+            values.append(
+                f"(:token{j}, :sid{j}, :rdate{j}, :scode{j}, :hw{j}, :iw{j})"
+            )
+            params[f"token{j}"] = token
+            params[f"sid{j}"] = sid
+            params[f"rdate{j}"] = rebalance
+            params[f"scode{j}"] = code
+            params[f"hw{j}"] = holding
+            params[f"iw{j}"] = industry_w
         db.execute(
-            _POSITION_STAGE_UPSERT_SQL,
-            [
-                {
-                    "token": token,
-                    "sid": sid,
-                    "rdate": rebalance,
-                    "scode": code,
-                    "hw": holding,
-                    "iw": industry_w,
-                }
-                for rebalance, code, holding, industry_w in chunk
-            ],
+            text(
+                f"""
+                INSERT INTO strategy_positions_import_stage
+                (import_token, strategy_id, rebalance_date, stock_code,
+                 holding_weight, industry_neutral_weight)
+                VALUES {", ".join(values)}
+                ON CONFLICT(import_token, strategy_id, rebalance_date, stock_code)
+                DO UPDATE SET
+                  holding_weight=excluded.holding_weight,
+                  industry_neutral_weight=excluded.industry_neutral_weight
+                """
+            ),
+            params,
         )
 
 
