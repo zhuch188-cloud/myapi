@@ -25,6 +25,27 @@
       .scroll { overflow-x: auto; }
       td.msg-cell { white-space: normal; word-break: break-word; max-width: 420px; }
       th[title] { cursor: help; text-decoration: underline dotted #94a3b8; text-underline-offset: 2px; }
+      .status-badge {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        background: #eef2f6;
+        color: #475467;
+      }
+      .status-badge.running { background: #e0f2fe; color: #0369a1; }
+      .status-badge.success { background: #dcfce7; color: #166534; }
+      .status-badge.failed { background: #fee2e2; color: #991b1b; }
+      .progress-track {
+        height: 5px;
+        min-width: 90px;
+        margin-top: 4px;
+        border-radius: 999px;
+        background: #eef2f6;
+        overflow: hidden;
+      }
+      .progress-fill { height: 100%; background: #2463eb; }
     </style>
   </head>
   <body>
@@ -113,6 +134,28 @@
         }
         if (tail) line += ` — ${tail.slice(0, 160)}`;
         return line;
+      }
+      function statusBadge(status) {
+        const s = String(status || "").toUpperCase();
+        const cls = (s === "RUNNING" || s === "QUEUED")
+          ? "running"
+          : (s === "SUCCESS" ? "success" : ((s === "FAILED" || s === "ABANDONED") ? "failed" : ""));
+        return `<span class="status-badge ${cls}">${esc(status || "-")}</span>`;
+      }
+      function shortMessage(message) {
+        const raw = String(message || "").replace(/\s+/g, " ").trim();
+        if (!raw) return "";
+        const parts = raw.split(/[。；;]|(?:\s[—-]\s)/).map((x) => x.trim()).filter(Boolean);
+        const picked = parts.find((x) => /读取|写入|完成|失败|续传|入队|跳过|正在|已/.test(x)) || parts[0] || raw;
+        return picked.length > 220 ? picked.slice(0, 220) + "…" : picked;
+      }
+      function scannedCell(b) {
+        const rt = b.rows_total != null ? Number(b.rows_total) : null;
+        const rr = Number(b.resume_from_row || 0);
+        const label = rt != null ? `${rr} / ${rt}` : (rr > 0 ? String(rr) : "—");
+        if (rt == null || !Number.isFinite(rt) || rt <= 0) return esc(label);
+        const pct = Math.max(0, Math.min(100, Math.round((rr / rt) * 100)));
+        return `${esc(label)}<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>`;
       }
       async function api(path, options = {}) {
         const opts = { ...options };
@@ -266,13 +309,14 @@
       let highlightBatchId = 0;
 
       async function fetchBatchById(batchId) {
-        const d = await api("/api/admin/data-import/batches?limit=80");
-        return (d.items || []).find(b => Number(b.id) === Number(batchId)) || null;
+        return api("/api/admin/data-import/batches/" + encodeURIComponent(String(batchId)));
       }
 
       async function loadBatches() {
         const d = await api("/api/admin/data-import/batches?limit=50");
-        const items = d.items || [];
+        renderBatches(d.items || []);
+      }
+      function renderBatches(items) {
         document.getElementById("batchTb").innerHTML = `
           <thead><tr>
             <th>ID</th><th>类型</th><th>状态</th>
@@ -284,9 +328,6 @@
           <tbody>${items.map(b => {
             const hi = highlightBatchId && Number(b.id) === Number(highlightBatchId);
             const rowStyle = hi ? ' style="background:#eef4ff"' : "";
-            const rt = b.rows_total != null ? Number(b.rows_total) : null;
-            const rr = Number(b.resume_from_row || 0);
-            const scanned = rt != null ? `${rr} / ${rt}` : (rr > 0 ? String(rr) : "—");
             const resumeBtn = b.resumable
               ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px;margin-right:4px" onclick="resumeBatch(${b.id})">续传</button>`
                 + `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="abandonBatch(${b.id})">放弃</button>`
@@ -294,16 +335,15 @@
             return `<tr${rowStyle}>
             <td>${b.id}</td>
             <td>${esc(b.definition_code)}</td>
-            <td>${esc(b.status)}</td>
-            <td>${esc(scanned)}</td>
+            <td>${statusBadge(b.status)}</td>
+            <td>${scannedCell(b)}</td>
             <td>${b.rows_ok ?? 0}</td>
             <td>${b.rows_fail ?? 0}</td>
             <td>${esc(b.created_at)}</td>
-            <td class="msg-cell">${esc((b.message || "").slice(0, 400))}</td>
+            <td class="msg-cell" title="${esc(b.message || "")}">${esc(shortMessage(b.message)) || "—"}</td>
             <td>${resumeBtn}</td>
           </tr>`;
           }).join("") || "<tr><td colspan='9' class='muted'>暂无批次</td></tr>"}</tbody>`;
-        return items;
       }
 
       async function pollBatchUntilDone(batchId) {
@@ -312,11 +352,12 @@
         const maxTicks = 7200;
         for (let i = 0; i < maxTicks; i++) {
           const b = await fetchBatchById(batchId);
-          await loadBatches();
+          if (i === 0 || i % 6 === 0) await loadBatches();
           if (b) {
             msg.textContent = formatBatchStatusLine(b, batchId);
             if (TERMINAL_BATCH.has(String(b.status || ""))) {
               highlightBatchId = 0;
+              await loadBatches();
               return b;
             }
           } else {

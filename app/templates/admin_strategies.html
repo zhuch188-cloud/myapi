@@ -61,11 +61,40 @@
         overflow-wrap: break-word;
       }
       .job-task-table .job-msg { line-height: 1.45; }
+      .job-task-table .job-msg-main {
+        display: block;
+        max-height: 4.4em;
+        overflow: hidden;
+      }
       .job-task-table .job-msg-time {
         display: block;
         font-size: 11px;
         color: #667085;
         margin-bottom: 4px;
+      }
+      .job-task-table .job-badge {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        line-height: 1.4;
+        background: #eef2f6;
+        color: #475467;
+      }
+      .job-task-table .job-badge.running { background: #e0f2fe; color: #0369a1; }
+      .job-task-table .job-badge.success { background: #dcfce7; color: #166534; }
+      .job-task-table .job-badge.failed { background: #fee2e2; color: #991b1b; }
+      .job-task-table .job-progress-track {
+        height: 5px;
+        background: #eef2f6;
+        border-radius: 999px;
+        overflow: hidden;
+        margin-top: 4px;
+      }
+      .job-task-table .job-progress-fill {
+        height: 100%;
+        background: #2463eb;
       }
       .job-task-table .col-actions { vertical-align: middle; }
       .job-task-actions {
@@ -556,12 +585,47 @@
       }
       const JOB_POLL_MS = 5000;
       const JOB_LOG_LIMIT = 5;
+      const JOB_TABLE_REFRESH_EVERY_TICKS = 3;
       let jobTableAutoTimer = null;
+      function jobStatusClass(status) {
+        const s = String(status || "").toUpperCase();
+        if (s === "RUNNING" || s === "QUEUED") return "running";
+        if (s === "SUCCESS") return "success";
+        if (s === "FAILED" || s === "ABANDONED") return "failed";
+        return "";
+      }
+      function jobStatusBadge(status) {
+        const label = esc(status || "-");
+        return `<span class="job-badge ${jobStatusClass(status)}">${label}</span>`;
+      }
+      function shortJobMessage(message) {
+        const raw = String(message || "").replace(/\s+/g, " ").trim();
+        if (!raw) return "";
+        const parts = raw.split(/[。；;]|(?:\s[—-]\s)/).map((x) => x.trim()).filter(Boolean);
+        const picked = parts.find((x) => /阶段|批|已|失败|完成|续传|等待|Wind|Excel|导入|净值|持仓|更新/.test(x)) || parts[0] || raw;
+        return picked.length > 260 ? picked.slice(0, 260) + "…" : picked;
+      }
+      function parseJsonArrayLength(s, fallback) {
+        try {
+          const v = JSON.parse(s || "[]");
+          return Array.isArray(v) ? v.length : fallback;
+        } catch (_) {
+          return fallback;
+        }
+      }
+      function progressCell(done, all) {
+        const d = Number(done);
+        const a = Number(all);
+        const label = `${Number.isFinite(d) ? d : 0}/${Number.isFinite(a) && a > 0 ? a : "?"}`;
+        if (!Number.isFinite(d) || !Number.isFinite(a) || a <= 0) return label;
+        const pct = Math.max(0, Math.min(100, Math.round((d / a) * 100)));
+        return `${label}<div class="job-progress-track"><div class="job-progress-fill" style="width:${pct}%"></div></div>`;
+      }
       function jobMsgCell(j) {
         const at = j.progress_at ? `<div class="job-msg-time">${esc(j.progress_at)}</div>` : "";
-        const body = esc((j.message || "").slice(0, 1200));
+        const body = esc(shortJobMessage(j.message));
         const title = esc(j.message || "");
-        return `<div class="job-msg" title="${title}">${at}${body}</div>`;
+        return `<div class="job-msg" title="${title}">${at}<span class="job-msg-main">${body || "—"}</span></div>`;
       }
       function jobTablesHaveActive(items) {
         return (items || []).some((j) => j.status === "QUEUED" || j.status === "RUNNING");
@@ -573,9 +637,9 @@
             api(`/api/admin/sync-jobs?limit=${JOB_LOG_LIMIT}`),
             api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() }),
           ]);
-          await loadImportJobs();
-          await loadSyncJobs();
-          await loadUpdateJobs();
+          renderImportJobs(imp.items || []);
+          renderSyncJobs(sync.items || []);
+          renderUpdateJobs(upd.items || []);
           const active =
             jobTablesHaveActive(imp.items) ||
             jobTablesHaveActive(sync.items) ||
@@ -593,11 +657,13 @@
       async function pollImportJob(jobId) {
         const msg = document.getElementById("jobMsg");
         const deadline = Date.now() + 120 * 60 * 1000;
+        let tick = 0;
         while (Date.now() < deadline) {
           const j = await api("/api/admin/import-jobs/" + encodeURIComponent(String(jobId)));
           const pat = j.progress_at ? ` · ${j.progress_at}` : "";
-          msg.textContent = `#${j.id} ${j.status}${pat} — ${j.message || ""}`;
-          await loadImportJobs();
+          msg.textContent = `#${j.id} ${j.status}${pat} — ${shortJobMessage(j.message)}`;
+          tick += 1;
+          if (tick === 1 || tick % JOB_TABLE_REFRESH_EVERY_TICKS === 0) await loadImportJobs();
           if (j.status === "QUEUED" || j.status === "RUNNING") {
             await maybeRefreshStrategyListDuringPoll();
           }
@@ -690,22 +756,25 @@
       </colgroup>`;
       async function loadImportJobs() {
         const d = await api(`/api/admin/import-jobs?limit=${JOB_LOG_LIMIT}`);
-        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
+        renderImportJobs(d.items || []);
+      }
+      function renderImportJobs(rows) {
+        const items = (rows || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("importJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
             <th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>进度</th><th>说明</th><th>操作</th>
           </tr></thead>
           <tbody>${items.map(j => {
-            const all = (() => { try { return JSON.parse(j.strategy_ids_json || "[]").length; } catch (_) { return "?"; } })();
-            const done = (() => { try { return JSON.parse(j.completed_strategy_ids_json || "[]").length; } catch (_) { return 0; } })();
+            const all = parseJsonArrayLength(j.strategy_ids_json, "?");
+            const done = parseJsonArrayLength(j.completed_strategy_ids_json, 0);
             const btn = j.resumable ? resumableJobButtons("resumeImportJob", "abandonImportJob", j.id) : "";
             return `<tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.import_mode)}</td>
-              <td class="col-meta">${esc(j.status)}</td>
+              <td class="col-meta">${jobStatusBadge(j.status)}</td>
               <td class="col-meta">${esc(j.started_at||"—")}</td>
-              <td class="col-meta">${done}/${all}</td>
+              <td class="col-meta">${progressCell(done, all)}</td>
               <td class="col-msg">${jobMsgCell(j)}</td>
               <td class="col-actions">${btn}</td></tr>`;
           }).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
@@ -713,13 +782,17 @@
       async function pollSyncJob(jobId) {
         const msg = document.getElementById("jobMsg");
         const deadline = Date.now() + 120 * 60 * 1000;
+        let tick = 0;
         while (Date.now() < deadline) {
           const st = await api("/api/admin/sync-jobs/" + encodeURIComponent(String(jobId)));
           const stg = st.stage ? ` · ${st.stage}` : "";
           const stt = st.progress_at ? ` · ${st.progress_at}` : (st.started_at ? ` · 开始 ${st.started_at}` : "");
-          msg.textContent = `#${st.id} ${st.status}${stg}${stt}${st.message ? " — " + st.message : ""}`;
-          await loadSyncJobs();
-          await loadUpdateJobs();
+          msg.textContent = `#${st.id} ${st.status}${stg}${stt}${st.message ? " — " + shortJobMessage(st.message) : ""}`;
+          tick += 1;
+          if (tick === 1 || tick % JOB_TABLE_REFRESH_EVERY_TICKS === 0) {
+            await loadSyncJobs();
+            await loadUpdateJobs();
+          }
           if (st.status === "QUEUED" || st.status === "RUNNING") {
             await maybeRefreshStrategyListDuringPoll();
           }
@@ -752,7 +825,10 @@
       }
       async function loadUpdateJobs() {
         const d = await api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() });
-        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
+        renderUpdateJobs(d.items || []);
+      }
+      function renderUpdateJobs(rows) {
+        const items = (rows || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("updateJobTb").innerHTML = `
           ${JOB_TABLE_COL_6}
           <thead><tr>
@@ -762,7 +838,7 @@
             <tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.job_type||"-")}</td>
-              <td class="col-meta">${esc(j.status)}</td>
+              <td class="col-meta">${jobStatusBadge(j.status)}</td>
               <td class="col-meta">${esc(j.triggered_by||"")}</td>
               <td class="col-msg">${jobMsgCell(j)}</td>
               <td class="col-meta">${esc(j.started_at||"")}</td>
@@ -771,7 +847,10 @@
       }
       async function loadSyncJobs() {
         const d = await api(`/api/admin/sync-jobs?limit=${JOB_LOG_LIMIT}`);
-        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
+        renderSyncJobs(d.items || []);
+      }
+      function renderSyncJobs(rows) {
+        const items = (rows || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("syncJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
@@ -782,7 +861,7 @@
             return `<tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.import_mode)}</td>
-              <td class="col-meta">${esc(j.status)}</td>
+              <td class="col-meta">${jobStatusBadge(j.status)}</td>
               <td class="col-meta">${esc(j.started_at||"—")}</td>
               <td class="col-meta">${esc(j.stage||"-")}</td>
               <td class="col-msg">${jobMsgCell(j)}</td>
@@ -812,6 +891,7 @@
           const deadline = Date.now() + 45 * 60 * 1000;
           while (Date.now() < deadline) {
             const jobs = await api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() });
+            renderUpdateJobs(jobs.items || []);
             const j = (jobs.items || []).find((x) => x.id === targetId);
             if (!j) {
               msg.textContent = `未找到任务 #${targetId}，稍后重试轮询…`;
@@ -819,8 +899,7 @@
               continue;
             }
             const pat = j.progress_at ? ` · ${j.progress_at}` : "";
-            msg.textContent = `#${j.id} ${j.status}${pat} — ${j.message || ""}`;
-            await loadUpdateJobs();
+            msg.textContent = `#${j.id} ${j.status}${pat} — ${shortJobMessage(j.message)}`;
             if (j.status === "RUNNING") {
               await maybeRefreshStrategyListDuringPoll();
             }
