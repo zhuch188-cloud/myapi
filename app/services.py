@@ -3527,14 +3527,21 @@ def abandon_older_admin_sync_jobs(db: Session, *, keep_job_id: int) -> None:
             UPDATE admin_sync_jobs
             SET status='FAILED',
                 checkpoint_json=NULL,
-                result_json='{{"resumable":false,"superseded":true}}',
+                result_json=:result_json,
                 finished_at={sql_now()},
                 message='Superseded by a newer sync job'
             WHERE id <> :keep
               AND status='FAILED'
             """
         ),
-        {"keep": int(keep_job_id)},
+        {
+            "keep": int(keep_job_id),
+            "result_json": json.dumps(
+                {"resumable": False, "superseded": True},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
     )
 
 
@@ -3629,13 +3636,21 @@ def abandon_admin_sync_job(db: Session, job_id: int) -> None:
             UPDATE admin_sync_jobs
             SET status='FAILED',
                 checkpoint_json=NULL,
-                result_json='{{"resumable":false,"abandoned":true}}',
+                result_json=:result_json,
                 finished_at={sql_now()},
                 message=:m
             WHERE id=:id
             """
         ),
-        {"m": "已放弃，不可续传", "id": job_id},
+        {
+            "m": "已放弃，不可续传",
+            "id": job_id,
+            "result_json": json.dumps(
+                {"resumable": False, "abandoned": True},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
     )
 
 
