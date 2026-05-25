@@ -420,6 +420,28 @@ def get_data_import_batch_row(db: Session, batch_id: int) -> dict[str, Any] | No
     return dict(row) if row else None
 
 
+def _resolve_batch_source_path(batch: dict[str, Any]) -> str:
+    path = str(batch.get("source_file_path") or "").strip()
+    if path and Path(path).is_file():
+        return path
+    code = str(batch.get("definition_code") or "").strip()
+    if not code:
+        return ""
+    try:
+        from app.server_files import resolve_supplement_import_path
+
+        fallback = default_company_profile_xlsx_path() if code == CODE_COMPANY_PROFILE_EXCEL else ""
+        resolved = resolve_supplement_import_path(
+            definition_code=code,
+            explicit_path=None,
+            default_file_path="",
+            fallback_path=fallback,
+        )
+        return str(resolved) if resolved and Path(resolved).is_file() else ""
+    except Exception:
+        return ""
+
+
 def batch_is_resumable(batch: dict[str, Any]) -> bool:
     st = str(batch.get("status") or "").upper()
     if st in ("SUCCESS", "ABANDONED"):
@@ -430,8 +452,7 @@ def batch_is_resumable(batch: dict[str, Any]) -> bool:
     rows_total = batch.get("rows_total")
     if rows_total is not None and resume_from >= int(rows_total):
         return False
-    path = (batch.get("source_file_path") or "").strip()
-    return bool(path and Path(path).is_file())
+    return bool(_resolve_batch_source_path(batch))
 
 
 def abandon_data_import_batch(db: Session, batch_id: int) -> None:
@@ -474,7 +495,11 @@ def resume_data_import_batch(db: Session, batch_id: int, actor_user_id: int | No
             if p.strip()
         ]
     code = str(batch.get("definition_code") or "").strip()
-    path = str(batch.get("source_file_path") or "").strip()
+    path = _resolve_batch_source_path(batch)
+    if not path:
+        raise DataImportBatchNotResumableError(
+            f"批次 #{batch_id} 不可续传：源文件不可用，请先上传对应文件"
+        )
     if code == CODE_COMPANY_PROFILE_EXCEL:
         return import_company_profile_excel(
             db,

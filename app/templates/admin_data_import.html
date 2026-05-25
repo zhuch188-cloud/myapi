@@ -77,6 +77,29 @@
         overflow: hidden;
       }
       .progress-fill { height: 100%; background: #2463eb; }
+      .batch-progress-panel {
+        display: none;
+        margin: 8px 0;
+        padding: 8px 10px;
+        border: 1px solid #dbe6ff;
+        border-radius: 8px;
+        background: #f8fbff;
+        line-height: 1.45;
+      }
+      .batch-progress-panel.active { display: block; }
+      .batch-progress-title {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 6px;
+        font-size: 12px;
+      }
+      .batch-progress-msg {
+        color: #475467;
+        font-size: 12px;
+        word-break: break-word;
+      }
     </style>
   </head>
   <body>
@@ -137,6 +160,7 @@
         <p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45">
           列「已扫行」与「写入成功」可能相差很大（大量行唯一键为空会计入「跳过」）。卡在某一数字时先看摘要是否含「正在写入远程库」。
         </p>
+        <div id="currentBatchProgress" class="batch-progress-panel"></div>
         <div class="scroll"><table id="batchTb"></table></div>
       </div>
     </div>
@@ -187,6 +211,33 @@
         if (rt == null || !Number.isFinite(rt) || rt <= 0) return esc(label);
         const pct = Math.max(0, Math.min(100, Math.round((rr / rt) * 100)));
         return `${esc(label)}<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>`;
+      }
+      function batchProgressPercent(b) {
+        const rt = b && b.rows_total != null ? Number(b.rows_total) : 0;
+        const rr = b ? Number(b.resume_from_row || 0) : 0;
+        if (!Number.isFinite(rt) || rt <= 0) return 0;
+        return Math.max(0, Math.min(100, Math.round((rr / rt) * 100)));
+      }
+      function renderCurrentBatchProgress(b) {
+        const el = document.getElementById("currentBatchProgress");
+        if (!el) return;
+        if (!b) {
+          el.classList.remove("active");
+          el.innerHTML = "";
+          return;
+        }
+        const pct = batchProgressPercent(b);
+        const rr = Number(b.resume_from_row || 0);
+        const rt = b.rows_total != null ? Number(b.rows_total) : null;
+        const scan = rt != null ? `${rr} / ${rt}` : String(rr);
+        el.classList.add("active");
+        el.innerHTML = `
+          <div class="batch-progress-title">
+            <span>批次 #${esc(b.id)} · ${statusBadge(b.status)} · 已扫行 ${esc(scan)} · 写入成功 ${esc(b.rows_ok ?? 0)} · 跳过 ${esc(b.rows_fail ?? 0)}</span>
+            <span>${pct}%</span>
+          </div>
+          <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+          <div class="batch-progress-msg">${esc(shortMessage(b.message)) || "—"}</div>`;
       }
       async function api(path, options = {}) {
         const opts = { ...options };
@@ -279,6 +330,7 @@
           msg.textContent = `已上传并覆盖：${body.path || ""}`;
           await loadDefinitions();
           await refreshServerFileStatus();
+          await loadBatches();
         } catch (e) {
           msg.textContent = formatFetchError(e);
         }
@@ -385,6 +437,7 @@
           const b = await fetchBatchById(batchId);
           if (i === 0 || i % 6 === 0) await loadBatches();
           if (b) {
+            renderCurrentBatchProgress(b);
             msg.textContent = formatBatchStatusLine(b, batchId);
             if (TERMINAL_BATCH.has(String(b.status || ""))) {
               highlightBatchId = 0;
@@ -406,6 +459,7 @@
           msg.textContent = "加载中…";
           await loadDefinitions();
           await loadBatches();
+          renderCurrentBatchProgress(null);
           msg.textContent = "";
         } catch (e) {
           msg.textContent = formatFetchError(e);
