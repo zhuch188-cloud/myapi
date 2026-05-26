@@ -177,8 +177,8 @@
           <button onclick="toggleAll(true)">全选</button>
           <button class="secondary" onclick="toggleAll(false)">清空</button>
           <button class="secondary" onclick="editSelectedStrategy()">编辑勾选项</button>
-          <button onclick="syncSelected('incremental')">增量导入并提取（勾选）</button>
-          <button class="secondary" onclick="syncSelected('full')">全量导入并提取（勾选）</button>
+          <button onclick="syncSelected('incremental')">增量净值+EOD（勾选）</button>
+          <button class="secondary" onclick="syncSelected('full')">全量净值+EOD（勾选）</button>
           <button class="secondary" onclick="importSelected('incremental')">仅增量导入 Excel（勾选）</button>
           <button class="secondary" onclick="importSelected('full')">仅全量导入 Excel（勾选）</button>
           <button class="secondary" onclick="updateLatestSelected()">仅更新最新交易日（勾选）</button>
@@ -191,7 +191,7 @@
           <span id="jobMsg" class="muted"></span>
         </div>
         <p class="muted" style="margin:0;font-size:12px;line-height:1.45;">
-          「导入并提取」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：仅最近一条可续传任务显示「续传」；新任务产生后，旧断点会自动作废。全量/增量指导入持仓表的方式，与是否重建净值无关（「导入并提取」会额外做净值与快照）。
+          「净值+EOD」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：仅最近一条可续传任务显示「续传」；新任务产生后，旧断点会自动作废。「净值+EOD」会跳过 Excel 导入，直接重建净值并写入最新交易日持仓快照。
         </p>
       </div>
       <div class="card">
@@ -203,7 +203,7 @@
         <div class="job-task-wrap"><table id="importJobTb" class="job-task-table"></table></div>
       </div>
       <div class="card">
-        <h4>导入并提取任务 <button type="button" class="secondary" onclick="loadSyncJobs()">刷新</button></h4>
+        <h4>净值+EOD任务 <button type="button" class="secondary" onclick="loadSyncJobs()">刷新</button></h4>
         <div class="job-task-wrap"><table id="syncJobTb" class="job-task-table"></table></div>
       </div>
       <div class="card">
@@ -422,7 +422,7 @@
         const msg = document.getElementById("jobMsg");
         if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
         try {
-          msg.textContent = `${importMode === "full" ? "全量" : "增量"}导入并提取已提交（${ids.length} 个策略）…`;
+          msg.textContent = `${importMode === "full" ? "全量" : "增量"}净值+EOD已提交（${ids.length} 个策略）…`;
           const ret = await api("/api/admin/sync", {
             method: "POST",
             body: JSON.stringify({ strategy_ids: ids, import_mode: importMode })
@@ -446,10 +446,10 @@
                 await loadSyncJobs();
                 const rj = parseSyncResultJson(st.result_json) || {};
                 if (!rj.ok) {
-                  const hint = st.resumable ? " — 可在下方「导入并提取任务」点续传" : "";
+                  const hint = st.resumable ? " — 可在下方「净值+EOD任务」点续传" : "";
                   msg.textContent = `执行失败（${rj.stage || st.stage || ""}）：${(rj.errors || []).join("；") || "未知原因"}${hint}`;
                 } else {
-                  msg.textContent = `执行成功：导入 ${rj.imported != null ? rj.imported : "—"} 个策略并完成最新交易日提取`;
+                  msg.textContent = `执行成功：已完成 ${ids.length} 个策略的净值与最新交易日EOD`;
                 }
                 await refreshStrategyListAfterJob();
                 return;
@@ -463,7 +463,7 @@
             msg.textContent = `执行失败（${ret.stage}）：${(ret.errors || []).join("；") || "未知原因"}`;
             return;
           }
-          msg.textContent = `执行成功：导入 ${ret.imported} 个策略并完成最新交易日提取`;
+          msg.textContent = `执行成功：已完成 ${ids.length} 个策略的净值与最新交易日EOD`;
           await refreshStrategyListAfterJob();
         } catch (e) { msg.textContent = formatFetchError(e); }
       }

@@ -4069,7 +4069,7 @@ def admin_sync(
     if row_run:
         raise HTTPException(
             status_code=409,
-            detail=f"已有「导入并提取」同步任务正在执行（admin_sync_jobs id={row_run[0]}），请待完成后再试。",
+            detail=f"已有「净值+EOD」任务正在执行（admin_sync_jobs id={row_run[0]}），请待完成后再试。",
         )
     row_q = db.execute(text("SELECT id FROM admin_sync_jobs WHERE status='QUEUED' LIMIT 1")).first()
     if row_q:

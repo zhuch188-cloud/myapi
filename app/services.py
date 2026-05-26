@@ -7218,7 +7218,7 @@ def execute_admin_sync_pipeline(
     resume: bool = False,
 ) -> dict:
     """
-    策略配置「导入并提取」一体化：导入 Excel → 重建净值 → 全量更新持仓快照。
+    策略配置「净值+EOD」一体化：跳过 Excel 导入 → 重建净值 → 全量更新持仓快照。
     与原先 admin_sync 同步逻辑一致；可选 sync_job_id 写入 admin_sync_jobs 进度。
     """
     ids = [str(x).strip() for x in selected_ids if str(x or "").strip()]
@@ -7252,7 +7252,8 @@ def execute_admin_sync_pipeline(
     completed_nav: set[str] = set()
     completed_update_rb: set[str] = set()
     ids_set = set(ids)
-    import_pending = True
+    skip_excel_import = True
+    import_pending = False
 
     with turso_stream_lock():
         db = SessionLocalFactory()
@@ -7286,7 +7287,7 @@ def execute_admin_sync_pipeline(
                 if completed_import:
                     p(
                         "resume",
-                        f"续传：导入 {len(completed_import)} 策略，净值 {len(completed_nav)}，"
+                        f"续传：净值 {len(completed_nav)} 策略，"
                         f"持仓快照调仓期 {len(completed_update_rb)} 个已完成",
                     )
             stale_mins = max(1, int(getattr(settings, "stale_running_update_job_minutes", 240)))
@@ -7327,7 +7328,11 @@ def execute_admin_sync_pipeline(
                         f"若确认无进程在跑，可将该条 status 改为 FAILED，或等待超过 {stale_mins} 分钟后重试。"
                     ],
                 }
-            import_pending = not (ids_set <= completed_import)
+            if skip_excel_import:
+                completed_import = set(ids_set)
+                import_pending = False
+            else:
+                import_pending = not (ids_set <= completed_import)
         except Exception as ex:
             try:
                 db.rollback()
@@ -7422,15 +7427,15 @@ def execute_admin_sync_pipeline(
         raise_if_shutting_down()
     else:
         imp = {
-            "imported": len(completed_import),
+            "imported": 0,
             "failed": 0,
             "errors": [],
-            "completed_strategy_ids": sorted(completed_import),
+            "completed_strategy_ids": sorted(ids_set),
         }
-        p("import", f"阶段1/3：导入已跳过（{len(completed_import)} 个策略已于断点完成）", detached=True)
+        p("import", f"阶段1/3：已跳过 Excel 导入，直接进入净值计算（{len(ids_set)} 个策略）", detached=True)
 
     t1 = float(settings.admin_sync_sleep_after_import_seconds or 0.0)
-    if t1 > 0:
+    if t1 > 0 and not skip_excel_import:
         p("import", f"导入完成，休眠 {t1}s 后进入净值…", detached=True)
         time.sleep(t1)
     gc.collect()
