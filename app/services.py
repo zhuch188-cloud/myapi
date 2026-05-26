@@ -6071,6 +6071,13 @@ def _rebuild_nav_for_strategy_yearly(
     bench_nav_acc: float | None = 1.0 if bench_code else None
     nav_accum: list[dict[str, Any]] = []
     td_i = 0
+    expected_rows = sum(
+        1
+        for d in trade_days_all
+        if append_after_c is None or d > append_after_c
+    )
+    generated_rows = 0
+    generated_last_c: str | None = None
     nav_bootstrapped = False
     if not nav_full_rebuild and append_after_c:
         last_nav_d_y = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
@@ -6253,6 +6260,8 @@ def _rebuild_nav_for_strategy_yearly(
                         "rb": current_rb,
                     }
                 )
+                generated_rows += 1
+                generated_last_c = td
             if len(nav_accum) >= nav_persist_chunk:
                 batch = nav_accum
 
@@ -6308,6 +6317,18 @@ def _rebuild_nav_for_strategy_yearly(
         return False, wind
     if append_after_c:
         _log.info("nav incremental %s: appended after %s through %s", sid, append_after_c, latest_trade_c)
+    if generated_rows < expected_rows or (
+        expected_rows > 0 and generated_last_c and generated_last_c < latest_trade_c
+    ):
+        _log.warning(
+            "nav %s: generated rows incomplete generated=%s expected=%s last=%s latest=%s",
+            sid,
+            generated_rows,
+            expected_rows,
+            generated_last_c,
+            latest_trade_c,
+        )
+        return False, wind
     nav_max_c = _strategy_nav_max_trade_compact(db, sid)
     if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
         _log.warning(
@@ -6578,6 +6599,13 @@ def _rebuild_nav_for_strategy(
     shares: dict[str, float] = {}
     last_close_fill: dict[str, float] = {}
     prev_mv: float | None = None
+    expected_rows = sum(
+        1
+        for d in trade_days
+        if append_after_c is None or d > append_after_c
+    )
+    generated_rows = 0
+    generated_last_c: str | None = None
     nav_bootstrapped = False
     if not nav_full_rebuild and append_after_c:
         boot = _nav_bootstrap_state_from_append_row(
@@ -6675,6 +6703,8 @@ def _rebuild_nav_for_strategy(
                     "rb": current_rb,
                 }
             )
+            generated_rows += 1
+            generated_last_c = td
         if len(nav_accum) >= nav_persist_chunk:
             _flush_strategy_nav_daily_batch(db, nav_accum)
             nav_accum.clear()
@@ -6690,6 +6720,18 @@ def _rebuild_nav_for_strategy(
         gc.collect()
     if append_after_c:
         _log.info("nav incremental %s: appended after %s through %s", sid, append_after_c, latest_trade_c)
+    if generated_rows < expected_rows or (
+        expected_rows > 0 and generated_last_c and generated_last_c < latest_trade_c
+    ):
+        _log.warning(
+            "nav %s: generated rows incomplete generated=%s expected=%s last=%s latest=%s",
+            sid,
+            generated_rows,
+            expected_rows,
+            generated_last_c,
+            latest_trade_c,
+        )
+        return False, wind
     nav_max_c = _strategy_nav_max_trade_compact(db, sid)
     if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
         _log.warning(
@@ -7231,6 +7273,16 @@ def execute_admin_sync_pipeline(
                 completed_update_rb = _sync_normalize_update_rb_done(
                     cp.get("completed_update_rb") or []
                 )
+                if str(import_mode or "").strip().lower() == "full" and completed_nav:
+                    # Full resume must rebuild NAV again. Older jobs may have
+                    # checkpointed a strategy after only checking the max NAV date,
+                    # preserving a broken middle gap.
+                    _log.warning(
+                        "admin_sync job %s: ignore completed_nav checkpoint on full resume: %s",
+                        sync_job_id,
+                        sorted(completed_nav),
+                    )
+                    completed_nav = set()
                 if completed_import:
                     p(
                         "resume",
