@@ -2586,6 +2586,28 @@ def _holding_union_codes_for_indices(
     return sorted(codes)
 
 
+def _latest_rebalance_stock_count(
+    rb_positions: list[tuple[date, list[dict[str, Any]]]],
+    *,
+    as_of: date | None = None,
+) -> int:
+    if not rb_positions:
+        return 0
+    chosen = rb_positions[-1]
+    if as_of is not None:
+        for item in reversed(rb_positions):
+            if item[0] <= as_of:
+                chosen = item
+                break
+    latest_positions = chosen[1] or []
+    codes = {
+        _wind_code_key(p["stock_code"])
+        for p in latest_positions
+        if p.get("stock_code")
+    }
+    return len(codes)
+
+
 def _holding_eod_start_for_indices(
     trade_date: date,
     rb_positions: list[tuple[date, list[dict[str, Any]]]],
@@ -2981,7 +3003,15 @@ def _run_update_try_build_work_item(
                 )
                 from app.strategy_list_metrics import refresh_strategy_list_metrics_safe
 
-                refresh_strategy_list_metrics_safe(db, sid, do_commit=do_commit)
+                refresh_strategy_list_metrics_safe(
+                    db,
+                    sid,
+                    do_commit=do_commit,
+                    stock_count_on_last_date=_latest_rebalance_stock_count(
+                        rb_positions, as_of=trade_date
+                    ),
+                    last_trade_date=trade_date.isoformat(),
+                )
                 return None
             _job_progress(
                 db,
@@ -4143,7 +4173,15 @@ def run_update(
             if skip_holdings:
                 from app.strategy_list_metrics import refresh_strategy_list_metrics_safe
 
-                refresh_strategy_list_metrics_safe(db, sid, do_commit=do_commit)
+                refresh_strategy_list_metrics_safe(
+                    db,
+                    sid,
+                    do_commit=do_commit,
+                    stock_count_on_last_date=_latest_rebalance_stock_count(
+                        rb_positions, as_of=trade_date
+                    ),
+                    last_trade_date=trade_date.isoformat(),
+                )
                 _release_run_update_strategy_memory(
                     eod_by_code={},
                     index_eod_by_code={},
@@ -4425,7 +4463,15 @@ def run_update(
                 db.commit()
             from app.strategy_list_metrics import refresh_strategy_list_metrics_safe
 
-            refresh_strategy_list_metrics_safe(db, sid, do_commit=do_commit)
+            refresh_strategy_list_metrics_safe(
+                db,
+                sid,
+                do_commit=do_commit,
+                stock_count_on_last_date=_latest_rebalance_stock_count(
+                    rb_positions, as_of=trade_date
+                ),
+                last_trade_date=trade_date.isoformat(),
+            )
             _release_run_update_strategy_memory(
                 eod_by_code=eod_by_code,
                 index_eod_by_code=index_eod_by_code,

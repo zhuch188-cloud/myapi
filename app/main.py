@@ -1472,54 +1472,6 @@ def _bind_date_compact(val: object | None) -> str | None:
     return s if len(s) == 8 and s.isdigit() else None
 
 
-def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> dict[str, dict]:
-    """净值表最后交易日 + 该日最新调仓期持仓股票数（日期比较用 compact，与排行榜一致）。"""
-    if not strategy_ids:
-        return {}
-    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in strategy_ids)
-    td_h = sql_date_compact_expr("h.trade_date")
-    td_n = sql_date_compact_expr("n.last_trade_date")
-    rb_h = sql_date_compact_expr("h.rebalance_date")
-    rb_x = sql_date_compact_expr("x.rebalance_date")
-    rows = db.execute(
-        text(
-            f"""
-            SELECT n.strategy_id AS strategy_id, n.last_trade_date AS last_trade_date,
-                   COUNT(DISTINCT h.stock_code) AS stock_cnt
-            FROM (
-                SELECT nd.strategy_id, nd.trade_date AS last_trade_date
-                FROM strategy_nav_daily nd
-                INNER JOIN (
-                    SELECT strategy_id, {sql_max_date_expr("trade_date")} AS mx
-                    FROM strategy_nav_daily
-                    WHERE strategy_id IN ({quoted})
-                    GROUP BY strategy_id
-                ) mm ON mm.strategy_id = nd.strategy_id
-                    AND {sql_date_compact_expr("nd.trade_date")} = mm.mx
-            ) n
-            LEFT JOIN strategy_holding_daily h
-              ON h.strategy_id = n.strategy_id
-             AND {td_h} = {td_n}
-             AND {rb_h} = (
-                    SELECT MAX({rb_x})
-                    FROM strategy_holding_daily x
-                    WHERE x.strategy_id = n.strategy_id
-                      AND {sql_date_compact_expr("x.trade_date")} = {td_n}
-                  )
-            GROUP BY n.strategy_id, n.last_trade_date
-            """
-        )
-    ).mappings().all()
-    out: dict[str, dict] = {}
-    for r in rows:
-        sid = str(r["strategy_id"])
-        td = r.get("last_trade_date")
-        out[sid] = {
-            "last_trade_date": str(td)[:10] if td is not None else None,
-            "stock_count": int(r["stock_cnt"] or 0),
-        }
-    return out
-
 
 _NAV_LIST_SUMMARY_EMPTY: dict[str, Any] = {
     "latest_nav": None,
