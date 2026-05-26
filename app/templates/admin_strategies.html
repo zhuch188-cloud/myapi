@@ -628,7 +628,11 @@
         return `<div class="job-msg" title="${title}">${at}<span class="job-msg-main">${body || "—"}</span></div>`;
       }
       function jobTablesHaveActive(items) {
-        return (items || []).some((j) => j.status === "QUEUED" || j.status === "RUNNING");
+        return (items || []).some((j) => {
+          const msg = String((j && j.message) || "");
+          const doneLike = msg.includes("全部完成") || msg.includes("鍏ㄩ儴瀹屾垚");
+          return (j.status === "QUEUED" || j.status === "RUNNING") && !doneLike;
+        });
       }
       async function refreshJobTablesIfActive() {
         try {
@@ -883,10 +887,11 @@
             }
             const pat = j.progress_at ? ` · ${j.progress_at}` : "";
             msg.textContent = `#${j.id} ${j.status}${pat} — ${shortJobMessage(j.message)}`;
-            if (j.status === "RUNNING") {
+            const doneLike = String(j.message || "").includes("全部完成") || String(j.message || "").includes("鍏ㄩ儴瀹屾垚");
+            if (j.status === "RUNNING" && !doneLike) {
               await maybeRefreshStrategyListDuringPoll();
             }
-            if (j.status !== "RUNNING") {
+            if (j.status !== "RUNNING" || doneLike) {
               await refreshStrategyListAfterJob();
               return;
             }

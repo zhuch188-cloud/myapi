@@ -4422,7 +4422,33 @@ def update_jobs(
         ),
         {"lim": int(limit)},
     ).mappings().all()
-    return {"items": [dict(r) for r in rows]}
+    items = [dict(r) for r in rows]
+    stuck_done_ids = [
+        int(x["id"])
+        for x in items
+        if str(x.get("status") or "").upper() == "RUNNING"
+        and (
+            "全部完成" in str(x.get("message") or "")
+            or "鍏ㄩ儴瀹屾垚" in str(x.get("message") or "")
+        )
+    ]
+    if stuck_done_ids:
+        quoted = ",".join(str(i) for i in stuck_done_ids)
+        db.execute(
+            text(
+                f"""
+                UPDATE strategy_update_jobs
+                SET status='SUCCESS', finished_at=COALESCE(finished_at, {sql_now()})
+                WHERE id IN ({quoted}) AND status='RUNNING'
+                """
+            )
+        )
+        db.commit()
+        for x in items:
+            if int(x.get("id") or 0) in stuck_done_ids:
+                x["status"] = "SUCCESS"
+                x["finished_at"] = x.get("finished_at") or x.get("progress_at")
+    return {"items": items}
 
 
 @app.post("/api/admin/smtp-test")
