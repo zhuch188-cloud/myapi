@@ -2586,7 +2586,7 @@ def _holding_union_codes_for_indices(
     return sorted(codes)
 
 
-def _latest_rebalance_stock_count(
+def _effective_rebalance_stock_count(
     rb_positions: list[tuple[date, list[dict[str, Any]]]],
     *,
     as_of: date | None = None,
@@ -3007,7 +3007,7 @@ def _run_update_try_build_work_item(
                     db,
                     sid,
                     do_commit=do_commit,
-                    stock_count_on_last_date=_latest_rebalance_stock_count(
+                    stock_count_on_last_date=_effective_rebalance_stock_count(
                         rb_positions, as_of=trade_date
                     ),
                     last_trade_date=trade_date.isoformat(),
@@ -3983,6 +3983,7 @@ def run_update(
 
     wind = None
     wind_merged: dict[str, Any] | None = None
+    work_items: list[dict[str, Any] | None] = []
 
     def prog(msg: str) -> None:
         _job_progress(db, job_id, msg, do_commit=do_commit, sync_job_id=sync_job_id)
@@ -4040,7 +4041,6 @@ def run_update(
             f"待处理策略数={len(configs)}"
         )
 
-        work_items: list[dict[str, Any] | None] = []
         for cfg in configs:
             work_items.append(
                 _run_update_try_build_work_item(
@@ -4177,7 +4177,7 @@ def run_update(
                     db,
                     sid,
                     do_commit=do_commit,
-                    stock_count_on_last_date=_latest_rebalance_stock_count(
+                    stock_count_on_last_date=_effective_rebalance_stock_count(
                         rb_positions, as_of=trade_date
                     ),
                     last_trade_date=trade_date.isoformat(),
@@ -4467,7 +4467,7 @@ def run_update(
                 db,
                 sid,
                 do_commit=do_commit,
-                stock_count_on_last_date=_latest_rebalance_stock_count(
+                stock_count_on_last_date=_effective_rebalance_stock_count(
                     rb_positions, as_of=trade_date
                 ),
                 last_trade_date=trade_date.isoformat(),
