@@ -204,6 +204,17 @@ def sql_trade_dates_range() -> str:
         """
 
 
+def sql_trade_calendar_range() -> str:
+    t = _tbl("asharecalendar")
+    return f"""
+        SELECT DISTINCT TRADE_DAYS AS d
+        FROM {t}
+        WHERE TRADE_DAYS >= :st AND TRADE_DAYS <= :ed
+          AND S_INFO_EXCHMARKET IN ('SSE', 'SZSE')
+        ORDER BY TRADE_DAYS ASC
+        """
+
+
 def sql_bulk_eod_range(quoted_codes: str) -> str:
     """
     一次拉取多只股票在 [st, td] 内的日频行情。

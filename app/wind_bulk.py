@@ -417,7 +417,7 @@ def fetch_trade_date_compacts(
         for attempt in range(_EOD_WIND_MAX_ATTEMPTS):
             try:
                 rows = w.execute(
-                    text(wind_sql.sql_trade_dates_range()),
+                    text(wind_sql.sql_trade_calendar_range()),
                     {"st": seg_st, "ed": seg_ed},
                 ).mappings().all()
                 combined.extend(_dt_compact(r["d"]) for r in rows)

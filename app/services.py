@@ -107,6 +107,63 @@ def _compact_date(v: object) -> str:
     return s[:8] if len(s) >= 8 else s.zfill(8)
 
 
+_NAV_MAX_TRADE_DAY_GAP_CALENDAR_DAYS = 12
+
+
+def _nav_large_trade_day_gap(
+    trade_days: list[str],
+    *,
+    max_calendar_days: int = _NAV_MAX_TRADE_DAY_GAP_CALENDAR_DAYS,
+) -> tuple[str, str, int] | None:
+    prev: date | None = None
+    prev_c = ""
+    for raw in trade_days:
+        c = str(raw or "").strip()[:8]
+        if len(c) < 8:
+            continue
+        try:
+            cur = datetime.strptime(c, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if prev is not None:
+            gap_days = (cur - prev).days
+            if gap_days > max_calendar_days:
+                return prev_c, c, gap_days
+        prev = cur
+        prev_c = c
+    return None
+
+
+def _nav_trade_days_continuous(
+    sid: str,
+    trade_days: list[str],
+    *,
+    label: str,
+    sync_job_id: int | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+    db: Session | None = None,
+    turso_remote: bool = False,
+) -> bool:
+    gap = _nav_large_trade_day_gap(trade_days)
+    if gap is None:
+        return True
+    prev_c, next_c, gap_days = gap
+    msg = (
+        f"{sid}：行情交易日列表异常断档 {prev_c}→{next_c}"
+        f"（{gap_days} 自然日，{label}），净值重建已停止"
+    )
+    _log.warning("nav %s: %s", sid, msg)
+    if sync_job_id is not None or progress_cb:
+        _nav_progress_touch(
+            msg,
+            sync_job_id=sync_job_id,
+            progress_cb=progress_cb,
+            db=None if turso_remote else db,
+            turso_remote=turso_remote,
+        )
+    return False
+
+
 def _wind_code_key(code) -> str:
     """与 Wind 行情 dict 查找统一（大小写、首尾空格）。"""
     if code is None:
@@ -5612,6 +5669,15 @@ def _rebuild_nav_incremental_from_current_period(
     sim_days = [d for d in trade_days if d > append_after_c]
     if not sim_days:
         return True, wind
+    if not _nav_trade_days_continuous(
+        sid,
+        [append_after_c, *sim_days],
+        label="incremental",
+        sync_job_id=sync_job_id,
+        progress_cb=progress_cb,
+        db=db,
+    ):
+        return False, wind
 
     period_codes = _nav_codes_for_incremental(
         rb_map, rb_sorted, anchor_rb, current_rb, last_nav_d, latest_d
@@ -5972,6 +6038,16 @@ def _rebuild_nav_for_strategy_yearly(
     )
     trade_days_all = [d for d in td_all if d >= start_c]
     if not trade_days_all:
+        return False, wind
+    if not _nav_trade_days_continuous(
+        sid,
+        trade_days_all,
+        label="yearly",
+        sync_job_id=sync_job_id,
+        progress_cb=progress_cb,
+        db=db,
+        turso_remote=turso_remote,
+    ):
         return False, wind
 
     nav_persist_chunk = max(50, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
@@ -6569,6 +6645,15 @@ def _rebuild_nav_for_strategy(
         wind, trade_days = wind_bulk.fetch_trade_date_compacts(wind, db, start_c, latest_trade_c)
 
     if not trade_days:
+        return False, wind
+    if not _nav_trade_days_continuous(
+        sid,
+        trade_days,
+        label="full",
+        sync_job_id=sync_job_id,
+        progress_cb=progress_cb,
+        db=db,
+    ):
         return False, wind
 
     day_map = _eod_dict_to_day_map(eod_by_code)
