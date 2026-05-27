@@ -2735,7 +2735,6 @@ def _build_holding_daily_row_from_wind(
     latest_trade: str,
     period_end_compact: str | None = None,
     desc_max_bars: int | None = None,
-    metric_eod_series: list | None = None,
 ) -> dict[str, Any]:
     """由 Wind 行情 + 单股 EOD 序列生成 strategy_holding_daily 一行（不含 latest_weight）。"""
     desc_n = int(desc_max_bars) if desc_max_bars is not None else 280
@@ -2771,19 +2770,21 @@ def _build_holding_daily_row_from_wind(
 
     if period_end_compact:
         asof_c = period_end_compact
+        seg = wind_bulk.series_on_or_before(eod_series, asof_c)
         period_end_px = wind_bulk.last_close_on_or_before(eod_series, asof_c)
         period_ret = _safe_return(period_end_px, period_start_close)
-        metric_series = metric_eod_series if metric_eod_series is not None else eod_series
-        day_ret = wind_bulk.day_return_adj_for_asof(metric_series, lt_compact)
-        if day_ret is None:
-            day_ret = _safe_return(latest_price, prev_close)
-        desc_closes = wind_bulk.closes_desc_from_asc(metric_series, desc_n)
-        latest_adj = desc_closes[0] if desc_closes else None
-        px = latest_adj if (latest_adj is not None and latest_adj > 0) else latest_price
-        ytd_close = wind_bulk.last_close_before_calendar_date(
-            metric_series, f"{trade_date.year}0101"
+        day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
+        desc_closes = wind_bulk.closes_desc_from_asc(seg, desc_n)
+        px = (
+            period_end_px
+            if period_end_px is not None and period_end_px > 0
+            else (desc_closes[0] if desc_closes else None)
         )
-        row_price = latest_price if latest_price > 0 else px
+        end_year = int(asof_c[:4])
+        ytd_close = wind_bulk.last_close_before_calendar_date(
+            seg, f"{end_year}0101"
+        )
+        row_price = px
     else:
         asof_c = lt_compact
         day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
@@ -4341,9 +4342,14 @@ def run_update(
                         )
                         continue
                     # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
-                    period_start_c = wind_bulk.holding_eod_start_for_period(
-                        trade_date, rebalance, full_refresh=full_refresh
-                    )
+                    if full_refresh and period_end_c:
+                        period_start_c = wind_bulk.bulk_eod_start_compact(
+                            period_end_c, rebalance
+                        )
+                    else:
+                        period_start_c = wind_bulk.holding_eod_start_for_period(
+                            trade_date, rebalance, full_refresh=full_refresh
+                        )
                     eod_load_end_c = period_end_c or str(latest_trade)
                     wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     prog(
@@ -4366,14 +4372,6 @@ def run_update(
                     wind, eod_part = wind_bulk.load_eod_by_code(
                         wind, period_codes, period_start_c, eod_load_end_c, db
                     )
-                    metric_eod_part: dict[str, list] | None = None
-                    if full_refresh and period_end_c:
-                        metric_start_c = wind_bulk.holding_eod_start_incremental(
-                            trade_date, rebalance
-                        )
-                        wind, metric_eod_part = wind_bulk.load_eod_by_code(
-                            wind, period_codes, metric_start_c, str(latest_trade), db
-                        )
                     for p in positions:
                         wk = _wind_code_key(p["stock_code"])
                         prepared_rows.append(
@@ -4387,18 +4385,11 @@ def run_update(
                                 latest_trade=str(latest_trade),
                                 period_end_compact=period_end_c,
                                 desc_max_bars=holding_desc_bars,
-                                metric_eod_series=(
-                                    metric_eod_part.get(wk) if metric_eod_part else None
-                                ),
                             )
                         )
                     quote_part.clear()
                     eod_part.clear()
-                    if metric_eod_part is not None:
-                        metric_eod_part.clear()
                     del eod_part
-                    if metric_eod_part is not None:
-                        del metric_eod_part
                     gc.collect()
                     _flush_one_rebalance(
                         i_rb,
