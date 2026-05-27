@@ -2760,6 +2760,40 @@ def _copy_holding_daily_rebalances(
     return int(res.rowcount or 0)
 
 
+def _holding_snapshot_complete(
+    db: Session,
+    *,
+    sid: str,
+    trade_date: date,
+    rebalance,
+    expected_codes: list[str] | set[str],
+) -> bool:
+    expected = {
+        _wind_code_key(c)
+        for c in expected_codes
+        if str(c or "").strip()
+    }
+    if not expected:
+        return False
+    row = db.execute(
+        text(
+            f"""
+            SELECT COUNT(DISTINCT stock_code) AS n
+            FROM strategy_holding_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("trade_date")} = :td
+              AND {sql_date_compact_expr("rebalance_date")} = :rb
+            """
+        ),
+        {
+            "sid": sid,
+            "td": _compact_date(trade_date),
+            "rb": _compact_date(rebalance),
+        },
+    ).mappings().first()
+    return int((row or {}).get("n") or 0) >= len(expected)
+
+
 def _flush_strategy_holding_daily_batch(db: Session, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -4334,6 +4368,7 @@ def run_update(
                 total_weight: float,
                 rb_compact: str,
                 wind_i: int,
+                expected_codes: list[str] | set[str],
             ) -> None:
                 n_written = _flush_rebalance_holding_period(
                     db,
@@ -4350,6 +4385,16 @@ def run_update(
                     f"调仓 {rebalance} 已写入 {n_written} 条"
                 )
                 if sync_job_id is not None and rb_compact:
+                    if not _holding_snapshot_complete(
+                        db,
+                        sid=sid,
+                        trade_date=trade_date,
+                        rebalance=rebalance,
+                        expected_codes=expected_codes,
+                    ):
+                        raise RuntimeError(
+                            f"{sid} 调仓 {rb_compact} 持仓快照未完整写入，未记录续传断点"
+                        )
                     _sync_mark_update_rb_done(
                         sync_job_id,
                         sid,
@@ -4376,7 +4421,22 @@ def run_update(
                         )
                         continue
                     rb_compact = _compact_date(rebalance)
-                    if rb_compact and rb_compact in skip_rb:
+                    checkpoint_codes = [
+                        _wind_code_key(p["stock_code"])
+                        for p in positions
+                        if p.get("stock_code")
+                    ]
+                    if (
+                        rb_compact
+                        and rb_compact in skip_rb
+                        and _holding_snapshot_complete(
+                            db,
+                            sid=sid,
+                            trade_date=trade_date,
+                            rebalance=rebalance,
+                            expected_codes=checkpoint_codes,
+                        )
+                    ):
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance} "
                             f"已跳过（断点已完成）"
@@ -4455,6 +4515,7 @@ def run_update(
                         total_weight,
                         rb_compact,
                         wind_i,
+                        period_codes,
                     )
                     prepared_rows.clear()
                 if sync_job_id is not None and do_commit:
@@ -4473,7 +4534,22 @@ def run_update(
                         )
                         continue
                     rb_compact = _compact_date(rebalance)
-                    if rb_compact and rb_compact in skip_rb:
+                    checkpoint_codes = [
+                        _wind_code_key(p["stock_code"])
+                        for p in positions
+                        if p.get("stock_code")
+                    ]
+                    if (
+                        rb_compact
+                        and rb_compact in skip_rb
+                        and _holding_snapshot_complete(
+                            db,
+                            sid=sid,
+                            trade_date=trade_date,
+                            rebalance=rebalance,
+                            expected_codes=checkpoint_codes,
+                        )
+                    ):
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] 调仓 {rebalance} "
                             f"已跳过（断点已完成）"
@@ -4512,6 +4588,7 @@ def run_update(
                         total_weight,
                         rb_compact,
                         wind_i,
+                        [_wind_code_key(p["stock_code"]) for p in positions if p.get("stock_code")],
                     )
                 if sync_job_id is not None and do_commit:
                     db.commit()
@@ -7364,20 +7441,16 @@ def execute_admin_sync_pipeline(
                 completed_update_rb = _sync_normalize_update_rb_done(
                     cp.get("completed_update_rb") or []
                 )
-                if str(import_mode or "").strip().lower() == "full" and (
-                    completed_nav or completed_update_rb
-                ):
-                    # Full resume must rebuild NAV and holding snapshots again.
-                    # A prior interrupted run may have checkpointed a strategy or
-                    # rebalance period while leaving a middle date range incomplete.
+                if str(import_mode or "").strip().lower() == "full" and completed_nav:
+                    # Full resume must rebuild NAV again. Holding snapshot
+                    # checkpoints are kept, but each skipped rebalance is
+                    # verified against the target snapshot before it is trusted.
                     _log.warning(
-                        "admin_sync job %s: ignore full-resume checkpoints nav=%s update_rb=%s",
+                        "admin_sync job %s: ignore completed_nav checkpoint on full resume: %s",
                         sync_job_id,
                         sorted(completed_nav),
-                        len(completed_update_rb),
                     )
                     completed_nav = set()
-                    completed_update_rb = set()
                 if completed_import:
                     p(
                         "resume",
