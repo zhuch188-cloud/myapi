@@ -4639,6 +4639,59 @@ def _strategy_nav_max_trade_compact(db: Session, sid: str) -> str | None:
     return c if len(c) >= 8 else None
 
 
+def _nav_db_covers_trade_days(
+    db: Session,
+    sid: str,
+    trade_days: list[str],
+    *,
+    label: str,
+    sync_job_id: int | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+    turso_remote: bool = False,
+) -> bool:
+    expected_days = sorted({str(d or "").strip()[:8] for d in trade_days if str(d or "").strip()})
+    expected_days = [d for d in expected_days if len(d) >= 8]
+    if not expected_days:
+        return False
+    first_c = expected_days[0]
+    last_c = expected_days[-1]
+    date_expr = sql_date_compact_expr("trade_date")
+    row = db.execute(
+        text(
+            f"""
+            SELECT COUNT(DISTINCT {date_expr}) AS cnt,
+                   MIN({date_expr}) AS min_d,
+                   MAX({date_expr}) AS max_d
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+              AND {date_expr} BETWEEN :first_c AND :last_c
+            """
+        ),
+        {"sid": sid, "first_c": first_c, "last_c": last_c},
+    ).mappings().first()
+    actual = int((row or {}).get("cnt") or 0)
+    min_d = str((row or {}).get("min_d") or "")
+    max_d = str((row or {}).get("max_d") or "")
+    expected = len(expected_days)
+    if actual == expected and min_d == first_c and max_d == last_c:
+        return True
+    msg = (
+        f"{sid}：净值覆盖校验失败（{label}），"
+        f"库内 {actual}/{expected} 个交易日，范围 {min_d or '-'}~{max_d or '-'}，"
+        f"应为 {first_c}~{last_c}"
+    )
+    _log.warning("nav %s: %s", sid, msg)
+    if sync_job_id is not None or progress_cb:
+        _nav_progress_touch(
+            msg,
+            sync_job_id=sync_job_id,
+            progress_cb=progress_cb,
+            db=None if turso_remote else db,
+            turso_remote=turso_remote,
+        )
+    return False
+
+
 def _nav_persist_after_compact(db: Session, sid: str, nav_full_rebuild: bool) -> str | None:
     """
     增量净值：返回已有最后交易日 compact；仅写入该日之后的交易日。
@@ -6410,6 +6463,16 @@ def _rebuild_nav_for_strategy_yearly(
             latest_trade_c,
         )
         return False, wind
+    if not _nav_db_covers_trade_days(
+        db,
+        sid,
+        trade_days_all,
+        label="yearly",
+        sync_job_id=sync_job_id,
+        progress_cb=progress_cb,
+        turso_remote=turso_remote,
+    ):
+        return False, wind
     nav_max_c = _strategy_nav_max_trade_compact(db, sid)
     if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
         _log.warning(
@@ -6822,6 +6885,15 @@ def _rebuild_nav_for_strategy(
             latest_trade_c,
         )
         return False, wind
+    if not _nav_db_covers_trade_days(
+        db,
+        sid,
+        trade_days,
+        label="full",
+        sync_job_id=sync_job_id,
+        progress_cb=progress_cb,
+    ):
+        return False, wind
     nav_max_c = _strategy_nav_max_trade_compact(db, sid)
     if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
         _log.warning(
@@ -7174,6 +7246,48 @@ def rebuild_nav_series(
         "completed_nav_ids": sorted(set(completed_nav)),
         "resumable": len(completed_nav) < len(sids),
     }, wind
+
+
+def _validate_nav_calendar_coverage_for_strategies(
+    db: Session,
+    wind: Any,
+    strategy_ids: list[str],
+    latest_trade_c: str,
+    *,
+    sync_job_id: int | None = None,
+) -> tuple[list[str], Any]:
+    ids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
+    if not ids:
+        return [], wind
+    plans = _batch_nav_mysql_plans(db, ids, "full")
+    errors: list[str] = []
+    for sid in ids:
+        pl = plans.get(sid)
+        start_c = str((pl or {}).get("start_c") or "").strip()[:8]
+        if len(start_c) < 8:
+            errors.append(f"{sid}: 无可用持仓起始日，无法校验净值覆盖")
+            continue
+        wind, trade_days = wind_bulk.fetch_trade_date_compacts(
+            wind, db, start_c, latest_trade_c
+        )
+        if not _nav_trade_days_continuous(
+            sid,
+            trade_days,
+            label="final",
+            sync_job_id=sync_job_id,
+            db=db,
+        ):
+            errors.append(f"{sid}: 交易日历异常")
+            continue
+        if not _nav_db_covers_trade_days(
+            db,
+            sid,
+            trade_days,
+            label="final",
+            sync_job_id=sync_job_id,
+        ):
+            errors.append(f"{sid}: 净值未覆盖完整交易日历")
+    return errors, wind
 
 
 def _admin_sync_mark_running(job_id: int, *, resume: bool = False) -> bool:
@@ -7574,6 +7688,45 @@ def execute_admin_sync_pipeline(
                 "failed": max(int(nav_ret.get("failed") or 0), len(missing_nav)),
                 "errors": nav_errors,
             }
+        if str(import_mode or "").strip().lower() == "full":
+            if wind is None:
+                p("nav", "阶段2/3：重新连接行情库，校验净值交易日覆盖…", detached=True)
+                wind = wind_sql.open_wind(None)
+            mtd_nav = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
+            latest_trade_c = _compact_date((mtd_nav or {}).get("d")) if mtd_nav else ""
+            if len(latest_trade_c) < 8:
+                return {
+                    "ok": False,
+                    "stage": "nav",
+                    "resumable": True,
+                    "imported": imp.get("imported", 0),
+                    "nav_rebuilt": nav_ret.get("rebuilt", 0),
+                    "failed": len(ids),
+                    "errors": ["无法取得最新交易日，净值覆盖校验失败"],
+                }
+            p("nav", "阶段2/3：校验净值是否覆盖完整交易日历…", detached=True)
+            with turso_stream_lock():
+                db_v = SessionLocalFactory()
+                try:
+                    coverage_errors, wind = _validate_nav_calendar_coverage_for_strategies(
+                        db_v,
+                        wind,
+                        ids,
+                        latest_trade_c,
+                        sync_job_id=sync_job_id,
+                    )
+                finally:
+                    db_v.close()
+            if coverage_errors:
+                return {
+                    "ok": False,
+                    "stage": "nav",
+                    "resumable": True,
+                    "imported": imp.get("imported", 0),
+                    "nav_rebuilt": nav_ret.get("rebuilt", 0),
+                    "failed": len(coverage_errors),
+                    "errors": coverage_errors,
+                }
         if sync_job_id is not None:
             with turso_stream_lock():
                 db_ck = SessionLocalFactory()
