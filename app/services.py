@@ -3325,6 +3325,7 @@ def _sync_load_checkpoint(raw: Any) -> dict[str, Any]:
             "completed_import": [],
             "completed_nav": [],
             "completed_update_rb": [],
+            "nav_progress": {},
             "stage": "import",
         }
     try:
@@ -3334,12 +3335,14 @@ def _sync_load_checkpoint(raw: Any) -> dict[str, Any]:
                 "completed_import": [],
                 "completed_nav": [],
                 "completed_update_rb": [],
+                "nav_progress": {},
                 "stage": "import",
             }
         return {
             "completed_import": _json_str_list(ck.get("completed_import")),
             "completed_nav": _json_str_list(ck.get("completed_nav")),
             "completed_update_rb": _json_str_list(ck.get("completed_update_rb")),
+            "nav_progress": ck.get("nav_progress") if isinstance(ck.get("nav_progress"), dict) else {},
             "stage": str(ck.get("stage") or "import"),
         }
     except json.JSONDecodeError:
@@ -3347,6 +3350,7 @@ def _sync_load_checkpoint(raw: Any) -> dict[str, Any]:
             "completed_import": [],
             "completed_nav": [],
             "completed_update_rb": [],
+            "nav_progress": {},
             "stage": "import",
         }
 
@@ -3359,6 +3363,7 @@ def _sync_save_checkpoint(
     completed_nav: list[str],
     stage: str,
     completed_update_rb: list[str] | None = None,
+    nav_progress: dict[str, Any] | None = None,
     do_commit: bool = True,
 ) -> None:
     payload: dict[str, Any] = {
@@ -3368,6 +3373,8 @@ def _sync_save_checkpoint(
     }
     if completed_update_rb is not None:
         payload["completed_update_rb"] = completed_update_rb
+    if nav_progress is not None:
+        payload["nav_progress"] = nav_progress
     body = json.dumps(payload, ensure_ascii=False)
     db.execute(
         text("UPDATE admin_sync_jobs SET checkpoint_json=:c WHERE id=:id"),
@@ -3375,6 +3382,91 @@ def _sync_save_checkpoint(
     )
     if do_commit:
         db.commit()
+
+
+def _sync_nav_progress_map(raw: Any) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for sid_raw, val in raw.items():
+        sid = str(sid_raw or "").strip()
+        if not sid or not isinstance(val, dict):
+            continue
+        last_done = str(val.get("last_done") or "").strip().replace("-", "")[:8]
+        start = str(val.get("start") or "").strip().replace("-", "")[:8]
+        latest = str(val.get("latest") or "").strip().replace("-", "")[:8]
+        if len(last_done) == 8 and last_done.isdigit():
+            item: dict[str, str] = {"last_done": last_done}
+            if len(start) == 8 and start.isdigit():
+                item["start"] = start
+            if len(latest) == 8 and latest.isdigit():
+                item["latest"] = latest
+            out[sid] = item
+    return out
+
+
+def _sync_nav_progress_for_strategy(
+    sync_job_id: int | None,
+    strategy_id: str,
+    *,
+    db: Session,
+) -> dict[str, str]:
+    if sync_job_id is None:
+        return {}
+    row = (
+        db.execute(
+            text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+            {"id": sync_job_id},
+        )
+        .mappings()
+        .first()
+    )
+    cp = _sync_load_checkpoint(row.get("checkpoint_json") if row else None)
+    progress = _sync_nav_progress_map(cp.get("nav_progress"))
+    return progress.get(str(strategy_id or "").strip(), {})
+
+
+def _sync_mark_nav_progress(
+    sync_job_id: int | None,
+    strategy_id: str,
+    last_done: str | None,
+    *,
+    start_c: str,
+    latest_c: str,
+    db: Session,
+    do_commit: bool = True,
+) -> None:
+    if sync_job_id is None or not last_done:
+        return
+    sid = str(strategy_id or "").strip()
+    last_c = str(last_done or "").strip().replace("-", "")[:8]
+    if not sid or len(last_c) != 8 or not last_c.isdigit():
+        return
+    row = (
+        db.execute(
+            text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+            {"id": sync_job_id},
+        )
+        .mappings()
+        .first()
+    )
+    cp = _sync_load_checkpoint(row.get("checkpoint_json") if row else None)
+    progress = _sync_nav_progress_map(cp.get("nav_progress"))
+    progress[sid] = {
+        "last_done": last_c,
+        "start": str(start_c or "").strip().replace("-", "")[:8],
+        "latest": str(latest_c or "").strip().replace("-", "")[:8],
+    }
+    _sync_save_checkpoint(
+        db,
+        sync_job_id,
+        completed_import=list(cp.get("completed_import") or []),
+        completed_nav=list(cp.get("completed_nav") or []),
+        completed_update_rb=list(cp.get("completed_update_rb") or []),
+        nav_progress=progress,
+        stage="nav",
+        do_commit=do_commit,
+    )
 
 
 def _sync_update_rb_key(strategy_id: str, rb_compact: str) -> str:
@@ -3456,6 +3548,7 @@ def _sync_mark_update_rb_done(
             completed_import=list(cp.get("completed_import") or []),
             completed_nav=list(cp.get("completed_nav") or []),
             completed_update_rb=sorted(done),
+            nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
             stage="update",
             do_commit=do_commit,
         )
@@ -3978,6 +4071,7 @@ def import_strategy_files(
                     completed_import=done_list,
                     completed_nav=cp.get("completed_nav") or [],
                     completed_update_rb=cp.get("completed_update_rb") or [],
+                    nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
                     stage="import",
                     do_commit=do_commit,
                 )
@@ -6158,7 +6252,17 @@ def _rebuild_nav_for_strategy_yearly(
         ),
         force=True,
     )
-    append_after_c = _nav_persist_after_compact(db, sid, nav_full_rebuild)
+    resume_after_c: str | None = None
+    if nav_full_rebuild and sync_job_id is not None:
+        progress = _sync_nav_progress_for_strategy(sync_job_id, sid, db=db)
+        last_done = str(progress.get("last_done") or "").strip().replace("-", "")[:8]
+        if (
+            len(last_done) == 8
+            and last_done.isdigit()
+            and start_c <= last_done <= latest_trade_c
+        ):
+            resume_after_c = last_done
+    append_after_c = resume_after_c or _nav_persist_after_compact(db, sid, nav_full_rebuild)
     if append_after_c and append_after_c >= latest_trade_c:
         _log.info("nav incremental %s: already through %s", sid, append_after_c)
         if sync_job_id is not None or progress_cb:
@@ -6206,10 +6310,22 @@ def _rebuild_nav_for_strategy_yearly(
             try:
 
                 def _delete_nav(sess: Session) -> None:
-                    sess.execute(
-                        text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"),
-                        {"sid": sid},
-                    )
+                    if resume_after_c:
+                        sess.execute(
+                            text(
+                                f"""
+                                DELETE FROM strategy_nav_daily
+                                WHERE strategy_id=:sid
+                                  AND {sql_date_compact_expr("trade_date")} > :resume_after
+                                """
+                            ),
+                            {"sid": sid, "resume_after": resume_after_c},
+                        )
+                    else:
+                        sess.execute(
+                            text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"),
+                            {"sid": sid},
+                        )
                     sess.commit()
 
                 _locked_db_op(_delete_nav)
@@ -6237,7 +6353,7 @@ def _rebuild_nav_for_strategy_yearly(
     generated_rows = 0
     generated_last_c: str | None = None
     nav_bootstrapped = False
-    if not nav_full_rebuild and append_after_c:
+    if append_after_c:
         last_nav_d_y = datetime.strptime(append_after_c[:8], "%Y%m%d").date()
         rb_idx, current_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d_y)
     bench_quads: list = []
@@ -6307,8 +6423,7 @@ def _rebuild_nav_for_strategy_yearly(
         )
 
         if (
-            not nav_full_rebuild
-            and append_after_c
+            append_after_c
             and not nav_bootstrapped
             and append_after_c in day_map
         ):
@@ -6342,7 +6457,7 @@ def _rebuild_nav_for_strategy_yearly(
         for td in seg_days:
             if td_i % 15 == 0:
                 raise_if_shutting_down()
-            if not nav_full_rebuild and append_after_c and td <= append_after_c:
+            if append_after_c and td <= append_after_c:
                 continue
             td_i += 1
             if sync_job_id is not None or progress_cb:
@@ -6428,6 +6543,18 @@ def _rebuild_nav_for_strategy_yearly(
                     sess.commit()
 
                 _locked_db_op(_flush_chunk)
+                if sync_job_id is not None:
+                    _locked_db_op(
+                        lambda sess: _sync_mark_nav_progress(
+                            sync_job_id,
+                            sid,
+                            td,
+                            start_c=start_c,
+                            latest_c=latest_trade_c,
+                            db=sess,
+                            do_commit=True,
+                        )
+                    )
                 _log_runtime_progress(
                     f"nav:{sid}",
                     f"nav {sid}: flushed {len(batch)} rows through {td}",
@@ -6457,6 +6584,18 @@ def _rebuild_nav_for_strategy_yearly(
             sess.commit()
 
         _locked_db_op(_flush_tail)
+        if sync_job_id is not None and generated_last_c:
+            _locked_db_op(
+                lambda sess: _sync_mark_nav_progress(
+                    sync_job_id,
+                    sid,
+                    generated_last_c,
+                    start_c=start_c,
+                    latest_c=latest_trade_c,
+                    db=sess,
+                    do_commit=True,
+                )
+            )
         _log_runtime_progress(
             f"nav:{sid}",
             f"nav {sid}: flushed tail {len(batch)} rows",
@@ -6466,7 +6605,7 @@ def _rebuild_nav_for_strategy_yearly(
     shares.clear()
     last_close_fill.clear()
     gc.collect()
-    if not nav_full_rebuild and append_after_c and not nav_bootstrapped:
+    if append_after_c and not nav_bootstrapped:
         _log.warning(
             "nav incremental %s: yearly replay never bootstrapped from %s (nav×本金)",
             sid,
@@ -6602,7 +6741,17 @@ def _rebuild_nav_for_strategy(
         if len(latest_trade_c) < 8:
             latest_trade_c = str(latest_trade).strip().replace("-", "")[:8]
 
-    append_after_c = _nav_persist_after_compact(db, sid, nav_full_rebuild)
+    resume_after_c: str | None = None
+    if nav_full_rebuild and sync_job_id is not None:
+        progress = _sync_nav_progress_for_strategy(sync_job_id, sid, db=db)
+        last_done = str(progress.get("last_done") or "").strip().replace("-", "")[:8]
+        if (
+            len(last_done) == 8
+            and last_done.isdigit()
+            and start_c <= last_done <= latest_trade_c
+        ):
+            resume_after_c = last_done
+    append_after_c = resume_after_c or _nav_persist_after_compact(db, sid, nav_full_rebuild)
     if append_after_c and append_after_c >= latest_trade_c:
         _log.info("nav incremental %s: already through %s", sid, append_after_c)
         return True, wind
@@ -6748,9 +6897,21 @@ def _rebuild_nav_for_strategy(
     if nav_full_rebuild:
         for attempt in range(4):
             try:
-                db.execute(
-                    text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid}
-                )
+                if resume_after_c:
+                    db.execute(
+                        text(
+                            f"""
+                            DELETE FROM strategy_nav_daily
+                            WHERE strategy_id=:sid
+                              AND {sql_date_compact_expr("trade_date")} > :resume_after
+                            """
+                        ),
+                        {"sid": sid, "resume_after": resume_after_c},
+                    )
+                else:
+                    db.execute(
+                        text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": sid}
+                    )
                 break
             except OperationalError as oe:
                 if not _mysql_lock_contention(oe) or attempt >= 3:
@@ -6774,7 +6935,7 @@ def _rebuild_nav_for_strategy(
     generated_rows = 0
     generated_last_c: str | None = None
     nav_bootstrapped = False
-    if not nav_full_rebuild and append_after_c:
+    if append_after_c:
         boot = _nav_bootstrap_state_from_append_row(
             db,
             sid,
@@ -6809,7 +6970,7 @@ def _rebuild_nav_for_strategy(
             )
             return False, wind
     for i_td, td in enumerate(trade_days):
-        if not nav_full_rebuild and append_after_c and td <= append_after_c:
+        if append_after_c and td <= append_after_c:
             continue
         rb_idx_at_start = rb_idx
         td_date = datetime.strptime(td, "%Y%m%d").date()
@@ -6874,9 +7035,29 @@ def _rebuild_nav_for_strategy(
             generated_last_c = td
         if len(nav_accum) >= nav_persist_chunk:
             _flush_strategy_nav_daily_batch(db, nav_accum)
+            db.commit()
+            _sync_mark_nav_progress(
+                sync_job_id,
+                sid,
+                td,
+                start_c=start_c,
+                latest_c=latest_trade_c,
+                db=db,
+                do_commit=True,
+            )
             nav_accum.clear()
     if nav_accum:
         _flush_strategy_nav_daily_batch(db, nav_accum)
+        db.commit()
+        _sync_mark_nav_progress(
+            sync_job_id,
+            sid,
+            generated_last_c,
+            start_c=start_c,
+            latest_c=latest_trade_c,
+            db=db,
+            do_commit=True,
+        )
         nav_accum.clear()
     if _wind_low_memory_mode():
         day_map.clear()
@@ -7115,6 +7296,7 @@ def rebuild_nav_series(
                                         [] if mode_l == "full" else sorted(set(completed_nav))
                                     ),
                                     completed_update_rb=cp.get("completed_update_rb") or [],
+                                    nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
                                     stage="nav",
                                     do_commit=False,
                                 )
@@ -7183,6 +7365,7 @@ def rebuild_nav_series(
                                 [] if mode_l == "full" else sorted(set(completed_nav))
                             ),
                             completed_update_rb=cp.get("completed_update_rb") or [],
+                            nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
                             stage="nav",
                             do_commit=False,
                         )
@@ -7662,6 +7845,15 @@ def execute_admin_sync_pipeline(
             with turso_stream_lock():
                 db_ck = SessionLocalFactory()
                 try:
+                    ck_row = (
+                        db_ck.execute(
+                            text("SELECT checkpoint_json FROM admin_sync_jobs WHERE id=:id"),
+                            {"id": sync_job_id},
+                        )
+                        .mappings()
+                        .first()
+                    )
+                    cp = _sync_load_checkpoint(ck_row.get("checkpoint_json") if ck_row else None)
                     _sync_save_checkpoint(
                         db_ck,
                         sync_job_id,
@@ -7672,6 +7864,7 @@ def execute_admin_sync_pipeline(
                             else sorted(completed_nav)
                         ),
                         completed_update_rb=sorted(completed_update_rb),
+                        nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
                         stage="update",
                         do_commit=True,
                     )
