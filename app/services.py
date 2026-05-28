@@ -7024,6 +7024,9 @@ def rebuild_nav_series(
         )
 
     skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
+    if mode_l == "full" and skip:
+        _log.warning("nav full rebuild ignores completed_nav checkpoints: %s", sorted(skip))
+        skip = set()
     done = len(skip)
     failed = 0
     errors: list[str] = []
@@ -7108,7 +7111,9 @@ def rebuild_nav_series(
                                     sdb,
                                     sync_job_id,
                                     completed_import=cp.get("completed_import") or [],
-                                    completed_nav=sorted(set(completed_nav)),
+                                    completed_nav=(
+                                        [] if mode_l == "full" else sorted(set(completed_nav))
+                                    ),
                                     completed_update_rb=cp.get("completed_update_rb") or [],
                                     stage="nav",
                                     do_commit=False,
@@ -7174,7 +7179,9 @@ def rebuild_nav_series(
                             db,
                             sync_job_id,
                             completed_import=cp.get("completed_import") or [],
-                            completed_nav=sorted(set(completed_nav)),
+                            completed_nav=(
+                                [] if mode_l == "full" else sorted(set(completed_nav))
+                            ),
                             completed_update_rb=cp.get("completed_update_rb") or [],
                             stage="nav",
                             do_commit=False,
@@ -7659,7 +7666,11 @@ def execute_admin_sync_pipeline(
                         db_ck,
                         sync_job_id,
                         completed_import=sorted(completed_import),
-                        completed_nav=sorted(completed_nav),
+                        completed_nav=(
+                            []
+                            if str(import_mode or "").strip().lower() == "full"
+                            else sorted(completed_nav)
+                        ),
                         completed_update_rb=sorted(completed_update_rb),
                         stage="update",
                         do_commit=True,
