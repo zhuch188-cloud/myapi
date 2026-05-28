@@ -4810,6 +4810,56 @@ def _strategy_nav_max_trade_compact(db: Session, sid: str) -> str | None:
     return c if len(c) >= 8 else None
 
 
+def _strategy_nav_trade_day_count(
+    db: Session,
+    sid: str,
+    start_c: str,
+    end_c: str,
+) -> int:
+    if not sid or not start_c or not end_c:
+        return 0
+    row = db.execute(
+        text(
+            f"""
+            SELECT COUNT(DISTINCT {sql_date_compact_expr("trade_date")}) AS n
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("trade_date")} BETWEEN :start_c AND :end_c
+            """
+        ),
+        {"sid": sid, "start_c": start_c[:8], "end_c": end_c[:8]},
+    ).mappings().first()
+    try:
+        return int((row or {}).get("n") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _nav_stored_range_complete(
+    db: Session,
+    sid: str,
+    start_c: str,
+    end_c: str,
+    trade_days: list[str],
+    *,
+    label: str,
+) -> bool:
+    expected = sum(1 for d in trade_days if start_c <= d <= end_c)
+    actual = _strategy_nav_trade_day_count(db, sid, start_c, end_c)
+    if actual == expected:
+        return True
+    _log.warning(
+        "nav %s: stored range incomplete for %s %s..%s actual=%s expected=%s",
+        sid,
+        label,
+        start_c,
+        end_c,
+        actual,
+        expected,
+    )
+    return False
+
+
 def _nav_persist_after_compact(db: Session, sid: str, nav_full_rebuild: bool) -> str | None:
     """
     增量净值：返回已有最后交易日 compact；仅写入该日之后的交易日。
@@ -6256,13 +6306,53 @@ def _rebuild_nav_for_strategy_yearly(
     if nav_full_rebuild and sync_job_id is not None:
         progress = _sync_nav_progress_for_strategy(sync_job_id, sid, db=db)
         last_done = str(progress.get("last_done") or "").strip().replace("-", "")[:8]
+        progress_start = str(progress.get("start") or "").strip().replace("-", "")[:8]
+        progress_latest = str(progress.get("latest") or "").strip().replace("-", "")[:8]
         if (
             len(last_done) == 8
             and last_done.isdigit()
+            and progress_start == start_c
+            and progress_latest == latest_trade_c
             and start_c <= last_done <= latest_trade_c
         ):
-            resume_after_c = last_done
+            if _nav_stored_range_complete(
+                db,
+                sid,
+                start_c,
+                last_done,
+                trade_days_all,
+                label="full-resume-prefix",
+            ):
+                resume_after_c = last_done
+            else:
+                _log.warning(
+                    "nav %s: ignore invalid full resume checkpoint at %s",
+                    sid,
+                    last_done,
+                )
     append_after_c = resume_after_c or _nav_persist_after_compact(db, sid, nav_full_rebuild)
+    if append_after_c and append_after_c >= latest_trade_c:
+        if nav_full_rebuild and not _nav_stored_range_complete(
+            db,
+            sid,
+            start_c,
+            latest_trade_c,
+            trade_days_all,
+            label="full-resume-complete",
+        ):
+            resume_after_c = None
+            append_after_c = None
+        else:
+            _log.info("nav incremental %s: already through %s", sid, append_after_c)
+            if sync_job_id is not None or progress_cb:
+                _nav_progress_touch(
+                    f"闃舵2/3 {sid}锛氬噣鍊煎凡鑷?{append_after_c}锛屾棤闇€琛ョ畻",
+                    sync_job_id=sync_job_id,
+                    progress_cb=progress_cb,
+                    db=None if turso_remote else db,
+                    turso_remote=turso_remote,
+                )
+            return True, wind
     if append_after_c and append_after_c >= latest_trade_c:
         _log.info("nav incremental %s: already through %s", sid, append_after_c)
         if sync_job_id is not None or progress_cb:
@@ -6626,6 +6716,15 @@ def _rebuild_nav_for_strategy_yearly(
             latest_trade_c,
         )
         return False, wind
+    if nav_full_rebuild and not _nav_stored_range_complete(
+        db,
+        sid,
+        start_c,
+        latest_trade_c,
+        trade_days_all,
+        label="full-final",
+    ):
+        return False, wind
     nav_max_c = _strategy_nav_max_trade_compact(db, sid)
     if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
         _log.warning(
@@ -6745,14 +6844,18 @@ def _rebuild_nav_for_strategy(
     if nav_full_rebuild and sync_job_id is not None:
         progress = _sync_nav_progress_for_strategy(sync_job_id, sid, db=db)
         last_done = str(progress.get("last_done") or "").strip().replace("-", "")[:8]
+        progress_start = str(progress.get("start") or "").strip().replace("-", "")[:8]
+        progress_latest = str(progress.get("latest") or "").strip().replace("-", "")[:8]
         if (
             len(last_done) == 8
             and last_done.isdigit()
+            and progress_start == start_c
+            and progress_latest == latest_trade_c
             and start_c <= last_done <= latest_trade_c
         ):
             resume_after_c = last_done
     append_after_c = resume_after_c or _nav_persist_after_compact(db, sid, nav_full_rebuild)
-    if append_after_c and append_after_c >= latest_trade_c:
+    if append_after_c and append_after_c >= latest_trade_c and not resume_after_c:
         _log.info("nav incremental %s: already through %s", sid, append_after_c)
         return True, wind
 
@@ -6881,6 +6984,34 @@ def _rebuild_nav_for_strategy(
         db=db,
     ):
         return False, wind
+    if resume_after_c:
+        if not _nav_stored_range_complete(
+            db,
+            sid,
+            start_c,
+            resume_after_c,
+            trade_days,
+            label="full-resume-prefix",
+        ):
+            _log.warning(
+                "nav %s: ignore invalid full resume checkpoint at %s",
+                sid,
+                resume_after_c,
+            )
+            resume_after_c = None
+            append_after_c = None
+        elif resume_after_c >= latest_trade_c:
+            if _nav_stored_range_complete(
+                db,
+                sid,
+                start_c,
+                latest_trade_c,
+                trade_days,
+                label="full-resume-complete",
+            ):
+                return True, wind
+            resume_after_c = None
+            append_after_c = None
 
     day_map = _eod_dict_to_day_map(eod_by_code)
     bench_quads = _bench_quads_for_code(index_eod_by_code, bench_code)
@@ -7079,6 +7210,15 @@ def _rebuild_nav_for_strategy(
             generated_last_c,
             latest_trade_c,
         )
+        return False, wind
+    if nav_full_rebuild and not _nav_stored_range_complete(
+        db,
+        sid,
+        start_c,
+        latest_trade_c,
+        trade_days,
+        label="full-final",
+    ):
         return False, wind
     nav_max_c = _strategy_nav_max_trade_compact(db, sid)
     if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
