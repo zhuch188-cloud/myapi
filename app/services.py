@@ -4761,7 +4761,7 @@ def run_update(
 
 
 # 净值日序列写入：逐条 INSERT 时 MySQL 往返次数 ≈ 交易日数；批量 executemany 可显著降低耗时
-_NAV_INSERT_CHUNK = 400
+_NAV_INSERT_CHUNK = 80
 
 _NAV_INSERT_SQL = text(
     """
@@ -4787,6 +4787,47 @@ def _flush_strategy_nav_daily_batch(db: Session, acc: list[dict[str, Any]]) -> N
     for i in range(0, len(acc), _NAV_INSERT_CHUNK):
         chunk = acc[i : i + _NAV_INSERT_CHUNK]
         db.execute(_NAV_INSERT_SQL, chunk)
+
+
+def _flush_strategy_nav_daily_batch_verified(
+    db: Session,
+    acc: list[dict[str, Any]],
+    *,
+    sid: str,
+    expected_trade_days: set[str],
+) -> None:
+    if not acc:
+        return
+    batch_days = {
+        _compact_date(row.get("td"))
+        for row in acc
+        if row.get("td") is not None and _compact_date(row.get("td"))
+    }
+    if not batch_days:
+        _flush_strategy_nav_daily_batch(db, acc)
+        return
+    start_c = min(batch_days)
+    end_c = max(batch_days)
+    expected = sum(1 for d in expected_trade_days if start_c <= d <= end_c)
+    for attempt in range(2):
+        _flush_strategy_nav_daily_batch(db, acc)
+        db.commit()
+        actual = _strategy_nav_trade_day_count(db, sid, start_c, end_c)
+        if actual >= expected:
+            return
+        _log.warning(
+            "nav %s: flush verify short %s..%s actual=%s expected=%s attempt=%s",
+            sid,
+            start_c,
+            end_c,
+            actual,
+            expected,
+            attempt + 1,
+        )
+    raise RuntimeError(
+        f"nav {sid}: persisted rows incomplete for {start_c}..{end_c} "
+        f"({actual}/{expected})"
+    )
 
 
 def _strategy_nav_max_trade_compact(db: Session, sid: str) -> str | None:
@@ -6260,6 +6301,7 @@ def _rebuild_nav_for_strategy_yearly(
     trade_days_all = [d for d in td_all if d >= start_c]
     if not trade_days_all:
         return False, wind
+    trade_days_expected_set = set(trade_days_all)
     if not _nav_trade_days_continuous(
         sid,
         trade_days_all,
@@ -6515,8 +6557,16 @@ def _rebuild_nav_for_strategy_yearly(
         if (
             append_after_c
             and not nav_bootstrapped
-            and append_after_c in day_map
+            and seg_st <= append_after_c <= seg_ed
         ):
+            if not _eod_day_map_has_trade(day_map, append_after_c, seg_codes):
+                def _ensure_anchor(sess: Session) -> None:
+                    nonlocal wind
+                    wind = _nav_ensure_anchor_eod_in_day_map(
+                        wind, sess, day_map, seg_codes, append_after_c
+                    )
+
+                _locked_db_op(_ensure_anchor)
             boot = _nav_bootstrap_state_from_append_row(
                 db,
                 sid,
@@ -6629,8 +6679,12 @@ def _rebuild_nav_for_strategy_yearly(
                 batch = nav_accum
 
                 def _flush_chunk(sess: Session) -> None:
-                    _flush_strategy_nav_daily_batch(sess, batch)
-                    sess.commit()
+                    _flush_strategy_nav_daily_batch_verified(
+                        sess,
+                        batch,
+                        sid=sid,
+                        expected_trade_days=trade_days_expected_set,
+                    )
 
                 _locked_db_op(_flush_chunk)
                 if sync_job_id is not None:
@@ -6670,8 +6724,12 @@ def _rebuild_nav_for_strategy_yearly(
         batch = nav_accum
 
         def _flush_tail(sess: Session) -> None:
-            _flush_strategy_nav_daily_batch(sess, batch)
-            sess.commit()
+            _flush_strategy_nav_daily_batch_verified(
+                sess,
+                batch,
+                sid=sid,
+                expected_trade_days=trade_days_expected_set,
+            )
 
         _locked_db_op(_flush_tail)
         if sync_job_id is not None and generated_last_c:
@@ -6984,6 +7042,7 @@ def _rebuild_nav_for_strategy(
         db=db,
     ):
         return False, wind
+    trade_days_expected_set = set(trade_days)
     if resume_after_c:
         if not _nav_stored_range_complete(
             db,
@@ -7165,8 +7224,12 @@ def _rebuild_nav_for_strategy(
             generated_rows += 1
             generated_last_c = td
         if len(nav_accum) >= nav_persist_chunk:
-            _flush_strategy_nav_daily_batch(db, nav_accum)
-            db.commit()
+            _flush_strategy_nav_daily_batch_verified(
+                db,
+                nav_accum,
+                sid=sid,
+                expected_trade_days=trade_days_expected_set,
+            )
             _sync_mark_nav_progress(
                 sync_job_id,
                 sid,
@@ -7178,8 +7241,12 @@ def _rebuild_nav_for_strategy(
             )
             nav_accum.clear()
     if nav_accum:
-        _flush_strategy_nav_daily_batch(db, nav_accum)
-        db.commit()
+        _flush_strategy_nav_daily_batch_verified(
+            db,
+            nav_accum,
+            sid=sid,
+            expected_trade_days=trade_days_expected_set,
+        )
         _sync_mark_nav_progress(
             sync_job_id,
             sid,
