@@ -3111,10 +3111,6 @@ def _run_update_try_build_work_item(
                     db,
                     sid,
                     do_commit=do_commit,
-                    stock_count_on_last_date=_effective_rebalance_stock_count(
-                        rb_positions, as_of=trade_date
-                    ),
-                    last_trade_date=trade_date.isoformat(),
                 )
                 return None
             _job_progress(
@@ -4455,10 +4451,6 @@ def run_update(
                     db,
                     sid,
                     do_commit=do_commit,
-                    stock_count_on_last_date=_effective_rebalance_stock_count(
-                        rb_positions, as_of=trade_date
-                    ),
-                    last_trade_date=trade_date.isoformat(),
                 )
                 _release_run_update_strategy_memory(
                     eod_by_code={},
@@ -4801,10 +4793,6 @@ def run_update(
                 db,
                 sid,
                 do_commit=do_commit,
-                stock_count_on_last_date=_effective_rebalance_stock_count(
-                    rb_positions, as_of=trade_date
-                ),
-                last_trade_date=trade_date.isoformat(),
             )
             _release_run_update_strategy_memory(
                 eod_by_code=eod_by_code,
