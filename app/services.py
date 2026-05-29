@@ -5002,6 +5002,41 @@ def _nav_stored_range_complete(
     return False
 
 
+def _nav_through_latest_for_sync(
+    db: Session,
+    sid: str,
+    latest_trade_c: str,
+    mysql_plan: dict[str, Any] | None,
+    trade_days: list[str] | None = None,
+) -> bool:
+    """同步管道：库内末净值已达 Wind 最新交易日则净值阶段可跳过（续传进 EOD 时）。"""
+    if not mysql_plan or not latest_trade_c:
+        return False
+    lt = str(latest_trade_c).strip().replace("-", "")[:8]
+    if len(lt) != 8 or not lt.isdigit():
+        return False
+    nav_max = _strategy_nav_max_trade_compact(db, sid)
+    if not nav_max or nav_max < lt:
+        return False
+    if trade_days:
+        rb_sorted = sorted(mysql_plan["rb_map"].keys())
+        append = _resolve_nav_append_anchor(db, sid, rb_sorted, trade_days)
+        if append and append >= lt:
+            return True
+        return _nav_stored_range_complete(
+            db,
+            sid,
+            mysql_plan["start_c"],
+            lt,
+            trade_days,
+            label="sync-through",
+        )
+    return nav_max >= lt
+
+
+_SYNC_NAV_DONE_STAGES = frozenset({"update", "wait_idle", "holding_update"})
+
+
 def _nav_persist_after_compact(db: Session, sid: str, nav_full_rebuild: bool) -> str | None:
     """
     增量净值：返回已有最后交易日 compact；仅写入该日之后的交易日。
@@ -6849,16 +6884,13 @@ def _rebuild_nav_for_strategy(
 
     append_after_c = _resolve_nav_append_anchor(db, sid, rb_sorted, trade_days)
     if append_after_c and append_after_c >= latest_trade_c:
-        if _nav_stored_range_complete(
-            db,
+        _log.info(
+            "nav %s: anchor %s already at/after latest %s, skip forward",
             sid,
-            start_c,
+            append_after_c,
             latest_trade_c,
-            trade_days,
-            label="complete",
-        ):
-            _log.info("nav %s: already through %s", sid, append_after_c)
-            return True, wind
+        )
+        return True, wind
 
     if not nav_force_reset and append_after_c and _nav_scale_break_detected(db, sid):
         good_c = _nav_last_good_trade_compact(db, sid) or append_after_c
@@ -7029,9 +7061,6 @@ def rebuild_nav_series(
         )
 
     skip = {str(x).strip() for x in (skip_strategy_ids or []) if str(x).strip()}
-    if mode_l == "full" and skip:
-        _log.warning("nav full rebuild ignores completed_nav checkpoints: %s", sorted(skip))
-        skip = set()
     done = len(skip)
     failed = 0
     errors: list[str] = []
@@ -7116,9 +7145,7 @@ def rebuild_nav_series(
                                     sdb,
                                     sync_job_id,
                                     completed_import=cp.get("completed_import") or [],
-                                    completed_nav=(
-                                        [] if mode_l == "full" else sorted(set(completed_nav))
-                                    ),
+                                    completed_nav=sorted(set(completed_nav)),
                                     completed_update_rb=cp.get("completed_update_rb") or [],
                                     nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
                                     stage="nav",
@@ -7185,9 +7212,7 @@ def rebuild_nav_series(
                             db,
                             sync_job_id,
                             completed_import=cp.get("completed_import") or [],
-                            completed_nav=(
-                                [] if mode_l == "full" else sorted(set(completed_nav))
-                            ),
+                            completed_nav=sorted(set(completed_nav)),
                             completed_update_rb=cp.get("completed_update_rb") or [],
                             nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
                             stage="nav",
@@ -7460,17 +7485,15 @@ def execute_admin_sync_pipeline(
                 completed_update_rb = _sync_normalize_update_rb_done(
                     cp.get("completed_update_rb") or []
                 )
-                if str(import_mode or "").strip().lower() == "full" and completed_nav:
-                    # Full resume must rebuild NAV again. Holding snapshot
-                    # checkpoints are kept, but each skipped rebalance is
-                    # verified against the target snapshot before it is trusted.
-                    _log.warning(
-                        "admin_sync job %s: ignore completed_nav checkpoint on full resume: %s",
+                cp_stage = str(cp.get("stage") or "import")
+                if cp_stage in _SYNC_NAV_DONE_STAGES:
+                    completed_nav = set(ids_set)
+                    _log.info(
+                        "admin_sync job %s: resume skip nav (checkpoint stage=%s)",
                         sync_job_id,
-                        sorted(completed_nav),
+                        cp_stage,
                     )
-                    completed_nav = set()
-                if completed_import:
+                if completed_import or completed_nav:
                     p(
                         "resume",
                         f"续传：净值 {len(completed_nav)} 策略，"
@@ -7655,16 +7678,62 @@ def execute_admin_sync_pipeline(
             )
             p("nav", "阶段2/3：连接 Wind SQL Server…", detached=True)
             wind = wind_sql.open_wind(None)
-            nav_ret, wind = rebuild_nav_series(
-                None,
-                wind,
-                ids,
-                mode=import_mode,
-                do_commit=True,
-                skip_strategy_ids=completed_nav,
-                sync_job_id=sync_job_id,
-            )
-            completed_nav = set(nav_ret.get("completed_nav_ids") or [])
+            mtd_nav = wind.execute(text(wind_sql.sql_max_trade_dt())).mappings().first()
+            latest_tc = _compact_date(mtd_nav["d"] if mtd_nav else "")
+            if len(latest_tc) >= 8:
+                with turso_stream_lock():
+                    plan_db = SessionLocalFactory()
+                    try:
+                        plans_nav = _batch_nav_mysql_plans(
+                            plan_db, ids, str(import_mode or "incremental")
+                        )
+                        for sid_chk in ids:
+                            if sid_chk in completed_nav:
+                                continue
+                            pl_chk = plans_nav.get(sid_chk)
+                            if not pl_chk:
+                                continue
+                            _, td_nav = wind_bulk.fetch_trade_date_compacts(
+                                wind,
+                                plan_db,
+                                pl_chk["start_c"],
+                                latest_tc,
+                            )
+                            if _nav_through_latest_for_sync(
+                                plan_db, sid_chk, latest_tc, pl_chk, td_nav
+                            ):
+                                completed_nav.add(sid_chk)
+                                _log.info(
+                                    "admin_sync job %s: %s nav DB-complete through %s, skip rebuild",
+                                    sync_job_id,
+                                    sid_chk,
+                                    latest_tc,
+                                )
+                    finally:
+                        plan_db.close()
+            if ids_set <= completed_nav:
+                nav_ret = {
+                    "rebuilt": len(completed_nav),
+                    "failed": 0,
+                    "errors": [],
+                    "completed_nav_ids": sorted(completed_nav),
+                }
+                p(
+                    "nav",
+                    f"阶段2/3：净值已跳过（{len(completed_nav)} 个策略库内已至 {latest_tc}）",
+                    detached=True,
+                )
+            else:
+                nav_ret, wind = rebuild_nav_series(
+                    None,
+                    wind,
+                    ids,
+                    mode=import_mode,
+                    do_commit=True,
+                    skip_strategy_ids=completed_nav,
+                    sync_job_id=sync_job_id,
+                )
+                completed_nav = set(nav_ret.get("completed_nav_ids") or [])
         if not ids_set <= completed_nav:
             nav_errors = list(nav_ret.get("errors") or [])
             missing_nav = sorted(ids_set - completed_nav)
@@ -7696,11 +7765,7 @@ def execute_admin_sync_pipeline(
                         db_ck,
                         sync_job_id,
                         completed_import=sorted(completed_import),
-                        completed_nav=(
-                            []
-                            if str(import_mode or "").strip().lower() == "full"
-                            else sorted(completed_nav)
-                        ),
+                        completed_nav=sorted(completed_nav),
                         completed_update_rb=sorted(completed_update_rb),
                         nav_progress=_sync_nav_progress_map(cp.get("nav_progress")),
                         stage="update",
