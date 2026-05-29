@@ -5582,6 +5582,60 @@ def _nav_holding_snapshot_on_day(
     return n > 0
 
 
+def _nav_rebalance_resume_anchor_compact(
+    db: Session,
+    sid: str,
+    current_rb: date,
+    trade_days: list[str],
+) -> str | None:
+    """调仓期续传锚点：调仓日有净值则用调仓日，否则用调仓后首个有净值的交易日。"""
+    rb_cmp = _compact_date(current_rb)
+    if _nav_fetch_row_on_day(db, sid, rb_cmp):
+        return rb_cmp
+    for d in trade_days:
+        if d >= rb_cmp and _nav_fetch_row_on_day(db, sid, d):
+            return d
+    return None
+
+
+def _nav_coerce_full_resume_anchor_without_snapshot(
+    db: Session,
+    sid: str,
+    resume_after_c: str | None,
+    rb_sorted: list[date],
+    trade_days: list[str],
+) -> str | None:
+    """
+    全量续传：锚点落在调仓期中间且无 strategy_holding_daily 时，回退到最近调仓日
+    （或该调仓后首个有净值的交易日），避免用静态调仓权重 bootstrap 导致日收益偏差。
+    """
+    if not resume_after_c or not rb_sorted:
+        return resume_after_c
+    td_cmp = str(resume_after_c).strip().replace("-", "")[:8]
+    if len(td_cmp) != 8 or not td_cmp.isdigit():
+        return resume_after_c
+    try:
+        anchor_d = datetime.strptime(td_cmp, "%Y%m%d").date()
+    except ValueError:
+        return resume_after_c
+    _, current_rb = _nav_rb_idx_on_date(rb_sorted, anchor_d)
+    if anchor_d <= current_rb:
+        return resume_after_c
+    if _nav_holding_snapshot_on_day(db, sid, current_rb, td_cmp):
+        return resume_after_c
+    rollback = _nav_rebalance_resume_anchor_compact(db, sid, current_rb, trade_days)
+    if not rollback or rollback == td_cmp:
+        return resume_after_c
+    _log.warning(
+        "nav %s: full resume anchor %s mid rebalance %s without holding; rollback to %s",
+        sid,
+        td_cmp,
+        _compact_date(current_rb),
+        rollback,
+    )
+    return rollback
+
+
 def _nav_incremental_eod_ready(
     db: Session,
     sid: str,
@@ -6372,6 +6426,14 @@ def _rebuild_nav_for_strategy_yearly(
                     sid,
                     last_done,
                 )
+    if resume_after_c:
+        resume_after_c = _nav_coerce_full_resume_anchor_without_snapshot(
+            db,
+            sid,
+            resume_after_c,
+            sorted(rb_map.keys()),
+            trade_days_all,
+        )
     append_after_c = resume_after_c or _nav_persist_after_compact(db, sid, nav_full_rebuild)
     if append_after_c and append_after_c >= latest_trade_c:
         if nav_full_rebuild and not _nav_stored_range_complete(
@@ -7071,6 +7133,17 @@ def _rebuild_nav_for_strategy(
                 return True, wind
             resume_after_c = None
             append_after_c = None
+        else:
+            coerced = _nav_coerce_full_resume_anchor_without_snapshot(
+                db,
+                sid,
+                resume_after_c,
+                sorted(rb_map.keys()),
+                trade_days,
+            )
+            if coerced != resume_after_c:
+                resume_after_c = coerced
+                append_after_c = coerced
 
     day_map = _eod_dict_to_day_map(eod_by_code)
     bench_quads = _bench_quads_for_code(index_eod_by_code, bench_code)

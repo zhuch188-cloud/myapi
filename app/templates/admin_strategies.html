@@ -61,40 +61,11 @@
         overflow-wrap: break-word;
       }
       .job-task-table .job-msg { line-height: 1.45; }
-      .job-task-table .job-msg-main {
-        display: block;
-        max-height: 4.4em;
-        overflow: hidden;
-      }
       .job-task-table .job-msg-time {
         display: block;
         font-size: 11px;
         color: #667085;
         margin-bottom: 4px;
-      }
-      .job-task-table .job-badge {
-        display: inline-block;
-        padding: 2px 6px;
-        border-radius: 999px;
-        font-size: 11px;
-        font-weight: 700;
-        line-height: 1.4;
-        background: #eef2f6;
-        color: #475467;
-      }
-      .job-task-table .job-badge.running { background: #e0f2fe; color: #0369a1; }
-      .job-task-table .job-badge.success { background: #dcfce7; color: #166534; }
-      .job-task-table .job-badge.failed { background: #fee2e2; color: #991b1b; }
-      .job-task-table .job-progress-track {
-        height: 5px;
-        background: #eef2f6;
-        border-radius: 999px;
-        overflow: hidden;
-        margin-top: 4px;
-      }
-      .job-task-table .job-progress-fill {
-        height: 100%;
-        background: #2463eb;
       }
       .job-task-table .col-actions { vertical-align: middle; }
       .job-task-actions {
@@ -177,8 +148,8 @@
           <button onclick="toggleAll(true)">全选</button>
           <button class="secondary" onclick="toggleAll(false)">清空</button>
           <button class="secondary" onclick="editSelectedStrategy()">编辑勾选项</button>
-          <button onclick="syncSelected('incremental')">增量净值+EOD（勾选）</button>
-          <button class="secondary" onclick="syncSelected('full')">全量净值+EOD（勾选）</button>
+          <button onclick="syncSelected('incremental')">增量导入并提取（勾选）</button>
+          <button class="secondary" onclick="syncSelected('full')">全量导入并提取（勾选）</button>
           <button class="secondary" onclick="importSelected('incremental')">仅增量导入 Excel（勾选）</button>
           <button class="secondary" onclick="importSelected('full')">仅全量导入 Excel（勾选）</button>
           <button class="secondary" onclick="updateLatestSelected()">仅更新最新交易日（勾选）</button>
@@ -191,7 +162,7 @@
           <span id="jobMsg" class="muted"></span>
         </div>
         <p class="muted" style="margin:0;font-size:12px;line-height:1.45;">
-          「净值+EOD」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：仅最近一条可续传任务显示「续传」；新任务产生后，旧断点会自动作废。「净值+EOD」会跳过 Excel 导入，直接重建净值并写入最新交易日持仓快照。
+          「导入并提取」与「仅导入 Excel」均在后台执行，支持<strong>断点续传</strong>：失败后在下方任务表点「续传」；若不再继续可点「放弃」，该任务将终止且不可续传。全量/增量指导入持仓表的方式，与是否重建净值无关（「导入并提取」会额外做净值与快照）。
         </p>
       </div>
       <div class="card">
@@ -203,7 +174,7 @@
         <div class="job-task-wrap"><table id="importJobTb" class="job-task-table"></table></div>
       </div>
       <div class="card">
-        <h4>净值+EOD任务 <button type="button" class="secondary" onclick="loadSyncJobs()">刷新</button></h4>
+        <h4>导入并提取任务 <button type="button" class="secondary" onclick="loadSyncJobs()">刷新</button></h4>
         <div class="job-task-wrap"><table id="syncJobTb" class="job-task-table"></table></div>
       </div>
       <div class="card">
@@ -422,7 +393,7 @@
         const msg = document.getElementById("jobMsg");
         if (!ids.length) { msg.textContent = "请先勾选策略"; return; }
         try {
-          msg.textContent = `${importMode === "full" ? "全量" : "增量"}净值+EOD已提交（${ids.length} 个策略）…`;
+          msg.textContent = `${importMode === "full" ? "全量" : "增量"}导入并提取已提交（${ids.length} 个策略）…`;
           const ret = await api("/api/admin/sync", {
             method: "POST",
             body: JSON.stringify({ strategy_ids: ids, import_mode: importMode })
@@ -446,10 +417,10 @@
                 await loadSyncJobs();
                 const rj = parseSyncResultJson(st.result_json) || {};
                 if (!rj.ok) {
-                  const hint = st.resumable ? " — 可在下方「净值+EOD任务」点续传" : "";
+                  const hint = st.resumable ? " — 可在下方「导入并提取任务」点续传" : "";
                   msg.textContent = `执行失败（${rj.stage || st.stage || ""}）：${(rj.errors || []).join("；") || "未知原因"}${hint}`;
                 } else {
-                  msg.textContent = `执行成功：已完成 ${ids.length} 个策略的净值与最新交易日EOD`;
+                  msg.textContent = `执行成功：导入 ${rj.imported != null ? rj.imported : "—"} 个策略并完成最新交易日提取`;
                 }
                 await refreshStrategyListAfterJob();
                 return;
@@ -463,7 +434,7 @@
             msg.textContent = `执行失败（${ret.stage}）：${(ret.errors || []).join("；") || "未知原因"}`;
             return;
           }
-          msg.textContent = `执行成功：已完成 ${ids.length} 个策略的净值与最新交易日EOD`;
+          msg.textContent = `执行成功：导入 ${ret.imported} 个策略并完成最新交易日提取`;
           await refreshStrategyListAfterJob();
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
@@ -585,54 +556,15 @@
       }
       const JOB_POLL_MS = 5000;
       const JOB_LOG_LIMIT = 5;
-      const JOB_TABLE_REFRESH_EVERY_TICKS = 3;
       let jobTableAutoTimer = null;
-      function jobStatusClass(status) {
-        const s = String(status || "").toUpperCase();
-        if (s === "RUNNING" || s === "QUEUED") return "running";
-        if (s === "SUCCESS") return "success";
-        if (s === "FAILED" || s === "ABANDONED") return "failed";
-        return "";
-      }
-      function jobStatusBadge(status) {
-        const label = esc(status || "-");
-        return `<span class="job-badge ${jobStatusClass(status)}">${label}</span>`;
-      }
-      function shortJobMessage(message) {
-        const raw = String(message || "").replace(/\s+/g, " ").trim();
-        if (!raw) return "";
-        const parts = raw.split(/[。；;]|(?:\s[—-]\s)/).map((x) => x.trim()).filter(Boolean);
-        const picked = parts.find((x) => /阶段|批|已|失败|完成|续传|等待|Wind|Excel|导入|净值|持仓|更新/.test(x)) || parts[0] || raw;
-        return picked.length > 260 ? picked.slice(0, 260) + "…" : picked;
-      }
-      function parseJsonArrayLength(s, fallback) {
-        try {
-          const v = JSON.parse(s || "[]");
-          return Array.isArray(v) ? v.length : fallback;
-        } catch (_) {
-          return fallback;
-        }
-      }
-      function progressCell(done, all) {
-        const d = Number(done);
-        const a = Number(all);
-        const label = `${Number.isFinite(d) ? d : 0}/${Number.isFinite(a) && a > 0 ? a : "?"}`;
-        if (!Number.isFinite(d) || !Number.isFinite(a) || a <= 0) return label;
-        const pct = Math.max(0, Math.min(100, Math.round((d / a) * 100)));
-        return `${label}<div class="job-progress-track"><div class="job-progress-fill" style="width:${pct}%"></div></div>`;
-      }
       function jobMsgCell(j) {
         const at = j.progress_at ? `<div class="job-msg-time">${esc(j.progress_at)}</div>` : "";
-        const body = esc(shortJobMessage(j.message));
+        const body = esc((j.message || "").slice(0, 1200));
         const title = esc(j.message || "");
-        return `<div class="job-msg" title="${title}">${at}<span class="job-msg-main">${body || "—"}</span></div>`;
+        return `<div class="job-msg" title="${title}">${at}${body}</div>`;
       }
       function jobTablesHaveActive(items) {
-        return (items || []).some((j) => {
-          const msg = String((j && j.message) || "");
-          const doneLike = msg.includes("全部完成") || msg.includes("鍏ㄩ儴瀹屾垚");
-          return (j.status === "QUEUED" || j.status === "RUNNING") && !doneLike;
-        });
+        return (items || []).some((j) => j.status === "QUEUED" || j.status === "RUNNING");
       }
       async function refreshJobTablesIfActive() {
         try {
@@ -641,9 +573,9 @@
             api(`/api/admin/sync-jobs?limit=${JOB_LOG_LIMIT}`),
             api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() }),
           ]);
-          renderImportJobs(imp.items || []);
-          renderSyncJobs(sync.items || []);
-          renderUpdateJobs(upd.items || []);
+          await loadImportJobs();
+          await loadSyncJobs();
+          await loadUpdateJobs();
           const active =
             jobTablesHaveActive(imp.items) ||
             jobTablesHaveActive(sync.items) ||
@@ -661,13 +593,11 @@
       async function pollImportJob(jobId) {
         const msg = document.getElementById("jobMsg");
         const deadline = Date.now() + 120 * 60 * 1000;
-        let tick = 0;
         while (Date.now() < deadline) {
           const j = await api("/api/admin/import-jobs/" + encodeURIComponent(String(jobId)));
           const pat = j.progress_at ? ` · ${j.progress_at}` : "";
-          msg.textContent = `#${j.id} ${j.status}${pat} — ${shortJobMessage(j.message)}`;
-          tick += 1;
-          if (tick === 1 || tick % JOB_TABLE_REFRESH_EVERY_TICKS === 0) await loadImportJobs();
+          msg.textContent = `#${j.id} ${j.status}${pat} — ${j.message || ""}`;
+          await loadImportJobs();
           if (j.status === "QUEUED" || j.status === "RUNNING") {
             await maybeRefreshStrategyListDuringPoll();
           }
@@ -721,9 +651,10 @@
           }
         }
       }
-      function resumableJobButtons(resumeFn, id) {
+      function resumableJobButtons(resumeFn, abandonFn, id) {
         return `<div class="job-task-actions">`
           + `<button type="button" class="secondary" onclick="${resumeFn}(${id})">续传</button>`
+          + `<button type="button" class="secondary" onclick="${abandonFn}(${id})">放弃</button>`
           + `</div>`;
       }
       async function resumeImportJob(jobId) {
@@ -740,6 +671,15 @@
           }
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
+      async function abandonImportJob(jobId) {
+        if (!confirm(`确定放弃策略导入任务 #${jobId}？放弃后不可续传。`)) return;
+        const msg = document.getElementById("jobMsg");
+        try {
+          const ret = await api(`/api/admin/import-jobs/${jobId}/abandon`, { method: "POST" });
+          msg.textContent = ret.message || `任务 #${jobId} 已放弃`;
+          await loadImportJobs();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
       const JOB_TABLE_COL_7 = `<colgroup>
         <col style="width:4%" /><col style="width:7%" /><col style="width:9%" />
         <col style="width:12%" /><col style="width:5%" /><col style="width:53%" /><col style="width:10%" />
@@ -750,26 +690,22 @@
       </colgroup>`;
       async function loadImportJobs() {
         const d = await api(`/api/admin/import-jobs?limit=${JOB_LOG_LIMIT}`);
-        renderImportJobs(d.items || []);
-      }
-      function renderImportJobs(rows) {
-        const items = (rows || []).slice(0, JOB_LOG_LIMIT);
-        const latestResumableId = (items.find((j) => !!j.resumable) || {}).id;
+        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("importJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
             <th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>进度</th><th>说明</th><th>操作</th>
           </tr></thead>
           <tbody>${items.map(j => {
-            const all = parseJsonArrayLength(j.strategy_ids_json, "?");
-            const done = parseJsonArrayLength(j.completed_strategy_ids_json, 0);
-            const btn = j.resumable && Number(j.id) === Number(latestResumableId) ? resumableJobButtons("resumeImportJob", j.id) : "";
+            const all = (() => { try { return JSON.parse(j.strategy_ids_json || "[]").length; } catch (_) { return "?"; } })();
+            const done = (() => { try { return JSON.parse(j.completed_strategy_ids_json || "[]").length; } catch (_) { return 0; } })();
+            const btn = j.resumable ? resumableJobButtons("resumeImportJob", "abandonImportJob", j.id) : "";
             return `<tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.import_mode)}</td>
-              <td class="col-meta">${jobStatusBadge(j.status)}</td>
+              <td class="col-meta">${esc(j.status)}</td>
               <td class="col-meta">${esc(j.started_at||"—")}</td>
-              <td class="col-meta">${progressCell(done, all)}</td>
+              <td class="col-meta">${done}/${all}</td>
               <td class="col-msg">${jobMsgCell(j)}</td>
               <td class="col-actions">${btn}</td></tr>`;
           }).join("") || "<tr><td colspan='7' class='muted'>暂无</td></tr>"}</tbody>`;
@@ -777,17 +713,13 @@
       async function pollSyncJob(jobId) {
         const msg = document.getElementById("jobMsg");
         const deadline = Date.now() + 120 * 60 * 1000;
-        let tick = 0;
         while (Date.now() < deadline) {
           const st = await api("/api/admin/sync-jobs/" + encodeURIComponent(String(jobId)));
           const stg = st.stage ? ` · ${st.stage}` : "";
           const stt = st.progress_at ? ` · ${st.progress_at}` : (st.started_at ? ` · 开始 ${st.started_at}` : "");
-          msg.textContent = `#${st.id} ${st.status}${stg}${stt}${st.message ? " — " + shortJobMessage(st.message) : ""}`;
-          tick += 1;
-          if (tick === 1 || tick % JOB_TABLE_REFRESH_EVERY_TICKS === 0) {
-            await loadSyncJobs();
-            await loadUpdateJobs();
-          }
+          msg.textContent = `#${st.id} ${st.status}${stg}${stt}${st.message ? " — " + st.message : ""}`;
+          await loadSyncJobs();
+          await loadUpdateJobs();
           if (st.status === "QUEUED" || st.status === "RUNNING") {
             await maybeRefreshStrategyListDuringPoll();
           }
@@ -809,12 +741,18 @@
           await pollSyncJob(jobId);
         } catch (e) { msg.textContent = formatFetchError(e); }
       }
+      async function abandonSyncJob(jobId) {
+        if (!confirm(`确定放弃「导入并提取」任务 #${jobId}？放弃后不可续传。`)) return;
+        const msg = document.getElementById("jobMsg");
+        try {
+          const ret = await api(`/api/admin/sync-jobs/${jobId}/abandon`, { method: "POST" });
+          msg.textContent = ret.message || `同步任务 #${jobId} 已放弃`;
+          await loadSyncJobs();
+        } catch (e) { msg.textContent = formatFetchError(e); }
+      }
       async function loadUpdateJobs() {
         const d = await api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() });
-        renderUpdateJobs(d.items || []);
-      }
-      function renderUpdateJobs(rows) {
-        const items = (rows || []).slice(0, JOB_LOG_LIMIT);
+        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("updateJobTb").innerHTML = `
           ${JOB_TABLE_COL_6}
           <thead><tr>
@@ -824,7 +762,7 @@
             <tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.job_type||"-")}</td>
-              <td class="col-meta">${jobStatusBadge(j.status)}</td>
+              <td class="col-meta">${esc(j.status)}</td>
               <td class="col-meta">${esc(j.triggered_by||"")}</td>
               <td class="col-msg">${jobMsgCell(j)}</td>
               <td class="col-meta">${esc(j.started_at||"")}</td>
@@ -833,22 +771,18 @@
       }
       async function loadSyncJobs() {
         const d = await api(`/api/admin/sync-jobs?limit=${JOB_LOG_LIMIT}`);
-        renderSyncJobs(d.items || []);
-      }
-      function renderSyncJobs(rows) {
-        const items = (rows || []).slice(0, JOB_LOG_LIMIT);
-        const latestResumableId = (items.find((j) => !!j.resumable) || {}).id;
+        const items = (d.items || []).slice(0, JOB_LOG_LIMIT);
         document.getElementById("syncJobTb").innerHTML = `
           ${JOB_TABLE_COL_7}
           <thead><tr>
             <th>ID</th><th>模式</th><th>状态</th><th>开始</th><th>阶段</th><th>说明</th><th>操作</th>
           </tr></thead>
           <tbody>${items.map(j => {
-            const btn = j.resumable && Number(j.id) === Number(latestResumableId) ? resumableJobButtons("resumeSyncJob", j.id) : "";
+            const btn = j.resumable ? resumableJobButtons("resumeSyncJob", "abandonSyncJob", j.id) : "";
             return `<tr>
               <td class="col-meta">${j.id}</td>
               <td class="col-meta">${esc(j.import_mode)}</td>
-              <td class="col-meta">${jobStatusBadge(j.status)}</td>
+              <td class="col-meta">${esc(j.status)}</td>
               <td class="col-meta">${esc(j.started_at||"—")}</td>
               <td class="col-meta">${esc(j.stage||"-")}</td>
               <td class="col-msg">${jobMsgCell(j)}</td>
@@ -878,7 +812,6 @@
           const deadline = Date.now() + 45 * 60 * 1000;
           while (Date.now() < deadline) {
             const jobs = await api(`/api/admin/update-jobs?limit=${JOB_LOG_LIMIT}`, { headers: authHeaders() });
-            renderUpdateJobs(jobs.items || []);
             const j = (jobs.items || []).find((x) => x.id === targetId);
             if (!j) {
               msg.textContent = `未找到任务 #${targetId}，稍后重试轮询…`;
@@ -886,12 +819,12 @@
               continue;
             }
             const pat = j.progress_at ? ` · ${j.progress_at}` : "";
-            msg.textContent = `#${j.id} ${j.status}${pat} — ${shortJobMessage(j.message)}`;
-            const doneLike = String(j.message || "").includes("全部完成") || String(j.message || "").includes("鍏ㄩ儴瀹屾垚");
-            if (j.status === "RUNNING" && !doneLike) {
+            msg.textContent = `#${j.id} ${j.status}${pat} — ${j.message || ""}`;
+            await loadUpdateJobs();
+            if (j.status === "RUNNING") {
               await maybeRefreshStrategyListDuringPoll();
             }
-            if (j.status !== "RUNNING" || doneLike) {
+            if (j.status !== "RUNNING") {
               await refreshStrategyListAfterJob();
               return;
             }

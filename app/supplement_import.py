@@ -420,28 +420,6 @@ def get_data_import_batch_row(db: Session, batch_id: int) -> dict[str, Any] | No
     return dict(row) if row else None
 
 
-def _resolve_batch_source_path(batch: dict[str, Any]) -> str:
-    path = str(batch.get("source_file_path") or "").strip()
-    if path and Path(path).is_file():
-        return path
-    code = str(batch.get("definition_code") or "").strip()
-    if not code:
-        return ""
-    try:
-        from app.server_files import resolve_supplement_import_path
-
-        fallback = default_company_profile_xlsx_path() if code == CODE_COMPANY_PROFILE_EXCEL else ""
-        resolved = resolve_supplement_import_path(
-            definition_code=code,
-            explicit_path=None,
-            default_file_path="",
-            fallback_path=fallback,
-        )
-        return str(resolved) if resolved and Path(resolved).is_file() else ""
-    except Exception:
-        return ""
-
-
 def batch_is_resumable(batch: dict[str, Any]) -> bool:
     st = str(batch.get("status") or "").upper()
     if st in ("SUCCESS", "ABANDONED"):
@@ -452,36 +430,8 @@ def batch_is_resumable(batch: dict[str, Any]) -> bool:
     rows_total = batch.get("rows_total")
     if rows_total is not None and resume_from >= int(rows_total):
         return False
-    return bool(_resolve_batch_source_path(batch))
-
-
-def abandon_older_data_import_batches(
-    db: Session,
-    *,
-    keep_batch_id: int,
-    definition_code: str | None = None,
-) -> None:
-    params: dict[str, Any] = {"keep": int(keep_batch_id)}
-    extra = ""
-    if definition_code:
-        extra = "AND definition_code = :dc"
-        params["dc"] = str(definition_code)
-    db.execute(
-        text(
-            f"""
-            UPDATE data_import_batches
-            SET status='FAILED',
-                checkpoint_json=NULL,
-                resume_from_row=0,
-                message='已有更新的导入任务，旧断点已自动作废'
-            WHERE id <> :keep
-              AND status='FAILED'
-              AND COALESCE(resume_from_row, 0) > 0
-              {extra}
-            """
-        ),
-        params,
-    )
+    path = (batch.get("source_file_path") or "").strip()
+    return bool(path and Path(path).is_file())
 
 
 def abandon_data_import_batch(db: Session, batch_id: int) -> None:
@@ -524,11 +474,7 @@ def resume_data_import_batch(db: Session, batch_id: int, actor_user_id: int | No
             if p.strip()
         ]
     code = str(batch.get("definition_code") or "").strip()
-    path = _resolve_batch_source_path(batch)
-    if not path:
-        raise DataImportBatchNotResumableError(
-            f"批次 #{batch_id} 不可续传：源文件不可用，请先上传对应文件"
-        )
+    path = str(batch.get("source_file_path") or "").strip()
     if code == CODE_COMPANY_PROFILE_EXCEL:
         return import_company_profile_excel(
             db,

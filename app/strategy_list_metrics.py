@@ -151,13 +151,12 @@ def refresh_strategy_list_metrics_cache(
     strategy_ids: list[str] | None = None,
     *,
     do_commit: bool = True,
-    stock_count_hints: dict[str, int | None] | None = None,
-    last_trade_date_hints: dict[str, str | None] | None = None,
 ) -> int:
     """
     按列表口径重算并 UPSERT 快照。日常由 refresh_strategy_list_metrics_one 逐策略调用；
     strategy_ids 为空时刷新全部可见策略（仅脚本/手工补数，run_update 不再在末尾全量重算）。
     """
+    from app.main import _batch_nav_last_date_stock_count
     from app.nav_list_metrics_calc import compute_strategy_list_metrics_snapshot
 
     ids = [str(x).strip() for x in (strategy_ids or []) if str(x or "").strip()]
@@ -180,21 +179,7 @@ def refresh_strategy_list_metrics_cache(
                 s.get("year_return"),
                 s.get("period_since_rebalance_return"),
             )
-    existing = load_strategy_list_metrics_batch(db, ids)
-    stock_hints = stock_count_hints or {}
-    td_hints = last_trade_date_hints or {}
-    nav_meta: dict[str, dict[str, Any]] = {}
-    for sid in ids:
-        ex = existing.get(sid) or {}
-        td = td_hints.get(sid) or summaries.get(sid, {}).get("last_trade_date") or ex.get("last_trade_date")
-        if sid in stock_hints:
-            stock_count = stock_hints.get(sid)
-        else:
-            stock_count = ex.get("stock_count_on_last_date")
-        nav_meta[sid] = {
-            "last_trade_date": str(td)[:10] if td else None,
-            "stock_count": stock_count,
-        }
+    nav_meta = _batch_nav_last_date_stock_count(db, ids)
     n = _upsert_metrics_rows(db, ids, summaries, nav_meta, do_commit=False)
     full_refresh = strategy_ids is None or not [
         x for x in (strategy_ids or []) if str(x or "").strip()
@@ -207,45 +192,21 @@ def refresh_strategy_list_metrics_cache(
 
 
 def refresh_strategy_list_metrics_one(
-    db: Session,
-    strategy_id: str,
-    *,
-    do_commit: bool = False,
-    stock_count_on_last_date: int | None = None,
-    last_trade_date: str | None = None,
+    db: Session, strategy_id: str, *, do_commit: bool = False
 ) -> None:
     """单策略数据更新完成后：重算并 UPSERT 该策略一行快照。"""
     sid = str(strategy_id or "").strip()
     if not sid:
         return
-    stock_hints = {sid: stock_count_on_last_date} if stock_count_on_last_date is not None else None
-    td_hints = {sid: last_trade_date} if last_trade_date else None
-    refresh_strategy_list_metrics_cache(
-        db,
-        [sid],
-        do_commit=do_commit,
-        stock_count_hints=stock_hints,
-        last_trade_date_hints=td_hints,
-    )
+    refresh_strategy_list_metrics_cache(db, [sid], do_commit=do_commit)
 
 
 def refresh_strategy_list_metrics_safe(
-    db: Session,
-    strategy_id: str,
-    *,
-    do_commit: bool = False,
-    stock_count_on_last_date: int | None = None,
-    last_trade_date: str | None = None,
+    db: Session, strategy_id: str, *, do_commit: bool = False
 ) -> None:
     """写快照失败只记日志，不中断 run_update。"""
     try:
-        refresh_strategy_list_metrics_one(
-            db,
-            strategy_id,
-            do_commit=do_commit,
-            stock_count_on_last_date=stock_count_on_last_date,
-            last_trade_date=last_trade_date,
-        )
+        refresh_strategy_list_metrics_one(db, strategy_id, do_commit=do_commit)
     except Exception:
         _log.exception(
             "strategy_list_metrics refresh failed sid=%s", strategy_id

@@ -75,8 +75,6 @@ from app.services import (
     find_resumable_strategy_import_job,
     count_strategy_positions_rows,
     admin_sync_job_is_resumable,
-    abandon_older_admin_sync_jobs,
-    abandon_older_strategy_import_jobs,
     abandon_strategy_import_job,
     abandon_admin_sync_job,
     reconcile_stale_admin_sync_jobs,
@@ -89,7 +87,6 @@ from app.supplement_import import (
     DataImportBatchNotFoundError,
     DataImportBatchNotResumableError,
     ImportDefinitionNotFoundError,
-    abandon_older_data_import_batches,
     abandon_data_import_batch,
     batch_is_resumable,
     default_company_profile_xlsx_path,
@@ -1471,6 +1468,54 @@ def _bind_date_compact(val: object | None) -> str | None:
     s = str(val or "").strip().replace("-", "").replace("/", "")[:8]
     return s if len(s) == 8 and s.isdigit() else None
 
+
+def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> dict[str, dict]:
+    """净值表最后交易日 + 该日最新调仓期持仓股票数（日期比较用 compact，与排行榜一致）。"""
+    if not strategy_ids:
+        return {}
+    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in strategy_ids)
+    td_h = sql_date_compact_expr("h.trade_date")
+    td_n = sql_date_compact_expr("n.last_trade_date")
+    rb_h = sql_date_compact_expr("h.rebalance_date")
+    rb_x = sql_date_compact_expr("x.rebalance_date")
+    rows = db.execute(
+        text(
+            f"""
+            SELECT n.strategy_id AS strategy_id, n.last_trade_date AS last_trade_date,
+                   COUNT(DISTINCT h.stock_code) AS stock_cnt
+            FROM (
+                SELECT nd.strategy_id, nd.trade_date AS last_trade_date
+                FROM strategy_nav_daily nd
+                INNER JOIN (
+                    SELECT strategy_id, {sql_max_date_expr("trade_date")} AS mx
+                    FROM strategy_nav_daily
+                    WHERE strategy_id IN ({quoted})
+                    GROUP BY strategy_id
+                ) mm ON mm.strategy_id = nd.strategy_id
+                    AND {sql_date_compact_expr("nd.trade_date")} = mm.mx
+            ) n
+            LEFT JOIN strategy_holding_daily h
+              ON h.strategy_id = n.strategy_id
+             AND {td_h} = {td_n}
+             AND {rb_h} = (
+                    SELECT MAX({rb_x})
+                    FROM strategy_holding_daily x
+                    WHERE x.strategy_id = n.strategy_id
+                      AND {sql_date_compact_expr("x.trade_date")} = {td_n}
+                  )
+            GROUP BY n.strategy_id, n.last_trade_date
+            """
+        )
+    ).mappings().all()
+    out: dict[str, dict] = {}
+    for r in rows:
+        sid = str(r["strategy_id"])
+        td = r.get("last_trade_date")
+        out[sid] = {
+            "last_trade_date": str(td)[:10] if td is not None else None,
+            "stock_count": int(r["stock_cnt"] or 0),
+        }
+    return out
 
 
 _NAV_LIST_SUMMARY_EMPTY: dict[str, Any] = {
@@ -3952,7 +3997,6 @@ def admin_import(
                 "m": f"续传已入队（{resume_ts}，模式 {im}；从断点继续，非从头导入）",
             },
         )
-        abandon_older_strategy_import_jobs(db, keep_job_id=job_id)
         db.commit()
         _log.info("strategy import RESUME job=%s mode=%s", job_id, im)
         spawn_daemon(
@@ -4069,7 +4113,7 @@ def admin_sync(
     if row_run:
         raise HTTPException(
             status_code=409,
-            detail=f"已有「净值+EOD」任务正在执行（admin_sync_jobs id={row_run[0]}），请待完成后再试。",
+            detail=f"已有「导入并提取」同步任务正在执行（admin_sync_jobs id={row_run[0]}），请待完成后再试。",
         )
     row_q = db.execute(text("SELECT id FROM admin_sync_jobs WHERE status='QUEUED' LIMIT 1")).first()
     if row_q:
@@ -4105,7 +4149,6 @@ def admin_sync(
     job_id = executed_rowid(db, res)
     if not job_id:
         raise HTTPException(status_code=500, detail="创建同步任务失败")
-    abandon_older_admin_sync_jobs(db, keep_job_id=job_id)
     db.commit()
 
     spawn_daemon(
@@ -4229,7 +4272,6 @@ def admin_sync_job_resume(
         ),
         {"id": job_id, "m": f"续传已入队（{resume_ts}，模式 {import_mode}）"},
     )
-    abandon_older_admin_sync_jobs(db, keep_job_id=job_id)
     db.commit()
     spawn_daemon(
         f"admin-sync-resume-{job_id}",
@@ -4422,33 +4464,7 @@ def update_jobs(
         ),
         {"lim": int(limit)},
     ).mappings().all()
-    items = [dict(r) for r in rows]
-    stuck_done_ids = [
-        int(x["id"])
-        for x in items
-        if str(x.get("status") or "").upper() == "RUNNING"
-        and (
-            "全部完成" in str(x.get("message") or "")
-            or "鍏ㄩ儴瀹屾垚" in str(x.get("message") or "")
-        )
-    ]
-    if stuck_done_ids:
-        quoted = ",".join(str(i) for i in stuck_done_ids)
-        db.execute(
-            text(
-                f"""
-                UPDATE strategy_update_jobs
-                SET status='SUCCESS', finished_at=COALESCE(finished_at, {sql_now()})
-                WHERE id IN ({quoted}) AND status='RUNNING'
-                """
-            )
-        )
-        db.commit()
-        for x in items:
-            if int(x.get("id") or 0) in stuck_done_ids:
-                x["status"] = "SUCCESS"
-                x["finished_at"] = x.get("finished_at") or x.get("progress_at")
-    return {"items": items}
+    return {"items": [dict(r) for r in rows]}
 
 
 @app.post("/api/admin/smtp-test")
@@ -4959,11 +4975,6 @@ def admin_data_import_resume(
             "id": batch_id,
         },
     )
-    abandon_older_data_import_batches(
-        db,
-        keep_batch_id=batch_id,
-        definition_code=str(batch.get("definition_code") or ""),
-    )
     db.commit()
     spawn_daemon(
         f"data-import-resume-{batch_id}",
@@ -5082,11 +5093,6 @@ def admin_data_import_run(
         if payload.background:
             batch_id, resolved_path = _enqueue_data_import_batch(
                 db, code=code, file_path=fp, actor_user_id=actor_id
-            )
-            abandon_older_data_import_batches(
-                db,
-                keep_batch_id=batch_id,
-                definition_code=code,
             )
             _audit_log(
                 db,

@@ -24,82 +24,7 @@
       th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; }
       .scroll { overflow-x: auto; }
       td.msg-cell { white-space: normal; word-break: break-word; max-width: 420px; }
-      #batchTb { table-layout: fixed; min-width: 980px; }
-      #batchTb th, #batchTb td { vertical-align: top; }
-      #batchTb .batch-id { width: 48px; }
-      #batchTb .batch-type { width: 120px; }
-      #batchTb .batch-status { width: 86px; }
-      #batchTb .batch-scanned { width: 130px; }
-      #batchTb .batch-count { width: 78px; }
-      #batchTb .batch-time { width: 150px; }
-      #batchTb .batch-summary { width: auto; }
-      #batchTb .batch-actions {
-        position: sticky;
-        right: 0;
-        z-index: 1;
-        width: 128px;
-        min-width: 128px;
-        background: #fff;
-        box-shadow: -8px 0 10px rgba(255,255,255,.9);
-      }
-      #batchTb thead .batch-actions { background: #f8fafc; }
-      .batch-action-buttons {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-      .batch-action-buttons button.secondary {
-        width: 100%;
-        margin: 0;
-        padding: 6px 8px;
-        font-size: 12px;
-        white-space: nowrap;
-      }
       th[title] { cursor: help; text-decoration: underline dotted #94a3b8; text-underline-offset: 2px; }
-      .status-badge {
-        display: inline-block;
-        padding: 2px 6px;
-        border-radius: 999px;
-        font-size: 11px;
-        font-weight: 700;
-        background: #eef2f6;
-        color: #475467;
-      }
-      .status-badge.running { background: #e0f2fe; color: #0369a1; }
-      .status-badge.success { background: #dcfce7; color: #166534; }
-      .status-badge.failed { background: #fee2e2; color: #991b1b; }
-      .progress-track {
-        height: 5px;
-        min-width: 90px;
-        margin-top: 4px;
-        border-radius: 999px;
-        background: #eef2f6;
-        overflow: hidden;
-      }
-      .progress-fill { height: 100%; background: #2463eb; }
-      .batch-progress-panel {
-        display: none;
-        margin: 8px 0;
-        padding: 8px 10px;
-        border: 1px solid #dbe6ff;
-        border-radius: 8px;
-        background: #f8fbff;
-        line-height: 1.45;
-      }
-      .batch-progress-panel.active { display: block; }
-      .batch-progress-title {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 6px;
-        font-size: 12px;
-      }
-      .batch-progress-msg {
-        color: #475467;
-        font-size: 12px;
-        word-break: break-word;
-      }
     </style>
   </head>
   <body>
@@ -122,7 +47,7 @@
           支持 <strong>.xlsx / .xls / .xlsm / .csv</strong>。任务在<strong>后台</strong>执行。
           <strong>已扫行</strong> = 文件读到第几行；<strong>写入成功</strong> = 唯一键有效且已入库（≠ 库表总行数，相同键只更新）。
           纯远程 Turso 时单批写入约 0.5～2 分钟，<strong>已扫行/写入成功 暂时不变属正常</strong>，摘会出现「正在写入远程库…」。
-          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，仅最近一条可续传批次显示<strong>续传</strong>；新批次产生后，旧断点会自动作废。
+          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，可点<strong>续传</strong>；若不再继续可点<strong>放弃</strong>，该批次不可续传。
           Render 部署请配置 <code>SERVER_UPLOAD_ROOT</code>，先上传再导入（同区写 Turso）。
         </p>
         <div class="row">
@@ -160,7 +85,6 @@
         <p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45">
           列「已扫行」与「写入成功」可能相差很大（大量行唯一键为空会计入「跳过」）。卡在某一数字时先看摘要是否含「正在写入远程库」。
         </p>
-        <div id="currentBatchProgress" class="batch-progress-panel"></div>
         <div class="scroll"><table id="batchTb"></table></div>
       </div>
     </div>
@@ -189,55 +113,6 @@
         }
         if (tail) line += ` — ${tail.slice(0, 160)}`;
         return line;
-      }
-      function statusBadge(status) {
-        const s = String(status || "").toUpperCase();
-        const cls = (s === "RUNNING" || s === "QUEUED")
-          ? "running"
-          : (s === "SUCCESS" ? "success" : ((s === "FAILED" || s === "ABANDONED") ? "failed" : ""));
-        return `<span class="status-badge ${cls}">${esc(status || "-")}</span>`;
-      }
-      function shortMessage(message) {
-        const raw = String(message || "").replace(/\s+/g, " ").trim();
-        if (!raw) return "";
-        const parts = raw.split(/[。；;]|(?:\s[—-]\s)/).map((x) => x.trim()).filter(Boolean);
-        const picked = parts.find((x) => /读取|写入|完成|失败|续传|入队|跳过|正在|已/.test(x)) || parts[0] || raw;
-        return picked.length > 220 ? picked.slice(0, 220) + "…" : picked;
-      }
-      function scannedCell(b) {
-        const rt = b.rows_total != null ? Number(b.rows_total) : null;
-        const rr = Number(b.resume_from_row || 0);
-        const label = rt != null ? `${rr} / ${rt}` : (rr > 0 ? String(rr) : "—");
-        if (rt == null || !Number.isFinite(rt) || rt <= 0) return esc(label);
-        const pct = Math.max(0, Math.min(100, Math.round((rr / rt) * 100)));
-        return `${esc(label)}<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>`;
-      }
-      function batchProgressPercent(b) {
-        const rt = b && b.rows_total != null ? Number(b.rows_total) : 0;
-        const rr = b ? Number(b.resume_from_row || 0) : 0;
-        if (!Number.isFinite(rt) || rt <= 0) return 0;
-        return Math.max(0, Math.min(100, Math.round((rr / rt) * 100)));
-      }
-      function renderCurrentBatchProgress(b) {
-        const el = document.getElementById("currentBatchProgress");
-        if (!el) return;
-        if (!b) {
-          el.classList.remove("active");
-          el.innerHTML = "";
-          return;
-        }
-        const pct = batchProgressPercent(b);
-        const rr = Number(b.resume_from_row || 0);
-        const rt = b.rows_total != null ? Number(b.rows_total) : null;
-        const scan = rt != null ? `${rr} / ${rt}` : String(rr);
-        el.classList.add("active");
-        el.innerHTML = `
-          <div class="batch-progress-title">
-            <span>批次 #${esc(b.id)} · ${statusBadge(b.status)} · 已扫行 ${esc(scan)} · 写入成功 ${esc(b.rows_ok ?? 0)} · 跳过 ${esc(b.rows_fail ?? 0)}</span>
-            <span>${pct}%</span>
-          </div>
-          <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
-          <div class="batch-progress-msg">${esc(shortMessage(b.message)) || "—"}</div>`;
       }
       async function api(path, options = {}) {
         const opts = { ...options };
@@ -330,7 +205,6 @@
           msg.textContent = `已上传并覆盖：${body.path || ""}`;
           await loadDefinitions();
           await refreshServerFileStatus();
-          await loadBatches();
         } catch (e) {
           msg.textContent = formatFetchError(e);
         }
@@ -378,44 +252,58 @@
           msg.textContent = formatFetchError(e);
         }
       }
+      async function abandonBatch(batchId) {
+        if (!confirm(`确定放弃批次 #${batchId}？放弃后不可续传。`)) return;
+        const msg = document.getElementById("runMsg");
+        try {
+          const ret = await api(`/api/admin/data-import/batches/${batchId}/abandon`, { method: "POST" });
+          msg.textContent = ret.message || `批次 #${batchId} 已放弃`;
+          await loadBatches();
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
       let highlightBatchId = 0;
 
       async function fetchBatchById(batchId) {
-        return api("/api/admin/data-import/batches/" + encodeURIComponent(String(batchId)));
+        const d = await api("/api/admin/data-import/batches?limit=80");
+        return (d.items || []).find(b => Number(b.id) === Number(batchId)) || null;
       }
 
       async function loadBatches() {
         const d = await api("/api/admin/data-import/batches?limit=50");
-        renderBatches(d.items || []);
-      }
-      function renderBatches(items) {
-        const latestResumableId = ((items || []).find((b) => !!b.resumable) || {}).id;
+        const items = d.items || [];
         document.getElementById("batchTb").innerHTML = `
           <thead><tr>
-            <th class="batch-id">ID</th><th class="batch-type">类型</th><th class="batch-status">状态</th>
-            <th class="batch-scanned" title="Excel 已扫描到的行号（含唯一键无效、未写入的行）">已扫行</th>
-            <th class="batch-count" title="唯一键有效且已 UPSERT 的行数；不等于 supplement_company_profiles 表总行数">写入成功</th>
-            <th class="batch-count" title="唯一键为空或拼不出，未写入">跳过</th>
-            <th class="batch-time">时间</th><th class="batch-summary">摘要</th><th class="batch-actions">操作</th>
+            <th>ID</th><th>类型</th><th>状态</th>
+            <th title="Excel 已扫描到的行号（含唯一键无效、未写入的行）">已扫行</th>
+            <th title="唯一键有效且已 UPSERT 的行数；不等于 supplement_company_profiles 表总行数">写入成功</th>
+            <th title="唯一键为空或拼不出，未写入">跳过</th>
+            <th>时间</th><th>摘要</th><th>操作</th>
           </tr></thead>
           <tbody>${items.map(b => {
             const hi = highlightBatchId && Number(b.id) === Number(highlightBatchId);
             const rowStyle = hi ? ' style="background:#eef4ff"' : "";
-            const resumeBtn = b.resumable && Number(b.id) === Number(latestResumableId)
-              ? `<div class="batch-action-buttons"><button type="button" class="secondary" onclick="resumeBatch(${b.id})">续传</button></div>`
+            const rt = b.rows_total != null ? Number(b.rows_total) : null;
+            const rr = Number(b.resume_from_row || 0);
+            const scanned = rt != null ? `${rr} / ${rt}` : (rr > 0 ? String(rr) : "—");
+            const resumeBtn = b.resumable
+              ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px;margin-right:4px" onclick="resumeBatch(${b.id})">续传</button>`
+                + `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="abandonBatch(${b.id})">放弃</button>`
               : "";
             return `<tr${rowStyle}>
-            <td class="batch-id">${b.id}</td>
-            <td class="batch-type">${esc(b.definition_code)}</td>
-            <td class="batch-status">${statusBadge(b.status)}</td>
-            <td class="batch-scanned">${scannedCell(b)}</td>
-            <td class="batch-count">${b.rows_ok ?? 0}</td>
-            <td class="batch-count">${b.rows_fail ?? 0}</td>
-            <td class="batch-time">${esc(b.created_at)}</td>
-            <td class="msg-cell batch-summary" title="${esc(b.message || "")}">${esc(shortMessage(b.message)) || "—"}</td>
-            <td class="batch-actions">${resumeBtn}</td>
+            <td>${b.id}</td>
+            <td>${esc(b.definition_code)}</td>
+            <td>${esc(b.status)}</td>
+            <td>${esc(scanned)}</td>
+            <td>${b.rows_ok ?? 0}</td>
+            <td>${b.rows_fail ?? 0}</td>
+            <td>${esc(b.created_at)}</td>
+            <td class="msg-cell">${esc((b.message || "").slice(0, 400))}</td>
+            <td>${resumeBtn}</td>
           </tr>`;
           }).join("") || "<tr><td colspan='9' class='muted'>暂无批次</td></tr>"}</tbody>`;
+        return items;
       }
 
       async function pollBatchUntilDone(batchId) {
@@ -424,13 +312,11 @@
         const maxTicks = 7200;
         for (let i = 0; i < maxTicks; i++) {
           const b = await fetchBatchById(batchId);
-          if (i === 0 || i % 6 === 0) await loadBatches();
+          await loadBatches();
           if (b) {
-            renderCurrentBatchProgress(b);
             msg.textContent = formatBatchStatusLine(b, batchId);
             if (TERMINAL_BATCH.has(String(b.status || ""))) {
               highlightBatchId = 0;
-              await loadBatches();
               return b;
             }
           } else {
@@ -448,7 +334,6 @@
           msg.textContent = "加载中…";
           await loadDefinitions();
           await loadBatches();
-          renderCurrentBatchProgress(null);
           msg.textContent = "";
         } catch (e) {
           msg.textContent = formatFetchError(e);
