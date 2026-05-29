@@ -4299,13 +4299,19 @@ def run_update(
                         )
                     if pl1:
                         last_nav_c = _last_nav_compact_for_update(db, sid)
-                        if last_nav_c and _compact_date(latest_trade) <= last_nav_c:
+                        if (
+                            last_nav_c
+                            and _compact_date(latest_trade) <= last_nav_c
+                            and not full_refresh
+                        ):
                             prog(
                                 f"[{i_active}/{n_active}] {sid}：净值已至 {last_nav_c}，无需补算"
                             )
                         else:
                             lt_c = _compact_date(latest_trade)
-                            if last_nav_c and len(last_nav_c) >= 8:
+                            if full_refresh:
+                                nav_hint = f"全量重算 {pl1['start_c']}~{lt_c}（删库后从首调仓）"
+                            elif last_nav_c and len(last_nav_c) >= 8:
                                 nav_hint = (
                                     f"末净值 {last_nav_c}（nav×本金 bootstrap），"
                                     f"仅补写之后交易日至 {lt_c}；不回放全历史"
@@ -6048,10 +6054,12 @@ def _rebuild_nav_forward_from_anchor(
         return False, wind
 
     inc_max_days = max(1, int(getattr(settings, "nav_incremental_max_sim_days", 31) or 31))
-    use_seg = (
-        len(sim_days) > inc_max_days
-        and bool(getattr(settings, "nav_rebuild_year_segments", True))
-        and (_wind_low_memory_mode() or len(period_codes) > 250)
+    use_nav_segments = bool(getattr(settings, "nav_rebuild_year_segments", True))
+    use_seg = use_nav_segments and (
+        _wind_low_memory_mode()
+        or len(period_codes) > 250
+        or len(sim_days) > inc_max_days
+        or from_start
     )
     nav_persist_chunk = max(50, int(getattr(settings, "nav_rebuild_persist_chunk", 400)))
     nav_accum: list[dict[str, Any]] = []
@@ -6059,13 +6067,84 @@ def _rebuild_nav_forward_from_anchor(
         None if from_start else _nav_fetch_row_on_day(db, sid, append_after_c)
     )
     trade_days_expected_set = set(trade_days)
+    use_verified_flush = from_start or len(sim_days) > inc_max_days
+
+    from app.db import SessionLocalFactory, turso_stream_lock, uses_remote_turso_only
+
+    turso_remote = uses_remote_turso_only()
+
+    def _locked_db_op(fn):
+        if turso_remote:
+            with turso_stream_lock():
+                sess = SessionLocalFactory()
+                try:
+                    return fn(sess)
+                finally:
+                    sess.close()
+        return fn(db)
+
+    def _flush_accum_batch(
+        batch: list[dict[str, Any]],
+        *,
+        last_td: str | None,
+        td_i: int,
+        seg_i: int | None = None,
+        seg_total: int | None = None,
+    ) -> None:
+        if not batch:
+            return
+
+        def _do(sess: Session) -> None:
+            if use_verified_flush:
+                _flush_strategy_nav_daily_batch_verified(
+                    sess,
+                    batch,
+                    sid=sid,
+                    expected_trade_days=trade_days_expected_set,
+                )
+            else:
+                _flush_strategy_nav_daily_batch(sess, batch)
+
+        _locked_db_op(_do)
+        if last_td and (sync_job_id is not None or progress_cb):
+            seg_hint = (
+                f"段 {seg_i}/{seg_total}，"
+                if seg_i is not None and seg_total
+                else ""
+            )
+            _nav_progress_touch(
+                f"阶段2/3 {sid}：净值已写入至 {last_td}（{seg_hint}第 {td_i} 日）",
+                sync_job_id=sync_job_id,
+                progress_cb=progress_cb,
+                db=None if turso_remote else db,
+                turso_remote=turso_remote,
+            )
+        _log_runtime_progress(
+            f"nav:{sid}",
+            f"nav {sid}: flushed {len(batch)} rows through {last_td or '?'}",
+            force=True,
+        )
 
     bench_quads: list = []
     bench_day_map: dict[str, tuple[float | None, float | None]] = {}
     if bench_code:
-        wind, idx_all = wind_bulk.load_index_eod_by_code(
-            wind, [bench_code], eod_start_c, latest_trade_c, db
-        )
+
+        def _load_bench(sess: Session):
+            nonlocal wind
+            w, idx_all = wind_bulk.load_index_eod_by_code(
+                wind, [bench_code], eod_start_c, latest_trade_c, sess
+            )
+            return w, idx_all
+
+        if turso_remote:
+            with turso_stream_lock():
+                bdb = SessionLocalFactory()
+                try:
+                    wind, idx_all = _load_bench(bdb)
+                finally:
+                    bdb.close()
+        else:
+            wind, idx_all = _load_bench(db)
         bench_quads = _bench_quads_for_code(idx_all, bench_code)
         bench_day_map = _index_eod_to_bench_day_map(idx_all, bench_code)
         idx_all.clear()
@@ -6079,10 +6158,11 @@ def _rebuild_nav_forward_from_anchor(
                 f"EOD {eod_start_c}→{latest_trade_c} 补 {len(sim_days)} 日"
             )
         _nav_progress_touch(
-            f"{sid}：{nav_hint} 成分 {len(period_codes)} 只…",
+            f"{sid}：{nav_hint} 成分约 {len(period_codes)} 只…",
             sync_job_id=sync_job_id,
             progress_cb=progress_cb,
-            db=db,
+            db=None if turso_remote else db,
+            turso_remote=turso_remote,
         )
 
     if use_seg:
@@ -6091,6 +6171,20 @@ def _rebuild_nav_forward_from_anchor(
         time_segs = _nav_eod_time_segments(
             eod_start_c, latest_trade_c, step_months=eod_step_months
         )
+        if sync_job_id is not None or progress_cb:
+            nav_mode = (
+                f"全量 {start_c}~{latest_trade_c}"
+                if from_start
+                else f"续算自 {append_after_c} 至 {latest_trade_c}"
+            )
+            _nav_progress_touch(
+                f"阶段2/3 {sid}：{nav_mode}；动态分段 {eod_step_months} 月/段"
+                f"（最新期约 {latest_n} 只），共 {len(time_segs)} 段…",
+                sync_job_id=sync_job_id,
+                progress_cb=progress_cb,
+                db=None if turso_remote else db,
+                turso_remote=turso_remote,
+            )
         sim_rb_idx = 0
         sim_current_rb = rb_sorted[0]
         prev_td_date: date | None = None
@@ -6099,15 +6193,59 @@ def _rebuild_nav_forward_from_anchor(
         prev_mv: float | None = None
         bench_nav_acc: float | None = None
         state_inited = False
-        for seg_st, seg_ed in time_segs:
+        td_i = 0
+        for seg_i, (seg_st, seg_ed) in enumerate(time_segs, start=1):
+            raise_if_shutting_down()
             seg_days = [d for d in sim_days if seg_st <= d <= seg_ed]
             if not seg_days:
                 continue
-            wind, day_map, seg_bench_dm = _load_segment_wind_maps(
-                wind, db, period_codes, seg_st, seg_ed, bench_code
+            seg_codes = _codes_for_nav_segment(
+                rb_sorted, rb_map, shares, seg_st, seg_ed
             )
+            if not seg_codes:
+                continue
+            _log_runtime_progress(
+                f"nav:{sid}:seg",
+                (
+                    f"nav {sid}: segment {seg_i}/{len(time_segs)} load "
+                    f"{seg_st}..{seg_ed} days={len(seg_days)} codes={len(seg_codes)}"
+                ),
+                force=True,
+            )
+            if sync_job_id is not None or progress_cb:
+                _nav_progress_touch(
+                    f"阶段2/3 {sid}：行情段 {seg_i}/{len(time_segs)}"
+                    f"（{seg_st}~{seg_ed}，{len(seg_codes)} 只股票）…",
+                    sync_job_id=sync_job_id,
+                    progress_cb=progress_cb,
+                    db=None if turso_remote else db,
+                    turso_remote=turso_remote,
+                )
+
+            def _load_maps(sess: Session):
+                return _load_segment_wind_maps(
+                    wind, sess, seg_codes, seg_st, seg_ed, bench_code
+                )
+
+            if turso_remote:
+                with turso_stream_lock():
+                    seg_db = SessionLocalFactory()
+                    try:
+                        wind, day_map, seg_bench_dm = _load_maps(seg_db)
+                    finally:
+                        seg_db.close()
+            else:
+                wind, day_map, seg_bench_dm = _load_maps(db)
             if bench_code and seg_bench_dm:
                 bench_day_map.update(seg_bench_dm)
+            _log_runtime_progress(
+                f"nav:{sid}:seg",
+                (
+                    f"nav {sid}: segment {seg_i}/{len(time_segs)} loaded "
+                    f"day_map_codes={len(day_map)} pending_rows={len(nav_accum)}"
+                ),
+                force=True,
+            )
             if not state_inited:
                 if from_start:
                     sim_rb_idx = 0
@@ -6120,7 +6258,7 @@ def _rebuild_nav_forward_from_anchor(
                     state_inited = True
                 else:
                     wind = _nav_ensure_anchor_eod_in_day_map(
-                        wind, db, day_map, period_codes, append_after_c
+                        wind, db, day_map, seg_codes, append_after_c
                     )
                     ok_eod, eod_reason = _nav_incremental_eod_ready(
                         db,
@@ -6128,7 +6266,7 @@ def _rebuild_nav_forward_from_anchor(
                         day_map,
                         append_after_c,
                         anchor_rb,
-                        period_codes,
+                        seg_codes,
                         sim_days,
                     )
                     if not ok_eod:
@@ -6172,6 +6310,28 @@ def _rebuild_nav_forward_from_anchor(
                         return False, wind
                     state_inited = True
             for td in seg_days:
+                if td_i % 15 == 0:
+                    raise_if_shutting_down()
+                td_i += 1
+                if sync_job_id is not None or progress_cb:
+                    if td_i % 15 == 0:
+                        _nav_progress_touch(
+                            f"阶段2/3 {sid}：净值计算 {td}"
+                            f"（段 {seg_i}/{len(time_segs)}，第 {td_i} 日）…",
+                            sync_job_id=sync_job_id,
+                            progress_cb=progress_cb,
+                            db=None if turso_remote else db,
+                            turso_remote=turso_remote,
+                        )
+                if td_i % 30 == 0:
+                    _log_runtime_progress(
+                        f"nav:{sid}",
+                        (
+                            f"nav {sid}: calc td={td} day={td_i} "
+                            f"segment={seg_i}/{len(time_segs)} "
+                            f"pending_rows={len(nav_accum)} shares={len(shares)}"
+                        ),
+                    )
                 td_date = datetime.strptime(td, "%Y%m%d").date()
                 (
                     sim_rb_idx,
@@ -6212,31 +6372,41 @@ def _rebuild_nav_forward_from_anchor(
                     }
                 )
                 if len(nav_accum) >= nav_persist_chunk:
-                    if from_start:
-                        _flush_strategy_nav_daily_batch_verified(
-                            db,
-                            nav_accum,
-                            sid=sid,
-                            expected_trade_days=trade_days_expected_set,
-                        )
-                    else:
-                        _flush_strategy_nav_daily_batch(db, nav_accum)
-                    nav_accum.clear()
+                    batch = nav_accum
+                    nav_accum = []
+                    _flush_accum_batch(
+                        batch,
+                        last_td=td,
+                        td_i=td_i,
+                        seg_i=seg_i,
+                        seg_total=len(time_segs),
+                    )
             day_map.clear()
             if _wind_low_memory_mode():
                 gc.collect()
+
+                def _reopen_wind(sess: Session):
+                    nonlocal wind
+                    try:
+                        wind_sql.close_wind(wind, sess)
+                    except Exception:
+                        pass
+                    wind = wind_sql.open_wind(sess)
+
+                _locked_db_op(_reopen_wind)
         if not state_inited:
             return False, wind
         if nav_accum:
-            if from_start:
-                _flush_strategy_nav_daily_batch_verified(
-                    db,
-                    nav_accum,
-                    sid=sid,
-                    expected_trade_days=trade_days_expected_set,
-                )
-            else:
-                _flush_strategy_nav_daily_batch(db, nav_accum)
+            tail_td = None
+            td_val = nav_accum[-1].get("td")
+            if td_val is not None:
+                tail_td = _compact_date(td_val)
+            _flush_accum_batch(
+                nav_accum,
+                last_td=tail_td,
+                td_i=td_i,
+                seg_total=len(time_segs),
+            )
             nav_accum.clear()
         _log.info(
             "nav forward %s: %s..%s%s",
@@ -6343,7 +6513,18 @@ def _rebuild_nav_forward_from_anchor(
             )
             day_map.clear()
             return False, wind
+    td_i = 0
     for td in sim_days:
+        td_i += 1
+        if sync_job_id is not None or progress_cb:
+            if td_i % 15 == 0:
+                _nav_progress_touch(
+                    f"阶段2/3 {sid}：净值计算 {td}（第 {td_i}/{len(sim_days)} 日）…",
+                    sync_job_id=sync_job_id,
+                    progress_cb=progress_cb,
+                    db=None if turso_remote else db,
+                    turso_remote=turso_remote,
+                )
         td_date = datetime.strptime(td, "%Y%m%d").date()
         (
             sim_rb_idx,
@@ -6384,27 +6565,13 @@ def _rebuild_nav_forward_from_anchor(
             }
         )
         if len(nav_accum) >= nav_persist_chunk:
-            if from_start:
-                _flush_strategy_nav_daily_batch_verified(
-                    db,
-                    nav_accum,
-                    sid=sid,
-                    expected_trade_days=trade_days_expected_set,
-                )
-            else:
-                _flush_strategy_nav_daily_batch(db, nav_accum)
-            nav_accum.clear()
+            batch = nav_accum
+            nav_accum = []
+            _flush_accum_batch(batch, last_td=td, td_i=td_i)
     day_map.clear()
     if nav_accum:
-        if from_start:
-            _flush_strategy_nav_daily_batch_verified(
-                db,
-                nav_accum,
-                sid=sid,
-                expected_trade_days=trade_days_expected_set,
-            )
-        else:
-            _flush_strategy_nav_daily_batch(db, nav_accum)
+        tail_td = _compact_date(nav_accum[-1]["td"]) if nav_accum else None
+        _flush_accum_batch(nav_accum, last_td=tail_td, td_i=td_i)
         nav_accum.clear()
     if _wind_low_memory_mode():
         gc.collect()
