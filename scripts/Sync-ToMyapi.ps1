@@ -46,11 +46,8 @@ if ($rc -ge 8) {
     throw "robocopy 失败，退出码 $rc"
 }
 
-Write-Host "同步完成。请在 myapi 中执行:"
+Write-Host "同步完成。助手将在 myapi 内 add/commit；你只需 push:"
 Write-Host "  cd $Dest"
-Write-Host "  git status"
-Write-Host "  git add -A"
-Write-Host "  git commit -m \"...\""
 Write-Host "  git push origin main"
 # robocopy 1-7 也视为成功
 exit 0
