@@ -75,6 +75,7 @@ from app.services import (
     find_resumable_strategy_import_job,
     count_strategy_positions_rows,
     admin_sync_job_is_resumable,
+    admin_sync_job_bootstrap_checkpoint,
     abandon_strategy_import_job,
     abandon_admin_sync_job,
     reconcile_stale_admin_sync_jobs,
@@ -4246,8 +4247,14 @@ def admin_sync_job_resume(
     st = str(row.get("status") or "").upper()
     if st not in ("FAILED",):
         raise HTTPException(status_code=400, detail=f"仅 FAILED 任务可续传（当前 {st}）")
+    row_d = dict(row)
+    if not admin_sync_job_is_resumable(row_d):
+        raise HTTPException(status_code=400, detail="该同步任务不可续传")
     if not row.get("checkpoint_json"):
-        raise HTTPException(status_code=400, detail="无断点记录，请重新发起同步")
+        try:
+            admin_sync_job_bootstrap_checkpoint(db, job_id, do_commit=False)
+        except ValueError as ex:
+            raise HTTPException(status_code=404, detail=str(ex)) from ex
     row_run = db.execute(text("SELECT id FROM admin_sync_jobs WHERE status='RUNNING' LIMIT 1")).first()
     if row_run and int(row_run[0]) != job_id:
         raise HTTPException(status_code=409, detail=f"已有同步任务 RUNNING id={row_run[0]}")

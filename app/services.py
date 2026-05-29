@@ -3384,6 +3384,59 @@ def _sync_save_checkpoint(
         db.commit()
 
 
+def admin_sync_job_bootstrap_checkpoint(
+    db: Session,
+    sync_job_id: int,
+    *,
+    strategy_ids: list[str] | None = None,
+    import_mode: str | None = None,
+    skip_excel_import: bool = True,
+    do_commit: bool = True,
+) -> dict[str, Any]:
+    """checkpoint_json 为空时写入初始断点，避免「可续传」但无断点记录。"""
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT checkpoint_json, strategy_ids_json, import_mode
+                FROM admin_sync_jobs WHERE id=:id
+                """
+            ),
+            {"id": sync_job_id},
+        )
+        .mappings()
+        .first()
+    )
+    if not row:
+        raise ValueError("sync job not found")
+    raw_ck = row.get("checkpoint_json")
+    if raw_ck is not None and str(raw_ck).strip():
+        return _sync_load_checkpoint(raw_ck)
+    ids = [str(x).strip() for x in (strategy_ids or []) if str(x).strip()]
+    if not ids:
+        ids = _json_str_list(row.get("strategy_ids_json"))
+    mode = str(import_mode or row.get("import_mode") or "incremental").strip().lower()
+    completed_import = list(ids) if skip_excel_import or mode == "full" else []
+    stage = "nav" if skip_excel_import else "import"
+    _sync_save_checkpoint(
+        db,
+        sync_job_id,
+        completed_import=completed_import,
+        completed_nav=[],
+        completed_update_rb=[],
+        stage=stage,
+        nav_progress={},
+        do_commit=do_commit,
+    )
+    return {
+        "completed_import": completed_import,
+        "completed_nav": [],
+        "completed_update_rb": [],
+        "nav_progress": {},
+        "stage": stage,
+    }
+
+
 def _sync_nav_progress_map(raw: Any) -> dict[str, dict[str, str]]:
     out: dict[str, dict[str, str]] = {}
     if not isinstance(raw, dict):
@@ -3871,6 +3924,21 @@ def abandon_admin_sync_job(db: Session, job_id: int) -> None:
 def reconcile_stale_admin_sync_jobs(db: Session, *, do_commit: bool = True) -> None:
     """将长时间无进度更新的 RUNNING/超时 QUEUED 标为 FAILED，便于续传或重新发起。"""
     stale_mins = max(5, int(getattr(settings, "admin_sync_stale_progress_minutes", 30)))
+    stale_rows = (
+        db.execute(
+            text(
+                f"""
+                SELECT id FROM admin_sync_jobs
+                WHERE status='RUNNING'
+                  AND COALESCE(progress_at, started_at, created_at)
+                      < {sql_minutes_ago(':mins')}
+                """
+            ),
+            {"mins": stale_mins},
+        )
+        .scalars()
+        .all()
+    )
     db.execute(
         text(
             f"""
@@ -3897,6 +3965,11 @@ def reconcile_stale_admin_sync_jobs(db: Session, *, do_commit: bool = True) -> N
         ),
         {"qmins": 2},
     )
+    for job_id in stale_rows:
+        try:
+            admin_sync_job_bootstrap_checkpoint(db, int(job_id), do_commit=False)
+        except Exception:
+            _log.exception("admin_sync job %s: bootstrap checkpoint after stale reconcile", job_id)
     if do_commit:
         db.commit()
 
@@ -7271,6 +7344,11 @@ def _finalize_admin_sync_job(job_id: int, result: dict) -> None:
     with turso_stream_lock():
         db = SessionLocalFactory()
         try:
+            if (not ok) and bool(result.get("resumable")):
+                try:
+                    admin_sync_job_bootstrap_checkpoint(db, job_id, do_commit=False)
+                except Exception:
+                    _log.exception("admin_sync job %s: bootstrap checkpoint on finalize failed", job_id)
             db.execute(
                 text(
                     f"""
@@ -7420,6 +7498,15 @@ def execute_admin_sync_pipeline(
                 import_pending = False
             else:
                 import_pending = not (ids_set <= completed_import)
+            if sync_job_id is not None:
+                admin_sync_job_bootstrap_checkpoint(
+                    db,
+                    sync_job_id,
+                    strategy_ids=ids,
+                    import_mode=import_mode,
+                    skip_excel_import=skip_excel_import,
+                    do_commit=True,
+                )
         except Exception as ex:
             try:
                 db.rollback()
@@ -7689,6 +7776,7 @@ def execute_admin_sync_pipeline(
         return {
             "ok": False,
             "stage": "update",
+            "resumable": True,
             "imported": (imp or {}).get("imported", 0),
             "nav_rebuilt": (nav_ret or {}).get("rebuilt", 0),
             "failed": len(ids),
