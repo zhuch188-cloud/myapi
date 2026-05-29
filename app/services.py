@@ -2819,7 +2819,7 @@ def _holding_quote_td_compact(
     period_end_compact: str | None,
     latest_trade: str | date,
 ) -> str:
-    """行情/PE/PB 截止日：历史调仓期用本期段末日，当前开放期用 Wind 最新交易日。"""
+    """市值/PE/PB/行业截止日：与本期收益率 asof 一致；历史段用段末日，开放期用最新交易日。"""
     pe = str(period_end_compact or "").strip().replace("-", "")[:8]
     if len(pe) == 8 and pe.isdigit():
         return pe
@@ -2869,12 +2869,12 @@ def _build_holding_daily_row_from_wind(
         }
     latest_price = float(quote["latest_price"] or 0.0)
     prev_close = float(quote["prev_close"] or 0.0)
-    lt_compact = str(latest_trade).strip().replace("-", "")[:8]
     rb_compact_this = _compact_date(rebalance)
     period_start_close = wind_bulk.first_close_on_or_after(eod_series, rb_compact_this)
+    asof_c = _holding_quote_td_compact(period_end_compact, latest_trade)
+    historical_segment = period_end_compact is not None
 
-    if period_end_compact:
-        asof_c = period_end_compact
+    if historical_segment:
         seg = wind_bulk.series_on_or_before(eod_series, asof_c)
         period_end_px = wind_bulk.last_close_on_or_before(eod_series, asof_c)
         period_ret = _safe_return(period_end_px, period_start_close)
@@ -2891,7 +2891,6 @@ def _build_holding_daily_row_from_wind(
         )
         row_price = px
     else:
-        asof_c = lt_compact
         day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
         if day_ret is None:
             day_ret = _safe_return(latest_price, prev_close)
@@ -4483,8 +4482,6 @@ def run_update(
                 eod_by_code = {c: full_eod[c] for c in stock_codes if c in full_eod}
                 if bench_code and bench_code in wind_merged["idx"]:
                     index_eod_by_code[bench_code] = wind_merged["idx"][bench_code]
-                full_qu = wind_merged["quote"]
-                quote_map = {k: full_qu[k] for k in stock_codes if k in full_qu}
             elif rb_chunked_eod:
                 if n_rb_wind <= 0:
                     prog(f"[{i_active}/{n_active}] {sid}：无待拉 Wind 的调仓期")
@@ -4506,9 +4503,6 @@ def run_update(
                     wind, index_eod_by_code = wind_bulk.load_index_eod_by_code(
                         wind, [bench_code], start_c, str(latest_trade), db
                     )
-                wind, quote_map = _fetch_wind_quote_map_batched(
-                    db, wind, eod_codes, latest_trade
-                )
 
             eod_local = eod_by_code if wind_merged is None and not rb_chunked_eod else None
             skip_rb = _sync_update_rb_done_for_strategy(
@@ -4761,13 +4755,9 @@ def run_update(
                         }
                     )
                     quote_td = _holding_quote_td_compact(period_end_c, latest_trade)
-                    if period_end_c and quote_td != _compact_date(latest_trade):
-                        wind, quote_period = _fetch_wind_quote_map_batched(
-                            db, wind, period_codes_q, quote_td
-                        )
-                        qmap = quote_period
-                    else:
-                        qmap = quote_map
+                    wind, qmap = _fetch_wind_quote_map_batched(
+                        db, wind, period_codes_q, quote_td
+                    )
                     for p in positions:
                         total_weight += max(float(p["holding_weight"] or 0.0), 0.0)
                         wk = _wind_code_key(p["stock_code"])
@@ -4784,8 +4774,7 @@ def run_update(
                                 desc_max_bars=holding_desc_bars,
                             )
                         )
-                    if period_end_c and quote_td != _compact_date(latest_trade):
-                        quote_period.clear()
+                    qmap.clear()
                     wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     _flush_one_rebalance(
                         i_rb,
