@@ -34,7 +34,7 @@ Write-Host ""
 # robocopy: 0-7 成功或仅多余文件；>=8 失败
 $robocopyArgs = @(
     $Source, $Dest,
-    "/E", "/XO",
+    "/E", "/IM", "/IT", "/IS",
     "/XD", ".git", ".venv", "__pycache__", ".pytest_cache", ".turso",
     "server-data", ".cursor", "node_modules", "logs",
     "/XF", ".env",
