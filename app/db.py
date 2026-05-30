@@ -223,13 +223,22 @@ def _is_turso_cloud_host(url: str) -> bool:
     return any(m in lower for m in _TURSO_CLOUD_HOST_MARKERS)
 
 
+def _strip_libsql_tls_query(url: str) -> str:
+    """明文 http:// 连接不需要 tls=0 查询参数。"""
+    if "?" not in url:
+        return url
+    base, query = url.split("?", 1)
+    kept = [p for p in query.split("&") if p and p.lower() not in ("tls=0", "tls=false")]
+    return base if not kept else f"{base}?{'&'.join(kept)}"
+
+
 def _resolve_libsql_connect_url(url: str) -> str:
     """
     将 TURSO_DATABASE_URL 转为 libsql.connect 可用的地址。
 
     - Turso 云：libsql://*.turso.io（Hrana over TLS，需 token）
-    - 本地 Docker sqld：明文 HTTP，须为 http://host:port；若写 libsql://host:port
-      客户端会按 TLS 握手，sqld 返回非 Hrana 响应 → InvalidContentType。
+    - 本地 Docker sqld / ngrok：须转为 http://host:port；libsql://…?tls=0 在 Python
+      libsql 0.1.x 仍会 InvalidContentType，http:// 已实测可用。
     """
     u = (url or "").strip()
     if not u:
@@ -245,11 +254,11 @@ def _resolve_libsql_connect_url(url: str) -> str:
         rest = u[len("libsql://") :]
         if _is_turso_cloud_host(rest):
             return u
-        return f"http://{rest}"
+        return _strip_libsql_tls_query(f"http://{rest}")
     if "://" not in u:
         if _is_turso_cloud_host(u):
             return f"libsql://{u}"
-        return f"http://{u}"
+        return _strip_libsql_tls_query(f"http://{u}")
     return u
 
 
