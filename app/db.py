@@ -174,16 +174,23 @@ def run_under_turso_stream_lock(fn, *, timeout: float | None = None):
 
 
 class _LibsqlCursor:
-    def __init__(self, cursor):
+    def __init__(self, adapter: "_LibsqlDbapiAdapter", cursor):
+        self._adapter = adapter
         self._cursor = cursor
 
     def execute(self, statement, parameters=None):
-        return self._cursor.execute(statement, coerce_bind_parameters(parameters))
+        params = coerce_bind_parameters(parameters)
+        return self._adapter._run_with_hrana_retry(
+            lambda: self._cursor.execute(statement, params),
+            refresh_cursor=lambda: setattr(self, "_cursor", self._adapter._conn.cursor()),
+        )
 
     def executemany(self, statement, parameters):
         seq = parameters or []
-        return self._cursor.executemany(
-            statement, [coerce_bind_parameters(p) for p in seq]
+        bound = [coerce_bind_parameters(p) for p in seq]
+        return self._adapter._run_with_hrana_retry(
+            lambda: self._cursor.executemany(statement, bound),
+            refresh_cursor=lambda: setattr(self, "_cursor", self._adapter._conn.cursor()),
         )
 
     def __getattr__(self, name):
@@ -193,19 +200,55 @@ class _LibsqlCursor:
 class _LibsqlDbapiAdapter:
     """包装 libsql 连接，满足 SQLAlchemy sqlite 方言对 create_function 的调用。"""
 
+    _HRANA_RETRY_ATTEMPTS = 3
+
     def __init__(self, conn):
         self._conn = conn
 
+    def _reconnect(self) -> None:
+        try:
+            close = getattr(self._conn, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        self._conn = _open_libsql_raw_connection()
+
+    def _run_with_hrana_retry(self, fn, *, refresh_cursor=None):
+        last_exc: Exception | None = None
+        for attempt in range(self._HRANA_RETRY_ATTEMPTS):
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                if not _is_hrana_stream_expired(exc) or attempt + 1 >= self._HRANA_RETRY_ATTEMPTS:
+                    raise
+                _log.warning(
+                    "Hrana stream expired, reconnecting (%s/%s)",
+                    attempt + 2,
+                    self._HRANA_RETRY_ATTEMPTS,
+                )
+                self._reconnect()
+                if refresh_cursor is not None:
+                    refresh_cursor()
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Hrana retry exhausted")
+
     def cursor(self):
-        return _LibsqlCursor(self._conn.cursor())
+        return _LibsqlCursor(self, self._conn.cursor())
 
     def execute(self, statement, parameters=None):
-        return self._conn.execute(statement, coerce_bind_parameters(parameters))
+        params = coerce_bind_parameters(parameters)
+        return self._run_with_hrana_retry(
+            lambda: self._conn.execute(statement, params),
+        )
 
     def executemany(self, statement, parameters):
         seq = parameters or []
-        return self._conn.executemany(
-            statement, [coerce_bind_parameters(p) for p in seq]
+        bound = [coerce_bind_parameters(p) for p in seq]
+        return self._run_with_hrana_retry(
+            lambda: self._conn.executemany(statement, bound),
         )
 
     def create_function(self, name, num_params, func, deterministic=False):
@@ -213,6 +256,15 @@ class _LibsqlDbapiAdapter:
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
+
+
+def _is_hrana_stream_expired(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "stream_expired" in msg
+        or "stream has expired" in msg
+        or "stream not found" in msg
+    )
 
 
 _TURSO_CLOUD_HOST_MARKERS = (".turso.io", ".turso.cloud")
@@ -264,16 +316,23 @@ def _resolve_libsql_connect_url(url: str) -> str:
 
 def _libsql_connect():
     remote = (settings.turso_database_url or "").strip()
+    if remote:
+        resolved = _resolve_libsql_connect_url(remote)
+        if resolved != remote:
+            _log.info(
+                "libsql connect URL normalized (local sqld uses http, not libsql TLS): %s",
+                resolved.split("?")[0],
+            )
+    return _LibsqlDbapiAdapter(_open_libsql_raw_connection())
+
+
+def _open_libsql_raw_connection():
+    remote = (settings.turso_database_url or "").strip()
     token = (settings.turso_auth_token or "").strip()
     if not remote:
         raise RuntimeError("TURSO_DATABASE_URL is required")
 
     connect_url = _resolve_libsql_connect_url(remote)
-    if connect_url != remote:
-        _log.info(
-            "libsql connect URL normalized (local sqld uses http, not libsql TLS): %s",
-            connect_url.split("?")[0],
-        )
 
     connect_kw: dict = {"_check_same_thread": False}
     if token:
@@ -285,14 +344,12 @@ def _libsql_connect():
         if not path.is_absolute():
             path = _PROJECT_ROOT / path
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = libsql.connect(
+        return libsql.connect(
             f"file:{path.as_posix()}",
             sync_url=connect_url,
             **connect_kw,
         )
-    else:
-        conn = libsql.connect(connect_url, **connect_kw)
-    return _LibsqlDbapiAdapter(conn)
+    return libsql.connect(connect_url, **connect_kw)
 
 
 def create_app_engine():
@@ -323,6 +380,11 @@ def create_app_engine():
     @event.listens_for(eng, "handle_error")
     def _release_on_cursor_error(exception_context, *_args, **_kwargs):
         _statement_lock_release(getattr(exception_context, "connection", None))
+        exc = exception_context.original_exception
+        if exc is not None and _is_hrana_stream_expired(exc):
+            conn = getattr(exception_context, "connection", None)
+            if conn is not None:
+                conn.invalidate()
 
     return eng
 
