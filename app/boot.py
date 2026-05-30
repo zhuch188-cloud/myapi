@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Callable
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import text
 
-from app.db import init_database
+from app.db import init_database, is_hrana_transient_error
 from app.scheduled_update_config import (
     daily_job_cron_value,
     register_daily_update_job,
@@ -129,38 +130,54 @@ def reschedule_daily_update_job(
 
 
 def _boot_worker(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None]) -> None:
-    try:
-        _log.info("后台启动：开始初始化 Turso 数据库（远程建表可能需 30～120 秒）…")
-        init_database()
+    boot_attempts = 5
+    for boot_i in range(boot_attempts):
         try:
-            wind_sql.init_wind_backend()
-        except Exception as e:
-            _log.warning("Wind 初始化异常（已忽略）: %s", e)
-        interrupted_update = _clear_stale_jobs()
-        import app.services as _svc
-        from app.db import SessionLocalFactory, turso_stream_lock
-        from app.site_settings_cache import reload_from_session
-
-        _svc._job_running = False
-        with turso_stream_lock():
-            db = SessionLocalFactory()
+            _log.info("后台启动：开始初始化 Turso 数据库（远程建表可能需 30～120 秒）…")
+            init_database()
             try:
-                reload_from_session(db)
-            finally:
-                db.close()
-        _start_scheduler(scheduler, scheduled_fn)
-        _state["ready"] = True
-        _log.info("后台启动：数据库与调度器已就绪")
-        if interrupted_update:
-            _log.info("检测到重启前未完成的更新任务，将自动续跑 run_update")
-            spawn_daemon("restart-resume-update", resume_interrupted_update_after_restart)
-    except Exception as e:
-        _state["error"] = str(e)
-        _log.critical(
-            "后台启动失败（请检查 TURSO_DATABASE_URL；连接 Turso 云库时需 TURSO_AUTH_TOKEN）: %s",
-            e,
-            exc_info=True,
-        )
+                wind_sql.init_wind_backend()
+            except Exception as e:
+                _log.warning("Wind 初始化异常（已忽略）: %s", e)
+            interrupted_update = _clear_stale_jobs()
+            import app.services as _svc
+            from app.db import SessionLocalFactory, turso_stream_lock
+            from app.site_settings_cache import reload_from_session
+
+            _svc._job_running = False
+            with turso_stream_lock():
+                db = SessionLocalFactory()
+                try:
+                    reload_from_session(db)
+                finally:
+                    db.close()
+            _start_scheduler(scheduler, scheduled_fn)
+            _state["ready"] = True
+            _state["error"] = None
+            _log.info("后台启动：数据库与调度器已就绪")
+            if interrupted_update:
+                _log.info("检测到重启前未完成的更新任务，将自动续跑 run_update")
+                spawn_daemon("restart-resume-update", resume_interrupted_update_after_restart)
+            return
+        except Exception as e:
+            if is_hrana_transient_error(e) and boot_i + 1 < boot_attempts:
+                wait = min(3 * (2**boot_i), 30)
+                _log.warning(
+                    "数据库初始化 transient 失败，%ss 后重试 (%s/%s): %s",
+                    wait,
+                    boot_i + 2,
+                    boot_attempts,
+                    e,
+                )
+                time.sleep(wait)
+                continue
+            _state["error"] = str(e)
+            _log.critical(
+                "后台启动失败（请检查 TURSO_DATABASE_URL；连接 Turso 云库时需 TURSO_AUTH_TOKEN）: %s",
+                e,
+                exc_info=True,
+            )
+            return
 
 
 def start_background_boot(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None]) -> None:

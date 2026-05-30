@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 import libsql
@@ -200,10 +201,11 @@ class _LibsqlCursor:
 class _LibsqlDbapiAdapter:
     """包装 libsql 连接，满足 SQLAlchemy sqlite 方言对 create_function 的调用。"""
 
-    _HRANA_RETRY_ATTEMPTS = 3
-
     def __init__(self, conn):
         self._conn = conn
+
+    def _retry_attempts(self) -> int:
+        return 5 if _uses_fragile_remote_sqld() else 3
 
     def _reconnect(self) -> None:
         try:
@@ -216,21 +218,24 @@ class _LibsqlDbapiAdapter:
 
     def _run_with_hrana_retry(self, fn, *, refresh_cursor=None):
         last_exc: Exception | None = None
-        for attempt in range(self._HRANA_RETRY_ATTEMPTS):
+        attempts = self._retry_attempts()
+        for attempt in range(attempts):
             try:
                 return fn()
             except Exception as exc:
                 last_exc = exc
-                if not _is_hrana_stream_expired(exc) or attempt + 1 >= self._HRANA_RETRY_ATTEMPTS:
+                if not is_hrana_transient_error(exc) or attempt + 1 >= attempts:
                     raise
                 _log.warning(
-                    "Hrana stream expired, reconnecting (%s/%s)",
+                    "Hrana transient error, reconnecting (%s/%s): %s",
                     attempt + 2,
-                    self._HRANA_RETRY_ATTEMPTS,
+                    attempts,
+                    exc,
                 )
                 self._reconnect()
                 if refresh_cursor is not None:
                     refresh_cursor()
+                time.sleep(min(0.25 * (2**attempt), 2.0))
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("Hrana retry exhausted")
@@ -258,13 +263,26 @@ class _LibsqlDbapiAdapter:
         return getattr(self._conn, name)
 
 
-def _is_hrana_stream_expired(exc: BaseException) -> bool:
+def is_hrana_transient_error(exc: BaseException) -> bool:
+    """Hrana / 远程 sqld 可重试的瞬时错误（ngrok 断流、STREAM_EXPIRED 等）。"""
     msg = str(exc).lower()
-    return (
-        "stream_expired" in msg
-        or "stream has expired" in msg
-        or "stream not found" in msg
-    )
+    if any(
+        n in msg
+        for n in (
+            "stream_expired",
+            "stream has expired",
+            "stream not found",
+            "connection closed before message completed",
+            "connection reset",
+            "broken pipe",
+            "unexpected eof",
+            "incomplete message",
+        )
+    ):
+        return True
+    if "hrana" in msg and "http error" in msg:
+        return True
+    return False
 
 
 _TURSO_CLOUD_HOST_MARKERS = (".turso.io", ".turso.cloud")
@@ -312,6 +330,28 @@ def _resolve_libsql_connect_url(url: str) -> str:
             return f"libsql://{u}"
         return _strip_libsql_tls_query(f"http://{u}")
     return u
+
+
+def _uses_fragile_remote_sqld() -> bool:
+    """ngrok / 自建明文 sqld：长连接易断，Turso 云与本地 file/replica 除外。"""
+    if (settings.turso_local_replica or "").strip():
+        return False
+    remote = (settings.turso_database_url or "").strip()
+    if not remote:
+        return False
+    resolved = _resolve_libsql_connect_url(remote)
+    lower = resolved.lower()
+    if lower.startswith("file:"):
+        return False
+    return not _is_turso_cloud_host(resolved)
+
+
+def _init_db_run(engine, fn) -> None:
+    """建库阶段：丢弃连接池并单条短连接执行（降低 ngrok 长 Hrana 流中断）。"""
+    engine.dispose()
+    with engine.connect() as conn:
+        fn(conn)
+        conn.commit()
 
 
 def _libsql_connect():
@@ -381,7 +421,7 @@ def create_app_engine():
     def _release_on_cursor_error(exception_context, *_args, **_kwargs):
         _statement_lock_release(getattr(exception_context, "connection", None))
         exc = exception_context.original_exception
-        if exc is not None and _is_hrana_stream_expired(exc):
+        if exc is not None and is_hrana_transient_error(exc):
             conn = getattr(exception_context, "connection", None)
             if conn is not None:
                 conn.invalidate()
@@ -621,10 +661,9 @@ def _apply_date_text_normalization(conn) -> None:
 
 def init_database() -> None:
     engine = create_app_engine()
-    with engine.connect() as conn:
-        for stmt in _SCHEMA_STATEMENTS:
-            conn.execute(text(stmt))
-        _apply_runtime_schema_migrations(conn)
+    fragile = _uses_fragile_remote_sqld()
+
+    def _seed_defaults(conn) -> None:
         conn.execute(
             text(
                 """
@@ -762,7 +801,20 @@ def init_database() -> None:
                 """
             )
         )
-        conn.commit()
+
+    if fragile:
+        _log.info("远程 sqld（ngrok/自建 HTTP）：schema 逐条短连接执行")
+        for stmt in _SCHEMA_STATEMENTS:
+            _init_db_run(engine, lambda c, s=stmt: c.execute(text(s)))
+        _init_db_run(engine, _apply_runtime_schema_migrations)
+        _init_db_run(engine, _seed_defaults)
+    else:
+        with engine.connect() as conn:
+            for stmt in _SCHEMA_STATEMENTS:
+                conn.execute(text(stmt))
+            _apply_runtime_schema_migrations(conn)
+            _seed_defaults(conn)
+            conn.commit()
 
     global SessionLocalFactory
     SessionLocalFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
