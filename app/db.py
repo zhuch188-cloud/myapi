@@ -220,8 +220,10 @@ def _libsql_connect():
     token = (settings.turso_auth_token or "").strip()
     if not remote:
         raise RuntimeError("TURSO_DATABASE_URL is required")
-    if not token:
-        raise RuntimeError("TURSO_AUTH_TOKEN is required")
+
+    connect_kw: dict = {"_check_same_thread": False}
+    if token:
+        connect_kw["auth_token"] = token
 
     replica = (settings.turso_local_replica or "").strip()
     if replica:
@@ -232,11 +234,10 @@ def _libsql_connect():
         conn = libsql.connect(
             f"file:{path.as_posix()}",
             sync_url=remote,
-            auth_token=token,
-            _check_same_thread=False,
+            **connect_kw,
         )
     else:
-        conn = libsql.connect(remote, auth_token=token, _check_same_thread=False)
+        conn = libsql.connect(remote, **connect_kw)
     return _LibsqlDbapiAdapter(conn)
 
 
