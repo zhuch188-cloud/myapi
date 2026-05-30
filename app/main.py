@@ -1471,51 +1471,70 @@ def _bind_date_compact(val: object | None) -> str | None:
 
 
 def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> dict[str, dict]:
-    """净值表最后交易日 + 该日最新调仓期持仓股票数（日期比较用 compact，与排行榜一致）。"""
+    """
+    净值表最后交易日 + 该日最新调仓期持仓股票数。
+    两步查询：nav 表取末日（行数小）；holding 用 trade_date 等值走 idx_daily，仅扫该日分区。
+    """
     if not strategy_ids:
         return {}
     quoted = ",".join("'" + s.replace("'", "''") + "'" for s in strategy_ids)
-    td_h = sql_date_compact_expr("h.trade_date")
-    td_n = sql_date_compact_expr("n.last_trade_date")
-    rb_h = sql_date_compact_expr("h.rebalance_date")
-    rb_x = sql_date_compact_expr("x.rebalance_date")
-    rows = db.execute(
+    nav_rows = db.execute(
         text(
             f"""
-            SELECT n.strategy_id AS strategy_id, n.last_trade_date AS last_trade_date,
-                   COUNT(DISTINCT h.stock_code) AS stock_cnt
-            FROM (
-                SELECT nd.strategy_id, nd.trade_date AS last_trade_date
-                FROM strategy_nav_daily nd
-                INNER JOIN (
-                    SELECT strategy_id, {sql_max_date_expr("trade_date")} AS mx
-                    FROM strategy_nav_daily
-                    WHERE strategy_id IN ({quoted})
-                    GROUP BY strategy_id
-                ) mm ON mm.strategy_id = nd.strategy_id
-                    AND {sql_date_compact_expr("nd.trade_date")} = mm.mx
-            ) n
-            LEFT JOIN strategy_holding_daily h
-              ON h.strategy_id = n.strategy_id
-             AND {td_h} = {td_n}
-             AND {rb_h} = (
-                    SELECT MAX({rb_x})
-                    FROM strategy_holding_daily x
-                    WHERE x.strategy_id = n.strategy_id
-                      AND {sql_date_compact_expr("x.trade_date")} = {td_n}
-                  )
-            GROUP BY n.strategy_id, n.last_trade_date
+            SELECT nd.strategy_id AS strategy_id, nd.trade_date AS last_trade_date
+            FROM strategy_nav_daily nd
+            INNER JOIN (
+                SELECT strategy_id, {sql_max_date_expr("trade_date")} AS mx
+                FROM strategy_nav_daily
+                WHERE strategy_id IN ({quoted})
+                GROUP BY strategy_id
+            ) mm ON mm.strategy_id = nd.strategy_id
+                AND {sql_date_compact_expr("nd.trade_date")} = mm.mx
             """
         )
     ).mappings().all()
     out: dict[str, dict] = {}
-    for r in rows:
+    by_td: dict[str, list[str]] = {}
+    for r in nav_rows:
         sid = str(r["strategy_id"])
-        td = r.get("last_trade_date")
+        td_raw = r.get("last_trade_date")
         out[sid] = {
-            "last_trade_date": str(td)[:10] if td is not None else None,
-            "stock_count": int(r["stock_cnt"] or 0),
+            "last_trade_date": str(td_raw)[:10] if td_raw is not None else None,
+            "stock_count": 0,
         }
+        td_bind = normalize_sql_date_text(td_raw)
+        if td_bind:
+            by_td.setdefault(td_bind, []).append(sid)
+    if not by_td:
+        return out
+
+    rb_h = sql_date_compact_expr("h.rebalance_date")
+    rb_x = sql_date_compact_expr("x.rebalance_date")
+    for td_bind, sids in by_td.items():
+        q_sids = ",".join("'" + s.replace("'", "''") + "'" for s in sids)
+        hold_rows = db.execute(
+            text(
+                f"""
+                SELECT h.strategy_id AS strategy_id, COUNT(DISTINCT h.stock_code) AS stock_cnt
+                FROM strategy_holding_daily h
+                INNER JOIN (
+                    SELECT strategy_id, MAX({rb_x}) AS mx_rb
+                    FROM strategy_holding_daily
+                    WHERE strategy_id IN ({q_sids})
+                      AND trade_date = :td
+                    GROUP BY strategy_id
+                ) m ON m.strategy_id = h.strategy_id
+                   AND h.trade_date = :td
+                   AND {rb_h} = m.mx_rb
+                GROUP BY h.strategy_id
+                """
+            ),
+            {"td": td_bind},
+        ).mappings().all()
+        for hr in hold_rows:
+            sid = str(hr["strategy_id"])
+            if sid in out:
+                out[sid]["stock_count"] = int(hr["stock_cnt"] or 0)
     return out
 
 

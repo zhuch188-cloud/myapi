@@ -81,20 +81,19 @@ async function summaryFor(sid) {
     }
   }
   const ret = (a, b) => (b > 0 ? a / b - 1 : null);
-  const tdCmp = cmp(lastTd);
   const stockCnt = (
     await db.execute({
       sql: `SELECT COUNT(DISTINCT h.stock_code) AS c
             FROM strategy_holding_daily h
             WHERE h.strategy_id = ?
-              AND REPLACE(SUBSTR(h.trade_date, 1, 10), '-', '') = ?
+              AND h.trade_date = ?
               AND REPLACE(SUBSTR(h.rebalance_date, 1, 10), '-', '') = (
                 SELECT MAX(REPLACE(SUBSTR(x.rebalance_date, 1, 10), '-', ''))
                 FROM strategy_holding_daily x
                 WHERE x.strategy_id = ?
-                  AND REPLACE(SUBSTR(x.trade_date, 1, 10), '-', '') = ?
+                  AND x.trade_date = ?
               )`,
-      args: [sid, tdCmp, sid, tdCmp],
+      args: [sid, lastTd, sid, lastTd],
     })
   ).rows[0]?.c;
   return {
