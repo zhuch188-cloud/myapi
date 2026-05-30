@@ -1834,7 +1834,7 @@ def health(verbose: bool = False):
         "db_ready": db_ready,
         "db_error": err,
         "service": "strategy-showcase-python",
-        "turso_configured": bool(turso_url and (settings.turso_auth_token or "").strip()),
+        "turso_configured": bool(turso_url),
         "wind_data_source": "sqlserver" if wind_ok else "disabled",
         "wind_sqlserver_ready": wind_ok,
         "wind_sqlserver": wind_st,

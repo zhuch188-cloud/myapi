@@ -157,7 +157,7 @@ def _boot_worker(scheduler: BackgroundScheduler, scheduled_fn: Callable[[], None
     except Exception as e:
         _state["error"] = str(e)
         _log.critical(
-            "后台启动失败（请检查 TURSO_DATABASE_URL / TURSO_AUTH_TOKEN）: %s",
+            "后台启动失败（请检查 TURSO_DATABASE_URL；连接 Turso 云库时需 TURSO_AUTH_TOKEN）: %s",
             e,
             exc_info=True,
         )
