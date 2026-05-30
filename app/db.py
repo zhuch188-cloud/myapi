@@ -215,11 +215,56 @@ class _LibsqlDbapiAdapter:
         return getattr(self._conn, name)
 
 
+_TURSO_CLOUD_HOST_MARKERS = (".turso.io", ".turso.cloud")
+
+
+def _is_turso_cloud_host(url: str) -> bool:
+    lower = (url or "").lower()
+    return any(m in lower for m in _TURSO_CLOUD_HOST_MARKERS)
+
+
+def _resolve_libsql_connect_url(url: str) -> str:
+    """
+    将 TURSO_DATABASE_URL 转为 libsql.connect 可用的地址。
+
+    - Turso 云：libsql://*.turso.io（Hrana over TLS，需 token）
+    - 本地 Docker sqld：明文 HTTP，须为 http://host:port；若写 libsql://host:port
+      客户端会按 TLS 握手，sqld 返回非 Hrana 响应 → InvalidContentType。
+    """
+    u = (url or "").strip()
+    if not u:
+        return u
+    lower = u.lower()
+    if lower.startswith("file:"):
+        return u
+    if lower.startswith(("http://", "https://", "ws://", "wss://")):
+        return u
+    if lower.startswith("libsqls://"):
+        return "https://" + u[len("libsqls://") :]
+    if lower.startswith("libsql://"):
+        rest = u[len("libsql://") :]
+        if _is_turso_cloud_host(rest):
+            return u
+        return f"http://{rest}"
+    if "://" not in u:
+        if _is_turso_cloud_host(u):
+            return f"libsql://{u}"
+        return f"http://{u}"
+    return u
+
+
 def _libsql_connect():
     remote = (settings.turso_database_url or "").strip()
     token = (settings.turso_auth_token or "").strip()
     if not remote:
         raise RuntimeError("TURSO_DATABASE_URL is required")
+
+    connect_url = _resolve_libsql_connect_url(remote)
+    if connect_url != remote:
+        _log.info(
+            "libsql connect URL normalized (local sqld uses http, not libsql TLS): %s",
+            connect_url.split("?")[0],
+        )
 
     connect_kw: dict = {"_check_same_thread": False}
     if token:
@@ -233,11 +278,11 @@ def _libsql_connect():
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = libsql.connect(
             f"file:{path.as_posix()}",
-            sync_url=remote,
+            sync_url=connect_url,
             **connect_kw,
         )
     else:
-        conn = libsql.connect(remote, **connect_kw)
+        conn = libsql.connect(connect_url, **connect_kw)
     return _LibsqlDbapiAdapter(conn)
 
 
