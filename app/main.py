@@ -1509,7 +1509,7 @@ def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> di
         return out
 
     rb_h = sql_date_compact_expr("h.rebalance_date")
-    rb_x = sql_date_compact_expr("x.rebalance_date")
+    rb_inner = sql_date_compact_expr("rebalance_date")
     for td_bind, sids in by_td.items():
         q_sids = ",".join("'" + s.replace("'", "''") + "'" for s in sids)
         hold_rows = db.execute(
@@ -1518,7 +1518,7 @@ def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> di
                 SELECT h.strategy_id AS strategy_id, COUNT(DISTINCT h.stock_code) AS stock_cnt
                 FROM strategy_holding_daily h
                 INNER JOIN (
-                    SELECT strategy_id, MAX({rb_x}) AS mx_rb
+                    SELECT strategy_id, MAX({rb_inner}) AS mx_rb
                     FROM strategy_holding_daily
                     WHERE strategy_id IN ({q_sids})
                       AND trade_date = :td

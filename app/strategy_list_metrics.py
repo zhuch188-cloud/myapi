@@ -179,7 +179,13 @@ def refresh_strategy_list_metrics_cache(
                 s.get("year_return"),
                 s.get("period_since_rebalance_return"),
             )
-    nav_meta = _batch_nav_last_date_stock_count(db, ids)
+    try:
+        nav_meta = _batch_nav_last_date_stock_count(db, ids)
+    except Exception:
+        _log.exception(
+            "strategy_list_metrics stock_count batch failed ids=%s", ids
+        )
+        nav_meta = {}
     n = _upsert_metrics_rows(db, ids, summaries, nav_meta, do_commit=False)
     full_refresh = strategy_ids is None or not [
         x for x in (strategy_ids or []) if str(x or "").strip()
