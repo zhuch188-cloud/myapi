@@ -208,11 +208,14 @@ def holding_eod_start_incremental(
     trade_date: date | str | Any, rebalance_date: date | str | Any
 ) -> str:
     """
-    日常增量持仓 EOD 起点。
+    日常增量持仓 EOD 起点（取**最早**必要日，以覆盖三类指标）。
 
-    开放期须覆盖：① 本期调仓日（算 period_return）；② 约 N 自然日回溯（算 5/20/60/YTD）。
-    取 max(调仓日, 上年, 回溯日) 以限制老调仓期勿从首调仓拉全历史；
-    但当行情日=调仓日时 rb 会顶掉 lb，K 线仅 1 根 → 改用 max(上年, 回溯日)。
+    - 5/20/60 日：约 N 自然日回溯 lb；
+    - 今年以来：须含当年 1/1 之前最近收盘 → 至少从 y_prev（上年 1/1）起；
+    - 本期收益：须含调仓日（期中更新时 rb 可能晚于 lookback_floor）。
+
+    期中：max(rb, lookback_floor)，老调仓期不会从 2016 拉至今；
+    调仓日=行情日：仅 lookback_floor，避免 rb 把起点顶到当天只剩 1 根 K。
     """
     td_c = _dt_compact(trade_date)
     rb_c = _dt_compact(rebalance_date)
@@ -221,9 +224,10 @@ def holding_eod_start_incremental(
     td_d = datetime.strptime(td_c[:8], "%Y%m%d").date()
     y_prev = f"{td_d.year - 1}0101"
     lb = (td_d - timedelta(days=holding_eod_lookback_calendar_days())).strftime("%Y%m%d")
+    lookback_floor = min(lb, y_prev)
     if td_c[:8] == rb_c[:8]:
-        return max(y_prev, lb)
-    return max(rb_c, y_prev, lb)
+        return lookback_floor
+    return max(rb_c, lookback_floor)
 
 
 def nav_incremental_eod_start(
