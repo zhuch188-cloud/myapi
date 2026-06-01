@@ -6184,11 +6184,14 @@ def _rebuild_nav_forward_from_anchor(
         None if from_start else _nav_fetch_row_on_day(db, sid, append_after_c)
     )
     trade_days_expected_set = set(trade_days)
-    use_verified_flush = from_start or len(sim_days) > inc_max_days
 
     from app.db import SessionLocalFactory, turso_stream_lock, uses_remote_turso_only
 
     turso_remote = uses_remote_turso_only()
+    # 远程 Turso：flush 在独立 Session，须 commit+写后校验；短增量（≤31 日）本地可仅 commit
+    use_verified_flush = (
+        from_start or len(sim_days) > inc_max_days or turso_remote
+    )
 
     def _locked_db_op(fn):
         if turso_remote:
@@ -6199,6 +6202,32 @@ def _rebuild_nav_forward_from_anchor(
                 finally:
                     sess.close()
         return fn(db)
+
+    def _nav_max_after_forward() -> str | None:
+        """flush 可能在另一 Session commit；远程 Turso 用新连接读末净值日。"""
+        if turso_remote:
+
+            def _read(sess: Session) -> str | None:
+                return _strategy_nav_max_trade_compact(sess, sid)
+
+            return _locked_db_op(_read)
+        try:
+            db.commit()
+        except Exception:
+            pass
+        return _strategy_nav_max_trade_compact(db, sid)
+
+    def _incremental_forward_reached_latest() -> bool:
+        nav_max_c = _nav_max_after_forward()
+        if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
+            _log.warning(
+                "nav forward %s: post-forward max %s < latest %s",
+                sid,
+                nav_max_c,
+                latest_trade_c,
+            )
+            return False
+        return True
 
     def _flush_accum_batch(
         batch: list[dict[str, Any]],
@@ -6221,6 +6250,7 @@ def _rebuild_nav_forward_from_anchor(
                 )
             else:
                 _flush_strategy_nav_daily_batch(sess, batch)
+                sess.commit()
 
         _locked_db_op(_do)
         if last_td and (sync_job_id is not None or progress_cb):
@@ -6566,8 +6596,7 @@ def _rebuild_nav_forward_from_anchor(
             ):
                 return False, wind
         else:
-            nav_max_c = _strategy_nav_max_trade_compact(db, sid)
-            if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
+            if not _incremental_forward_reached_latest():
                 return False, wind
         return True, wind
 
@@ -6731,8 +6760,7 @@ def _rebuild_nav_forward_from_anchor(
         ):
             return False, wind
     else:
-        nav_max_c = _strategy_nav_max_trade_compact(db, sid)
-        if nav_max_c and latest_trade_c and nav_max_c < latest_trade_c:
+        if not _incremental_forward_reached_latest():
             return False, wind
     return True, wind
 
