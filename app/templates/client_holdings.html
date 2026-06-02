@@ -220,7 +220,7 @@
           );
         }).join("");
         document.getElementById("holdingsTable").innerHTML =
-          '<thead><tr><th class="sticky-col-1">代码</th><th class="sticky-col-2">名称</th><th>本期权重</th><th>最新权重</th><th>最新价格</th><th>本期收益</th><th>1日</th><th>5日</th><th>20日</th><th>60日</th><th>今年以来</th><th>市值(亿)</th><th>行业</th><th>PE</th><th>PB</th></tr></thead><tbody>' + rowsHtml + "</tbody>";
+          '<thead><tr><th class="sticky-col-1">代码</th><th class="sticky-col-2">名称</th><th>本期权重</th><th>最新权重</th><th>收盘价</th><th>本期收益</th><th>1日</th><th>5日</th><th>20日</th><th>60日</th><th>今年以来</th><th>市值(亿)</th><th>行业</th><th>PE</th><th>PB</th></tr></thead><tbody>' + rowsHtml + "</tbody>";
       }
       (async function initHoldings() {
         if (!(await ensureViewerAuth())) return;

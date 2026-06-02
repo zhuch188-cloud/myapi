@@ -807,7 +807,7 @@
         const kv = [
           ["行情日", x.trade_date || "-"], ["调仓日", x.rebalance_date || "-"],
           ["本期权重", pct(x.period_weight)], ["最新权重", pct(x.latest_weight)],
-          ["价格", price(x.latest_price)], ["本期", pctSigned(x.period_return)],
+          ["收盘价", price(x.latest_price)], ["本期", pctSigned(x.period_return)],
           ["1日", pctSigned(x.last_1d_pct)], ["5交易日", pctSigned(x.ret_5d)],
           ["20交易日", pctSigned(x.ret_20d)], ["今年以来", pctSigned(x.ret_ytd)],
           ["行业", x.industry_name || "-"], ["市值(亿)", mvYi(x.market_cap)],

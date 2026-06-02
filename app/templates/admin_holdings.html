@@ -120,7 +120,7 @@
           return `<tr class="${endCls}"><td>${i.trade_date||"-"}</td><td>${i.rebalance_date||"-"}</td><td>${i.stock_code||"-"}</td><td>${i.stock_name||"-"}</td><td>${pct(i.period_weight)}</td><td>${pct(i.latest_weight)}</td><td>${priceFmt(i.latest_price)}</td><td>${pctSigned(i.period_return)}</td><td>${pctSigned(i.last_1d_pct)}</td><td>${pctSigned(i.ret_5d)}</td><td>${pctSigned(i.ret_20d)}</td><td>${pctSigned(i.ret_60d)}</td><td>${pctSigned(i.ret_ytd)}</td><td>${mvYi(i.market_cap)}</td><td>${i.industry_name||"-"}</td><td>${num2(i.pe)}</td><td>${num2(i.pb)}</td></tr>`;
         }).join("");
         document.getElementById("holdingsTable").innerHTML = `
-          <thead><tr><th>行情日</th><th>调仓日</th><th>代码</th><th>名称</th><th>本期权重</th><th>最新权重</th><th>最新价格</th><th>本期收益</th><th>1日</th><th>5交易日</th><th>20交易日</th><th>60交易日</th><th>今年以来</th><th>市值(亿)</th><th>行业</th><th>PE</th><th>PB</th></tr></thead>
+          <thead><tr><th>行情日</th><th>调仓日</th><th>代码</th><th>名称</th><th>本期权重</th><th>最新权重</th><th>收盘价</th><th>本期收益</th><th>1日</th><th>5交易日</th><th>20交易日</th><th>60交易日</th><th>今年以来</th><th>市值(亿)</th><th>行业</th><th>PE</th><th>PB</th></tr></thead>
           <tbody>${rowsHtml}</tbody>`;
       }
       function prevPage() { if (page > 1) { page -= 1; reloadHoldings(); } }

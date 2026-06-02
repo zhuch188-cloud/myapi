@@ -533,6 +533,24 @@ def last_close_on_or_before(
     return last
 
 
+def last_raw_close_on_or_before(
+    series_asc: list[WindEodQuad], end_compact: str
+) -> float | None:
+    """升序序列中，TRADE_DT <= end_compact 的最后一个有效不复权收盘价（展示用）。"""
+    ec = str(end_compact).replace("-", "")[:8].zfill(8)
+    last: float | None = None
+    for d, _adj, _prev, raw in series_asc:
+        if _dt_compact(d) > ec:
+            continue
+        if isinstance(raw, float) and raw != raw:
+            continue
+        v = float(raw)
+        if v <= 0:
+            continue
+        last = v
+    return last
+
+
 def series_on_or_before(
     series_asc: list[WindEodQuad], end_compact: str
 ) -> list[WindEodQuad]:

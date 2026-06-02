@@ -2826,6 +2826,36 @@ def _holding_quote_td_compact(
     return _compact_date(latest_trade)
 
 
+def _holding_eod_load_end_compact(
+    trade_date: date,
+    period_end_c: str | None,
+    latest_trade: str,
+) -> str:
+    """EOD 拉取终点：至少覆盖行情日，以便写入当日不复权收盘价。"""
+    end_c = period_end_c or str(latest_trade)
+    td_c = _compact_date(trade_date)
+    if len(td_c) >= 8 and td_c > end_c:
+        return td_c
+    return end_c
+
+
+def _holding_display_close_price(
+    eod_series: list,
+    trade_date: date,
+    quote_close: float,
+    *,
+    quote_asof_compact: str,
+) -> float | None:
+    """行情日不复权收盘（展示）；优先 EOD 序列，其次与行情日一致的 quote。"""
+    td_c = _compact_date(trade_date)
+    raw_px = wind_bulk.last_raw_close_on_or_before(eod_series, td_c)
+    if raw_px is not None and raw_px > 0:
+        return raw_px
+    if quote_close > 0 and quote_asof_compact == td_c:
+        return quote_close
+    return None
+
+
 def _build_holding_daily_row_from_wind(
     *,
     sid: str,
@@ -2841,6 +2871,7 @@ def _build_holding_daily_row_from_wind(
     """由 Wind 行情 + 单股 EOD 序列生成 strategy_holding_daily 一行（不含 latest_weight）。
 
     quote_map 须与 period_end_compact 对齐：历史调仓期按段末日拉取（含 PE/PB/市值/行业）。
+    latest_price 存行情日不复权收盘（展示）；各类收益率仍用后复权价链计算。
     """
     desc_n = int(desc_max_bars) if desc_max_bars is not None else 280
     scode = p["stock_code"]
@@ -2868,11 +2899,11 @@ def _build_holding_daily_row_from_wind(
             "pb": None,
         }
     latest_price = float(quote["latest_price"] or 0.0)
-    prev_close = float(quote["prev_close"] or 0.0)
     rb_compact_this = _compact_date(rebalance)
     period_start_close = wind_bulk.first_close_on_or_after(eod_series, rb_compact_this)
     asof_c = _holding_quote_td_compact(period_end_compact, latest_trade)
     historical_segment = period_end_compact is not None
+    quote_asof_c = asof_c
 
     if historical_segment:
         seg = wind_bulk.series_on_or_before(eod_series, asof_c)
@@ -2880,7 +2911,9 @@ def _build_holding_daily_row_from_wind(
         period_ret = _safe_return(period_end_px, period_start_close)
         day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
         desc_closes = wind_bulk.closes_desc_from_asc(seg, desc_n)
-        px = (
+        if day_ret is None and len(desc_closes) >= 2:
+            day_ret = _safe_return(desc_closes[0], desc_closes[1])
+        px_adj = (
             period_end_px
             if period_end_px is not None and period_end_px > 0
             else (desc_closes[0] if desc_closes else None)
@@ -2889,19 +2922,24 @@ def _build_holding_daily_row_from_wind(
         ytd_close = wind_bulk.last_close_before_calendar_date(
             seg, f"{end_year}0101"
         )
-        row_price = px
     else:
         day_ret = wind_bulk.day_return_adj_for_asof(eod_series, asof_c)
-        if day_ret is None:
-            day_ret = _safe_return(latest_price, prev_close)
         desc_closes = wind_bulk.closes_desc_from_asc(eod_series, desc_n)
+        if day_ret is None and len(desc_closes) >= 2:
+            day_ret = _safe_return(desc_closes[0], desc_closes[1])
         latest_adj = desc_closes[0] if desc_closes else None
-        px = latest_adj if (latest_adj is not None and latest_adj > 0) else latest_price
-        period_ret = _safe_return(px, period_start_close)
+        px_adj = latest_adj if (latest_adj is not None and latest_adj > 0) else None
+        period_ret = _safe_return(px_adj, period_start_close)
         ytd_close = wind_bulk.last_close_before_calendar_date(
             eod_series, f"{trade_date.year}0101"
         )
-        row_price = latest_price if latest_price > 0 else px
+
+    display_px = _holding_display_close_price(
+        eod_series,
+        trade_date,
+        latest_price,
+        quote_asof_compact=quote_asof_c,
+    )
 
     close_5 = wind_bulk.close_n_trading_days_ago(desc_closes, 5)
     close_20 = wind_bulk.close_n_trading_days_ago(desc_closes, 20)
@@ -2914,13 +2952,13 @@ def _build_holding_daily_row_from_wind(
         "stock_code": scode,
         "stock_name": quote["stock_name"],
         "period_weight": period_weight,
-        "latest_price": row_price if row_price and float(row_price) > 0 else None,
+        "latest_price": display_px if display_px and float(display_px) > 0 else None,
         "last_1d_pct": day_ret,
         "period_return": period_ret,
-        "ret_5d": _safe_return(px, close_5),
-        "ret_20d": _safe_return(px, close_20),
-        "ret_60d": _safe_return(px, close_60),
-        "ret_ytd": _safe_return(px, ytd_close),
+        "ret_5d": _safe_return(px_adj, close_5),
+        "ret_20d": _safe_return(px_adj, close_20),
+        "ret_60d": _safe_return(px_adj, close_60),
+        "ret_ytd": _safe_return(px_adj, ytd_close),
         "market_cap": quote["market_cap"],
         "industry_name": quote["industry_name"],
         "pe": quote["pe"],
@@ -4641,7 +4679,9 @@ def run_update(
                         period_start_c = wind_bulk.holding_eod_start_for_period(
                             trade_date, rebalance, full_refresh=full_refresh
                         )
-                    eod_load_end_c = period_end_c or str(latest_trade)
+                    eod_load_end_c = _holding_eod_load_end_compact(
+                        trade_date, period_end_c, str(latest_trade)
+                    )
                     wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     prog(
                         f"[{i_active}/{n_active}] {sid} Wind {wind_i}/{n_rb_wind} "
