@@ -2760,6 +2760,85 @@ def _copy_holding_daily_rebalances(
     return int(res.rowcount or 0)
 
 
+def _refresh_copied_holding_display_closes(
+    db: Session,
+    wind: Any,
+    *,
+    sid: str,
+    trade_date: date,
+    rb_positions: list[tuple[date, list[dict[str, Any]]]],
+    copied_rebalance_dates: list[date],
+) -> tuple[Any, int]:
+    """复制已结束/沿用调仓期后，将 latest_price 校正为各期截止日（下一调仓日）S_DQ_CLOSE。"""
+    if not copied_rebalance_dates or not wind_sql.use_remote_sqlserver():
+        return wind, 0
+    copied = {_compact_date(rd) for rd in copied_rebalance_dates}
+    rb_list = [rb for rb, _ in rb_positions]
+    td_iso = trade_date.isoformat()
+    td_cmp = _compact_date(trade_date)
+    n_up = 0
+    for i, (rb, positions) in enumerate(rb_positions):
+        rb_c = _compact_date(rb)
+        if rb_c not in copied:
+            continue
+        if i + 1 < len(rb_list):
+            pe = _compact_date(rb_list[i + 1])
+        else:
+            pe = td_cmp
+        if len(pe) < 8:
+            continue
+        codes = sorted(
+            {_wind_code_key(p["stock_code"]) for p in (positions or []) if p.get("stock_code")}
+        )
+        if not codes:
+            continue
+        wind, qmap = _fetch_wind_quote_map_batched(db, wind, codes, pe)
+        rb_iso = rb.isoformat()
+        for p in positions or []:
+            sc = p.get("stock_code")
+            if not sc:
+                continue
+            wk = _wind_code_key(sc)
+            q = qmap.get(wk)
+            if not q:
+                continue
+            try:
+                px = float(q.get("latest_price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if px <= 0:
+                continue
+            db.execute(
+                text(
+                    f"""
+                    UPDATE strategy_holding_daily
+                    SET latest_price = :px
+                    WHERE strategy_id = :sid
+                      AND (
+                        trade_date = :td_iso
+                        OR {sql_date_compact_expr("trade_date")} = :td_cmp
+                      )
+                      AND (
+                        rebalance_date = :rb_iso
+                        OR {sql_date_compact_expr("rebalance_date")} = :rb_cmp
+                      )
+                      AND stock_code = :code
+                    """
+                ),
+                {
+                    "px": px,
+                    "sid": sid,
+                    "td_iso": td_iso,
+                    "td_cmp": td_cmp,
+                    "rb_iso": rb_iso,
+                    "rb_cmp": rb_c,
+                    "code": sc,
+                },
+            )
+            n_up += 1
+    return wind, n_up
+
+
 def _holding_snapshot_complete(
     db: Session,
     *,
@@ -2864,17 +2943,19 @@ def _holding_eod_load_end_compact(
 
 def _holding_display_close_price(
     eod_series: list,
-    trade_date: date,
+    cutoff_compact: str,
     quote_close: float,
     *,
     quote_asof_compact: str,
 ) -> float | None:
-    """行情日不复权收盘（展示）；优先 EOD 序列，其次与行情日一致的 quote。"""
-    td_c = _compact_date(trade_date)
-    raw_px = wind_bulk.last_raw_close_on_or_before(eod_series, td_c)
+    """本期截止日不复权收盘（展示）；优先 EOD 序列，其次与截止日一致的 quote。"""
+    cc = str(cutoff_compact or "").strip().replace("-", "")[:8]
+    if len(cc) < 8 or not cc.isdigit():
+        return None
+    raw_px = wind_bulk.last_raw_close_on_or_before(eod_series, cc)
     if raw_px is not None and raw_px > 0:
         return raw_px
-    if quote_close > 0 and quote_asof_compact == td_c:
+    if quote_close > 0 and quote_asof_compact == cc:
         return quote_close
     return None
 
@@ -2894,7 +2975,7 @@ def _build_holding_daily_row_from_wind(
     """由 Wind 行情 + 单股 EOD 序列生成 strategy_holding_daily 一行（不含 latest_weight）。
 
     quote_map 须与 period_end_compact 对齐：历史调仓期按段末日拉取（含 PE/PB/市值/行业）。
-    latest_price 存行情日不复权收盘（展示）；各类收益率仍用后复权价链计算。
+    latest_price 存本期截止日不复权收盘（展示）；各类收益率仍用后复权价链计算。
     """
     desc_n = int(desc_max_bars) if desc_max_bars is not None else 280
     scode = p["stock_code"]
@@ -2959,7 +3040,7 @@ def _build_holding_daily_row_from_wind(
 
     display_px = _holding_display_close_price(
         eod_series,
-        trade_date,
+        asof_c,
         latest_price,
         quote_asof_compact=quote_asof_c,
     )
@@ -4580,6 +4661,17 @@ def run_update(
                         rebalance_dates=rb_copy,
                         do_commit=do_commit,
                     )
+                    if rb_copy:
+                        wind, n_px = _refresh_copied_holding_display_closes(
+                            db,
+                            wind,
+                            sid=sid,
+                            trade_date=trade_date,
+                            rb_positions=rb_positions,
+                            copied_rebalance_dates=rb_copy,
+                        )
+                        if n_px and do_commit:
+                            db.commit()
                     prog(
                         f"[{i_active}/{n_active}] {sid}：持仓 {len(rb_copy)} 期沿用 {prior_td}"
                         f"（{n_copy} 条），仅 {n_rb_wind} 个开放期拉 Wind"
