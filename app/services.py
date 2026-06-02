@@ -2826,6 +2826,29 @@ def _holding_quote_td_compact(
     return _compact_date(latest_trade)
 
 
+def overlay_holding_display_close_from_wind(
+    wind: Any,
+    db: Session,
+    stock_code: str,
+    td_compact: str,
+) -> tuple[Any, float | None]:
+    """行情日不复权收盘（S_DQ_CLOSE），用于展示覆盖 holding 快照中的 latest_price。"""
+    try:
+        wcode = normalize_code(stock_code)
+    except Exception:
+        return wind, None
+    wk = _wind_code_key(wcode)
+    wind, qmap = _fetch_wind_quote_map_batched(db, wind, [wcode], td_compact)
+    q = qmap.get(wk)
+    if not q:
+        return wind, None
+    try:
+        px = float(q.get("latest_price") or 0.0)
+    except (TypeError, ValueError):
+        px = 0.0
+    return wind, (px if px > 0 else None)
+
+
 def _holding_eod_load_end_compact(
     trade_date: date,
     period_end_c: str | None,

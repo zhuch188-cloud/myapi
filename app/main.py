@@ -65,6 +65,7 @@ from app.services import (
     execute_admin_sync_pipeline,
     import_strategy_files,
     normalize_code,
+    overlay_holding_display_close_from_wind,
     rebuild_nav_series,
     run_admin_sync_background_task,
     run_update,
@@ -3107,6 +3108,7 @@ def strategy_stock_profile(
             WHERE strategy_id=:sid
               AND {sql_date_compact_expr("trade_date")} = :td_cmp
               AND stock_code=:code
+            ORDER BY rebalance_date DESC
             LIMIT 1
             """
         ),
@@ -3114,6 +3116,7 @@ def strategy_stock_profile(
     ).mappings().first()
     if not latest:
         raise HTTPException(status_code=404, detail="stock not found")
+    latest = dict(latest)
 
     hist = db.execute(
         text(
@@ -3159,6 +3162,11 @@ def strategy_stock_profile(
         try:
             wind = wind_sql.open_wind(db)
             try:
+                wind, disp_close = overlay_holding_display_close_from_wind(
+                    wind, db, code, td_cmp
+                )
+                if disp_close is not None:
+                    latest["latest_price"] = disp_close
                 trend_payload = stock_trend.compute_stock_index_year_trend(wind, code)
             except Exception as e:
                 trend_payload = {"error": str(e)}
@@ -3182,7 +3190,7 @@ def strategy_stock_profile(
         top10_holders = {"error": "Wind 未配置", "items": []}
 
     return {
-        "latest": dict(latest),
+        "latest": latest,
         "history": hist_items,
         "company_profile": company_profile,
         "trend": trend_payload,
