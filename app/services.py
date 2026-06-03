@@ -6426,6 +6426,71 @@ def _nav_init_mismatch_detail(
     )
 
 
+def _nav_first_trade_compact_on_or_after(
+    trade_days: list[str], rb_cmp: str
+) -> str | None:
+    for d in trade_days:
+        if d >= rb_cmp:
+            return d
+    return None
+
+
+def _nav_prior_trade_compact(trade_days: list[str], td_cmp: str) -> str | None:
+    prev: str | None = None
+    for d in trade_days:
+        if d >= td_cmp:
+            return prev
+        prev = d
+    return prev
+
+
+def _nav_reconcile_append_after_stale_rebalance(
+    db: Session,
+    sid: str,
+    rb_sorted: list[date],
+    trade_days: list[str],
+    append_after_c: str | None,
+) -> str | None:
+    """
+    positions 新增/修正调仓日后：若某调仓 R 的首个净值交易日仍挂旧 rebalance_date，
+    将续算锚点回退到该日前一交易日并重删其后净值，避免 6/1 仍显示上一期调仓日。
+    """
+    if not append_after_c or not rb_sorted or not trade_days:
+        return append_after_c
+    append_cmp = str(append_after_c).strip().replace("-", "")[:8]
+    if len(append_cmp) < 8:
+        return append_after_c
+    rewind_cmp: str | None = None
+    for rb in rb_sorted:
+        rb_cmp = _compact_date(rb)
+        if len(rb_cmp) < 8:
+            continue
+        first_td = _nav_first_trade_compact_on_or_after(trade_days, rb_cmp)
+        if not first_td or first_td > append_cmp:
+            continue
+        row = _nav_fetch_row_on_day(db, sid, first_td)
+        if not row or row.get("rebalance_date") is None:
+            continue
+        nav_rb = _row_sql_date(row["rebalance_date"])
+        nav_rb_cmp = _compact_date(nav_rb) if nav_rb else ""
+        if nav_rb_cmp == rb_cmp:
+            continue
+        prior = _nav_prior_trade_compact(trade_days, first_td)
+        if prior and (rewind_cmp is None or prior < rewind_cmp):
+            rewind_cmp = prior
+    if rewind_cmp and rewind_cmp != append_cmp:
+        _log.info(
+            "nav %s: stale rebalance_date before %s; rewind append %s -> %s",
+            sid,
+            append_cmp,
+            append_after_c,
+            rewind_cmp,
+        )
+        _nav_delete_nav_for_rebuild(db, sid, rewind_cmp, force_reset=False)
+        return rewind_cmp
+    return append_after_c
+
+
 def _nav_fetch_row_on_day(db: Session, sid: str, td_compact: str) -> Any | None:
     return (
         db.execute(
@@ -7362,6 +7427,9 @@ def _rebuild_nav_for_strategy(
         )
 
     append_after_c = _resolve_nav_append_anchor(db, sid, rb_sorted, trade_days)
+    append_after_c = _nav_reconcile_append_after_stale_rebalance(
+        db, sid, rb_sorted, trade_days, append_after_c
+    )
     if append_after_c and append_after_c >= latest_trade_c:
         _log.info(
             "nav %s: anchor %s already at/after latest %s, skip forward",
