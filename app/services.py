@@ -3072,14 +3072,21 @@ def overlay_holding_display_close_from_wind(
 
 
 def _holding_eod_load_end_compact(
-    trade_date: date,
+    snapshot_trade_date: date,
     period_end_c: str | None,
     latest_trade: str,
 ) -> str:
-    """EOD 拉取终点：至少覆盖行情日，以便写入当日不复权收盘价。"""
-    end_c = period_end_c or str(latest_trade)
-    td_c = _compact_date(trade_date)
-    if len(td_c) >= 8 and td_c > end_c:
+    """
+    EOD 拉取终点：已结束期仅到段末日（period_end_c）；
+    开放期到最新行情日（与 snapshot_trade_date 一致）。
+    """
+    if period_end_c:
+        pe = str(period_end_c).strip().replace("-", "")[:8]
+        if len(pe) == 8 and pe.isdigit():
+            return pe
+    end_c = _compact_date(latest_trade) or _compact_date(snapshot_trade_date)
+    td_c = _compact_date(snapshot_trade_date)
+    if len(td_c) >= 8 and len(end_c) >= 8 and td_c > end_c:
         return td_c
     return end_c
 
@@ -4916,7 +4923,7 @@ def run_update(
                             trade_date, rebalance, full_refresh=False
                         )
                     eod_load_end_c = _holding_eod_load_end_compact(
-                        trade_date, period_end_c, str(latest_trade)
+                        snap_td, period_end_c, str(latest_trade)
                     )
                     wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     prog(
