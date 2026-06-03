@@ -2574,7 +2574,7 @@ def _holding_incremental_scope(
 ) -> tuple[int, date | None, str | None, str]:
     """
     与净值增量同一约定：末净值日 → 调仓日≤该日的最近一期为锚；
-    仅锚定及之后调仓期拉 Wind，更早期沿用上一行情日快照（不逐期重拉全历史）。
+    持仓 Wind 范围由 _holding_rb_indices_need_wind 按「受影响期」决定（非锚定后全拉）。
     返回 (hold_start_idx, anchor_rb, last_nav_c, 说明文案)。
     """
     n_rb = len(rb_positions)
@@ -2609,25 +2609,168 @@ def _holding_anchor_start_idx(
     return idx, anchor
 
 
+def strategy_market_holding_trade_date(db: Session, strategy_id: str) -> date | None:
+    """策略持仓表中的最新行情日（开放期快照日）。"""
+    row = db.execute(
+        text(
+            f"""
+            SELECT {sql_max_date_expr("trade_date")} AS d
+            FROM strategy_holding_daily
+            WHERE strategy_id=:sid
+            """
+        ),
+        {"sid": strategy_id},
+    ).mappings().first()
+    return _row_sql_date(row["d"]) if row else None
+
+
+def resolve_holding_snapshot_trade_date(
+    db: Session,
+    strategy_id: str,
+    rebalance_date: date | None,
+    market_trade_date: date,
+) -> tuple[date, date]:
+    """
+    查询持仓明细时使用的 trade_date（段末或最新行情日）与实际调仓日。
+    rebalance_date 为 None 时用 positions 中最新一期。
+    """
+    rb_positions, latest_rb, _ = _group_strategy_positions_by_rebalance(db, strategy_id)
+    if not rb_positions or latest_rb is None:
+        return market_trade_date, market_trade_date
+    chosen = rebalance_date if rebalance_date is not None else latest_rb
+    next_rb: date | None = None
+    for i, (rb, _) in enumerate(rb_positions):
+        if _compact_date(rb) != _compact_date(chosen):
+            continue
+        if i + 1 < len(rb_positions):
+            next_rb = rb_positions[i + 1][0]
+        break
+    snap = holding_snapshot_trade_date_for_period(chosen, next_rb, market_trade_date)
+    return snap, chosen
+
+
+def holding_snapshot_trade_date_for_period(
+    rebalance: date,
+    next_rebalance: date | None,
+    market_trade_date: date,
+) -> date:
+    """
+    持仓快照行的 trade_date：已结束期=下一调仓日（段末 as-of）；开放期=当前行情日。
+    """
+    if next_rebalance is not None:
+        pe_cmp = _compact_date(next_rebalance)
+        td_cmp = _compact_date(market_trade_date)
+        if len(pe_cmp) >= 8 and len(td_cmp) >= 8 and pe_cmp <= td_cmp:
+            return next_rebalance
+    return market_trade_date
+
+
+def _holding_period_expected_codes(
+    positions: list[dict[str, Any]],
+) -> set[str]:
+    return {
+        _wind_code_key(p["stock_code"])
+        for p in (positions or [])
+        if p.get("stock_code")
+    }
+
+
+def _purge_stale_holding_rows_for_period(
+    db: Session,
+    *,
+    sid: str,
+    rebalance: date,
+    snapshot_trade_date: date,
+    market_trade_date: date,
+    do_commit: bool,
+) -> int:
+    """已结束期：删除 rebalance 下挂在「最新行情日」等错误 trade_date 上的遗留行。"""
+    snap_cmp = _compact_date(snapshot_trade_date)
+    mkt_cmp = _compact_date(market_trade_date)
+    if snap_cmp == mkt_cmp:
+        return 0
+    res = db.execute(
+        text(
+            f"""
+            DELETE FROM strategy_holding_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
+              AND {sql_date_compact_expr("trade_date")} != :snap_cmp
+            """
+        ),
+        {"sid": sid, "rb_cmp": _compact_date(rebalance), "snap_cmp": snap_cmp},
+    )
+    if do_commit:
+        db.commit()
+    return int(res.rowcount or 0)
+
+
+def _holding_period_needs_wind(
+    db: Session,
+    *,
+    sid: str,
+    rebalance: date,
+    next_rebalance: date | None,
+    positions: list[dict[str, Any]],
+    market_trade_date: date,
+) -> bool:
+    expected = _holding_period_expected_codes(positions)
+    if not expected:
+        return False
+    snap_td = holding_snapshot_trade_date_for_period(
+        rebalance, next_rebalance, market_trade_date
+    )
+    if not _holding_snapshot_complete(
+        db,
+        sid=sid,
+        trade_date=snap_td,
+        rebalance=rebalance,
+        expected_codes=expected,
+    ):
+        return True
+    return False
+
+
 def _holding_rb_indices_need_wind(
+    db: Session,
+    sid: str,
     rb_positions: list[tuple[date, list[dict[str, Any]]]],
-    trade_date: date,
+    market_trade_date: date,
+    *,
     full_refresh: bool,
     hold_start_idx: int,
 ) -> list[int]:
-    """增量：仅「锚定及之后、且截至行情日仍未结束」的调仓期拉 Wind；已结束期复制上一日。"""
-    if full_refresh:
-        return list(range(len(rb_positions)))
-    td_cmp = _compact_date(trade_date)
+    """
+    需拉 Wind 的调仓期下标：开放期、未定格的已结束期、或库内尚无段末快照的期。
+    全量同步阶段 3（full_refresh）亦只处理「受影响」期，不扫全历史。
+    hold_start_idx 仅用于进度文案（锚定调仓），不再用于复制历史行。
+    """
+    _ = hold_start_idx
+    n = len(rb_positions)
     out: list[int] = []
-    for i, (_rb, _pos) in enumerate(rb_positions):
-        if i < hold_start_idx:
+    for i in range(n):
+        rb, positions = rb_positions[i]
+        next_rb = rb_positions[i + 1][0] if i + 1 < n else None
+        if _holding_period_needs_wind(
+            db,
+            sid=sid,
+            rebalance=rb,
+            next_rebalance=next_rb,
+            positions=positions,
+            market_trade_date=market_trade_date,
+        ):
+            out.append(i)
             continue
-        if i + 1 < len(rb_positions):
-            pe = _compact_date(rb_positions[i + 1][0])
-            if pe <= td_cmp:
-                continue
-        out.append(i)
+        snap_td = holding_snapshot_trade_date_for_period(rb, next_rb, market_trade_date)
+        if snap_td != market_trade_date:
+            _purge_stale_holding_rows_for_period(
+                db,
+                sid=sid,
+                rebalance=rb,
+                snapshot_trade_date=snap_td,
+                market_trade_date=market_trade_date,
+                do_commit=False,
+            )
     return out
 
 
@@ -3186,7 +3329,12 @@ def _run_update_try_build_work_item(
         _holding_incremental_scope(db, sid, rb_positions, full_refresh)
     )
     wind_rb_indices = _holding_rb_indices_need_wind(
-        rb_positions, trade_date, full_refresh, hold_start_idx
+        db,
+        sid,
+        rb_positions,
+        trade_date,
+        full_refresh=full_refresh,
+        hold_start_idx=hold_start_idx,
     )
     n_rb_wind = len(wind_rb_indices)
     wind_stock_codes = (
@@ -3194,45 +3342,41 @@ def _run_update_try_build_work_item(
         if wind_rb_indices
         else stock_codes
     )
-    if full_refresh or hold_start_idx <= 0 or anchor_rb_hold is None:
-        start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
-    else:
+    if wind_rb_indices:
         start_c = _holding_eod_start_for_indices(
             trade_date, rb_positions, wind_rb_indices, full_refresh=False
         )
         for i in wind_rb_indices:
             rb = rb_positions[i][0]
-            st = wind_bulk.holding_eod_start_for_period(
-                trade_date, rb, full_refresh=False
-            )
+            next_rb = rb_positions[i + 1][0] if i + 1 < len(rb_positions) else None
+            pe_c = _holding_period_end_compact(next_rb, trade_date)
+            if pe_c:
+                st = wind_bulk.bulk_eod_start_compact(pe_c, rb)
+            else:
+                st = wind_bulk.holding_eod_start_for_period(
+                    trade_date, rb, full_refresh=False
+                )
             if st < start_c:
                 start_c = st
+    else:
+        start_c = wind_bulk.bulk_eod_start_compact(trade_date, min_rb_date)
     skip_holdings = False
     if (not full_refresh) and last_td is not None and last_td >= trade_date:
-        rb_pos_row = db.execute(
-            text(
-                f"SELECT {sql_max_date_expr('rebalance_date')} AS m "
-                "FROM strategy_positions WHERE strategy_id=:sid"
-            ),
-            {"sid": sid},
-        ).mappings().first()
-        td_cmp = _compact_date(trade_date)
-        rb_hold_row = db.execute(
-            text(
-                f"""
-                SELECT {sql_max_date_expr("rebalance_date")} AS m
-                FROM strategy_holding_daily
-                WHERE strategy_id=:sid
-                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                """
-            ),
-            {"sid": sid, "td_cmp": td_cmp},
-        ).mappings().first()
-        mx_pos = rb_pos_row.get("m") if rb_pos_row else None
-        mx_hold = rb_hold_row.get("m") if rb_hold_row else None
-        dp = _row_sql_date(mx_pos)
-        dh = _row_sql_date(mx_hold)
-        if dp is not None and dh is not None and dp <= dh:
+        if not wind_rb_indices:
+            rb_pos_row = db.execute(
+                text(
+                    f"SELECT {sql_max_date_expr('rebalance_date')} AS m "
+                    "FROM strategy_positions WHERE strategy_id=:sid"
+                ),
+                {"sid": sid},
+            ).mappings().first()
+            mx_pos = rb_pos_row.get("m") if rb_pos_row else None
+            dp = _row_sql_date(mx_pos)
+            dh = latest_rb
+            positions_ok = dp is not None and dh is not None and dp <= dh
+        else:
+            positions_ok = False
+        if positions_ok:
             last_nav_c = _strategy_nav_max_trade_compact(db, sid)
             td_nav_cmp = _compact_date(trade_date)
             if (
@@ -4442,8 +4586,8 @@ def run_update(
         incr_rule = ""
         if not full_refresh:
             incr_rule = (
-                "；约定=以库末净值为基准、调仓日≤末净值日的最近一期为锚，"
-                "净值仅补末净值日之后、持仓仅锚定及之后拉 Wind（非从第 1 期重拉）"
+                "；净值=末净值日后补写；持仓=仅开放期+待定格已结束期拉 Wind，"
+                "段末 trade_date=下一调仓日，不复制历史期"
             )
         prog(
             f"Wind源={src} 最新交易日={trade_date} 模式={mode_text} 范围={scope_text}{incr_rule}，"
@@ -4644,49 +4788,14 @@ def run_update(
                 sid,
                 allow_legacy_dates=(len(selected_set) <= 1),
             )
-            if hold_start_idx > 0 and anchor_rb_hold is not None and not full_refresh:
-                prior_td = _holding_prior_trade_date(db, sid, trade_date)
-                rb_copy: list[date] = []
-                for i_rb_c, (rb_c, _) in enumerate(rb_positions):
-                    if i_rb_c < hold_start_idx:
-                        rb_copy.append(rb_c)
-                    elif i_rb_c not in wind_rb_indices:
-                        rb_copy.append(rb_c)
-                if prior_td is not None and rb_copy:
-                    n_copy = _copy_holding_daily_rebalances(
-                        db,
-                        sid=sid,
-                        from_trade_date=prior_td,
-                        to_trade_date=trade_date,
-                        rebalance_dates=rb_copy,
-                        do_commit=do_commit,
-                    )
-                    if rb_copy:
-                        wind, n_px = _refresh_copied_holding_display_closes(
-                            db,
-                            wind,
-                            sid=sid,
-                            trade_date=trade_date,
-                            rb_positions=rb_positions,
-                            copied_rebalance_dates=rb_copy,
-                        )
-                        if n_px and do_commit:
-                            db.commit()
-                    prog(
-                        f"[{i_active}/{n_active}] {sid}：持仓 {len(rb_copy)} 期沿用 {prior_td}"
-                        f"（{n_copy} 条），仅 {n_rb_wind} 个开放期拉 Wind"
-                        f"（EOD 约 {wind_bulk.holding_eod_lookback_calendar_days()} 日回溯）"
-                    )
-                elif n_rb_wind:
-                    prog(
-                        f"[{i_active}/{n_active}] {sid}：持仓仅 {n_rb_wind} 个开放期拉 Wind"
-                        f"（锚定 {_compact_date(anchor_rb_hold)}，无上一日可沿用）"
-                    )
-            else:
+            if n_rb_wind:
                 prog(
-                    f"[{i_active}/{n_active}] {sid}：共 {n_rb} 个调仓期写入持仓"
-                    f"（{'全量刷新' if full_refresh else '无末净值'}，逐期拉 Wind）…"
+                    f"[{i_active}/{n_active}] {sid}：持仓 {n_rb_wind}/{n_rb} 个调仓期拉 Wind"
+                    f"（{'同步快照' if full_refresh else '增量'}，"
+                    f"已结束期段末定格不复制历史）…"
                 )
+            else:
+                prog(f"[{i_active}/{n_active}] {sid}：持仓快照均已齐，跳过 Wind")
 
             def _flush_one_rebalance(
                 i_rb: int,
@@ -4696,11 +4805,12 @@ def run_update(
                 rb_compact: str,
                 wind_i: int,
                 expected_codes: list[str] | set[str],
+                snapshot_trade_date: date,
             ) -> None:
                 n_written = _flush_rebalance_holding_period(
                     db,
                     sid=sid,
-                    trade_date=trade_date,
+                    trade_date=snapshot_trade_date,
                     rebalance=rebalance,
                     i_rb=i_rb,
                     prepared_rows=prepared_rows,
@@ -4709,13 +4819,13 @@ def run_update(
                 )
                 prog(
                     f"[{i_active}/{n_active}] {sid} Wind {wind_i}/{n_rb_wind} "
-                    f"调仓 {rebalance} 已写入 {n_written} 条"
+                    f"调仓 {rebalance} 快照日 {snapshot_trade_date} 已写入 {n_written} 条"
                 )
                 if sync_job_id is not None and rb_compact:
                     if not _holding_snapshot_complete(
                         db,
                         sid=sid,
-                        trade_date=trade_date,
+                        trade_date=snapshot_trade_date,
                         rebalance=rebalance,
                         expected_codes=expected_codes,
                     ):
@@ -4741,6 +4851,17 @@ def run_update(
                     period_end_c = _holding_period_end_compact(
                         next_rebalance, latest_trade
                     )
+                    snap_td = holding_snapshot_trade_date_for_period(
+                        rebalance, next_rebalance, trade_date
+                    )
+                    _purge_stale_holding_rows_for_period(
+                        db,
+                        sid=sid,
+                        rebalance=rebalance,
+                        snapshot_trade_date=snap_td,
+                        market_trade_date=trade_date,
+                        do_commit=False,
+                    )
                     if not positions:
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
@@ -4759,7 +4880,7 @@ def run_update(
                         and _holding_snapshot_complete(
                             db,
                             sid=sid,
-                            trade_date=trade_date,
+                            trade_date=snap_td,
                             rebalance=rebalance,
                             expected_codes=checkpoint_codes,
                         )
@@ -4786,13 +4907,13 @@ def run_update(
                         )
                         continue
                     # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
-                    if full_refresh and period_end_c:
+                    if period_end_c:
                         period_start_c = wind_bulk.bulk_eod_start_compact(
                             period_end_c, rebalance
                         )
                     else:
                         period_start_c = wind_bulk.holding_eod_start_for_period(
-                            trade_date, rebalance, full_refresh=full_refresh
+                            trade_date, rebalance, full_refresh=False
                         )
                     eod_load_end_c = _holding_eod_load_end_compact(
                         trade_date, period_end_c, str(latest_trade)
@@ -4800,7 +4921,7 @@ def run_update(
                     wind_i = wind_rb_indices.index(i_rb - 1) + 1
                     prog(
                         f"[{i_active}/{n_active}] {sid} Wind {wind_i}/{n_rb_wind} "
-                        f"调仓 {rebalance} EOD {len(period_codes)} 只"
+                        f"调仓 {rebalance} 快照日 {snap_td} EOD {len(period_codes)} 只"
                         f"（{period_start_c}~{eod_load_end_c}）…"
                     )
                     if sync_job_id is not None:
@@ -4824,7 +4945,7 @@ def run_update(
                         prepared_rows.append(
                             _build_holding_daily_row_from_wind(
                                 sid=sid,
-                                trade_date=trade_date,
+                                trade_date=snap_td,
                                 rebalance=rebalance,
                                 p=p,
                                 quote_map=quote_part,
@@ -4846,6 +4967,7 @@ def run_update(
                         rb_compact,
                         wind_i,
                         period_codes,
+                        snap_td,
                     )
                     prepared_rows.clear()
                 if sync_job_id is not None and do_commit:
@@ -4857,6 +4979,23 @@ def run_update(
                 for i_rb, (rebalance, positions) in enumerate(rb_positions, start=1):
                     if (i_rb - 1) not in wind_rb_indices:
                         continue
+                    next_rebalance = (
+                        rb_positions[i_rb][0] if i_rb < len(rb_positions) else None
+                    )
+                    period_end_c = _holding_period_end_compact(
+                        next_rebalance, latest_trade
+                    )
+                    snap_td = holding_snapshot_trade_date_for_period(
+                        rebalance, next_rebalance, trade_date
+                    )
+                    _purge_stale_holding_rows_for_period(
+                        db,
+                        sid=sid,
+                        rebalance=rebalance,
+                        snapshot_trade_date=snap_td,
+                        market_trade_date=trade_date,
+                        do_commit=False,
+                    )
                     if not positions:
                         prog(
                             f"[{i_active}/{n_active}] {sid} [{i_rb}/{n_rb}] "
@@ -4875,7 +5014,7 @@ def run_update(
                         and _holding_snapshot_complete(
                             db,
                             sid=sid,
-                            trade_date=trade_date,
+                            trade_date=snap_td,
                             rebalance=rebalance,
                             expected_codes=checkpoint_codes,
                         )
@@ -4885,12 +5024,6 @@ def run_update(
                             f"已跳过（断点已完成）"
                         )
                         continue
-                    next_rebalance = (
-                        rb_positions[i_rb][0] if i_rb < len(rb_positions) else None
-                    )
-                    period_end_c = _holding_period_end_compact(
-                        next_rebalance, latest_trade
-                    )
 
                     prepared_rows = []
                     total_weight = 0.0
@@ -4911,7 +5044,7 @@ def run_update(
                         prepared_rows.append(
                             _build_holding_daily_row_from_wind(
                                 sid=sid,
-                                trade_date=trade_date,
+                                trade_date=snap_td,
                                 rebalance=rebalance,
                                 p=p,
                                 quote_map=qmap,
@@ -4931,6 +5064,7 @@ def run_update(
                         rb_compact,
                         wind_i,
                         [_wind_code_key(p["stock_code"]) for p in positions if p.get("stock_code")],
+                        snap_td,
                     )
                 if sync_job_id is not None and do_commit:
                     db.commit()

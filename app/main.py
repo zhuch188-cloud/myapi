@@ -67,6 +67,10 @@ from app.services import (
     normalize_code,
     overlay_holding_display_close_from_wind,
     rebuild_nav_series,
+    resolve_holding_snapshot_trade_date,
+    strategy_market_holding_trade_date,
+    holding_snapshot_trade_date_for_period,
+    _group_strategy_positions_by_rebalance,
     run_admin_sync_background_task,
     run_update,
     create_strategy_import_job,
@@ -260,25 +264,8 @@ def _strategy_weight_display_mode_store() -> str:
 def _strategy_rebalance_dates_list(
     db: Session, strategy_id: str, *, latest_only: bool
 ) -> list[str]:
-    """调仓日列表：有持仓日快照时 latest_only 取最新行情日截面；否则用导入的 strategy_positions。"""
-    if latest_only:
-        rows = db.execute(
-            text(
-                f"""
-                SELECT DISTINCT rebalance_date
-                FROM strategy_holding_daily
-                WHERE strategy_id=:sid
-                  AND trade_date = (
-                    SELECT {sql_max_date_expr("trade_date")}
-                    FROM strategy_holding_daily WHERE strategy_id=:sid
-                  )
-                ORDER BY {sql_order_date_desc("rebalance_date")}
-                """
-            ),
-            {"sid": strategy_id},
-        ).mappings().all()
-        if rows:
-            return [str(r["rebalance_date"]) for r in rows]
+    """调仓日列表：以 strategy_positions 为准（每期一条快照，与 trade_date 语义解耦）。"""
+    _ = latest_only
     rows = db.execute(
         text(
             f"""
@@ -2914,17 +2901,9 @@ def strategy_holdings(
     if int(all_rows or 0) != 1 and page_size not in (20, 50, 100):
         raise HTTPException(status_code=400, detail="page_size must be 20, 50, or 100")
 
-    latest_td_row = db.execute(
-        text(
-            f"SELECT {sql_max_date_expr('trade_date')} AS d "
-            "FROM strategy_holding_daily WHERE strategy_id=:sid"
-        ),
-        {"sid": strategy_id},
-    ).mappings().first()
-    latest_trade_date_raw = latest_td_row["d"] if latest_td_row else None
-    latest_trade_date = _api_trade_date_iso(latest_trade_date_raw)
-    td_cmp = _bind_date_compact(latest_trade_date_raw)
-    if latest_trade_date is None or not td_cmp:
+    market_td = strategy_market_holding_trade_date(db, strategy_id)
+    latest_trade_date = _api_trade_date_iso(market_td)
+    if market_td is None:
         pos_items, pos_meta = _strategy_holdings_from_positions(
             db, strategy_id, rebalance_date
         )
@@ -2965,23 +2944,23 @@ def strategy_holdings(
             "items": page_items,
         }
 
-    selected_rb = rebalance_date.strip() if rebalance_date else None
-    if selected_rb == "":
-        selected_rb = None
-    if selected_rb is None:
-        rb_row = db.execute(
-            text(
-                f"""
-                SELECT {sql_max_date_expr("rebalance_date")} AS rb
-                FROM strategy_holding_daily
-                WHERE strategy_id=:sid
-                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                """
-            ),
-            {"sid": strategy_id, "td_cmp": td_cmp},
-        ).mappings().first()
-        selected_rb = _api_trade_date_iso(rb_row["rb"]) if rb_row and rb_row.get("rb") is not None else None
-    rb_cmp = _bind_date_compact(selected_rb) if selected_rb else None
+    selected_rb_raw = rebalance_date.strip() if rebalance_date else None
+    if selected_rb_raw == "":
+        selected_rb_raw = None
+    rebalance_d: date | None = None
+    if selected_rb_raw:
+        rb_iso = normalize_sql_date_text(selected_rb_raw)
+        if rb_iso:
+            try:
+                rebalance_d = datetime.strptime(rb_iso, "%Y-%m-%d").date()
+            except ValueError:
+                rebalance_d = None
+    snap_td, rebalance_d = resolve_holding_snapshot_trade_date(
+        db, strategy_id, rebalance_d, market_td
+    )
+    td_cmp = _bind_date_compact(snap_td)
+    rb_cmp = _bind_date_compact(rebalance_d)
+    selected_rb = _api_trade_date_iso(rebalance_d)
 
     total = db.execute(
         text(
@@ -2989,7 +2968,7 @@ def strategy_holdings(
             SELECT COUNT(*) AS c FROM strategy_holding_daily h
             WHERE h.strategy_id=:sid
               AND {sql_date_compact_expr("h.trade_date")} = :td_cmp
-              AND (:rb_cmp IS NULL OR {sql_date_compact_expr("h.rebalance_date")} = :rb_cmp)
+              AND {sql_date_compact_expr("h.rebalance_date")} = :rb_cmp
             """
         ),
         {"sid": strategy_id, "td_cmp": td_cmp, "rb_cmp": rb_cmp},
@@ -2997,15 +2976,12 @@ def strategy_holdings(
     meta_row = db.execute(
         text(
             f"""
-            SELECT
-              MAX(trade_date) AS latest_trade_date,
-              COUNT(DISTINCT rebalance_date) AS rebalance_periods
-            FROM strategy_holding_daily h
-            WHERE h.strategy_id=:sid
-              AND {sql_date_compact_expr("h.trade_date")} = :td_cmp
+            SELECT COUNT(DISTINCT rebalance_date) AS rebalance_periods
+            FROM strategy_positions
+            WHERE strategy_id=:sid
             """
         ),
-        {"sid": strategy_id, "td_cmp": td_cmp},
+        {"sid": strategy_id},
     ).mappings().first()
     hold_params = {"sid": strategy_id, "td_cmp": td_cmp, "rb_cmp": rb_cmp}
     if int(all_rows or 0) == 1:
@@ -3019,7 +2995,7 @@ def strategy_holdings(
                 FROM strategy_holding_daily
                 WHERE strategy_id=:sid
                   AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                  AND (:rb_cmp IS NULL OR {sql_date_compact_expr("rebalance_date")} = :rb_cmp)
+                  AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
                 ORDER BY latest_weight DESC, stock_code
                 """
             ),
@@ -3037,7 +3013,7 @@ def strategy_holdings(
                 FROM strategy_holding_daily
                 WHERE strategy_id=:sid
                   AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                  AND (:rb_cmp IS NULL OR {sql_date_compact_expr("rebalance_date")} = :rb_cmp)
+                  AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
                 ORDER BY latest_weight DESC, stock_code
                 LIMIT :limit OFFSET :offset
                 """
@@ -3049,8 +3025,8 @@ def strategy_holdings(
         "page_size": page_size,
         "total": int(total),
         "meta": {
-            "latest_trade_date": _api_trade_date_iso(meta_row["latest_trade_date"])
-            or latest_trade_date,
+            "latest_trade_date": latest_trade_date,
+            "snapshot_trade_date": _api_trade_date_iso(snap_td),
             "rebalance_periods": int(meta_row["rebalance_periods"] or 0),
             "current_rebalance_date": selected_rb,
             "wind_data_source": "sqlserver",
@@ -3085,16 +3061,15 @@ def strategy_stock_profile(
     if not code or len(code) > 32:
         raise HTTPException(status_code=400, detail="invalid stock_code")
 
-    latest_td_row = db.execute(
-        text(
-            f"SELECT {sql_max_date_expr('trade_date')} AS d "
-            "FROM strategy_holding_daily WHERE strategy_id=:sid"
-        ),
-        {"sid": strategy_id},
-    ).mappings().first()
-    latest_trade_date_raw = latest_td_row["d"] if latest_td_row else None
-    td_cmp = _bind_date_compact(latest_trade_date_raw)
-    if not td_cmp:
+    market_td = strategy_market_holding_trade_date(db, strategy_id)
+    if market_td is None:
+        raise HTTPException(status_code=404, detail="stock not found")
+    snap_td, open_rb = resolve_holding_snapshot_trade_date(
+        db, strategy_id, None, market_td
+    )
+    td_cmp = _bind_date_compact(snap_td)
+    rb_cmp = _bind_date_compact(open_rb)
+    if not td_cmp or not rb_cmp:
         raise HTTPException(status_code=404, detail="stock not found")
 
     latest = db.execute(
@@ -3107,48 +3082,78 @@ def strategy_stock_profile(
             FROM strategy_holding_daily
             WHERE strategy_id=:sid
               AND {sql_date_compact_expr("trade_date")} = :td_cmp
+              AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
               AND stock_code=:code
-            ORDER BY rebalance_date DESC
             LIMIT 1
             """
         ),
-        {"sid": strategy_id, "td_cmp": td_cmp, "code": code},
+        {"sid": strategy_id, "td_cmp": td_cmp, "rb_cmp": rb_cmp, "code": code},
     ).mappings().first()
     if not latest:
         raise HTTPException(status_code=404, detail="stock not found")
     latest = dict(latest)
 
-    hist = db.execute(
+    rb_positions, _, _ = _group_strategy_positions_by_rebalance(db, strategy_id)
+    hold_rows = db.execute(
         text(
+            f"""
+            SELECT rebalance_date, trade_date, period_return
+            FROM strategy_holding_daily
+            WHERE strategy_id=:sid AND stock_code=:code
             """
-            SELECT
-              p.rebalance_date AS snapshot_date,
-              p.holding_weight AS period_weight,
-              d.period_return
-            FROM strategy_positions p
-            LEFT JOIN (
-              SELECT x.rebalance_date, x.period_return
-              FROM strategy_holding_daily x
-              INNER JOIN (
-                SELECT rebalance_date, MAX(trade_date) AS max_td
-                FROM strategy_holding_daily
-                WHERE strategy_id=:sid AND stock_code=:code
-                GROUP BY rebalance_date
-              ) m
-                ON x.rebalance_date = m.rebalance_date
-               AND x.trade_date = m.max_td
-               AND x.strategy_id = :sid
-               AND x.stock_code = :code
-            ) d
-              ON d.rebalance_date = p.rebalance_date
-            WHERE p.strategy_id=:sid AND p.stock_code=:code
-            ORDER BY p.rebalance_date DESC
+        ),
+        {"sid": strategy_id, "code": code},
+    ).mappings().all()
+    hold_by_key: dict[tuple[str, str], Any] = {}
+    for hr in hold_rows:
+        k = (
+            _bind_date_compact(hr.get("rebalance_date")) or "",
+            _bind_date_compact(hr.get("trade_date")) or "",
+        )
+        if k[0] and k[1]:
+            hold_by_key[k] = hr.get("period_return")
+    pos_rows = db.execute(
+        text(
+            f"""
+            SELECT rebalance_date, holding_weight
+            FROM strategy_positions
+            WHERE strategy_id=:sid AND stock_code=:code
+            ORDER BY {sql_order_date_desc("rebalance_date")}
             LIMIT 60
             """
         ),
         {"sid": strategy_id, "code": code},
     ).mappings().all()
-    hist_items = [dict(r) for r in hist]
+    hist_items: list[dict] = []
+    for pr in pos_rows:
+        rb_d = pr.get("rebalance_date")
+        if rb_d is None:
+            continue
+        rb_iso = normalize_sql_date_text(rb_d)
+        if not rb_iso:
+            continue
+        try:
+            rb_date = datetime.strptime(rb_iso, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        next_rb: date | None = None
+        for i, (rb, _) in enumerate(rb_positions):
+            if _bind_date_compact(rb) != _bind_date_compact(rb_date):
+                continue
+            if i + 1 < len(rb_positions):
+                next_rb = rb_positions[i + 1][0]
+            break
+        canon_td = holding_snapshot_trade_date_for_period(
+            rb_date, next_rb, market_td
+        )
+        ck = (_bind_date_compact(rb_date) or "", _bind_date_compact(canon_td) or "")
+        hist_items.append(
+            {
+                "snapshot_date": rb_iso,
+                "period_weight": pr.get("holding_weight"),
+                "period_return": hold_by_key.get(ck),
+            }
+        )
     company_profile = _fetch_supplement_company_profile(db, code)
 
     trend_payload: dict | None = None
