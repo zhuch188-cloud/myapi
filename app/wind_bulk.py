@@ -173,6 +173,22 @@ def bulk_eod_start_compact(trade_date: date | str | Any, min_rebalance_date: dat
     return min(y_prev, rb_c, lb)
 
 
+def holding_wind_desc_max_bars() -> int:
+    """持仓 Wind 指标取近 N 根 K（与全量同步 stage3 一致，保证 ret_5d/20d/60d 相同）。"""
+    return 280
+
+
+def holding_eod_start_wind_parity(
+    *,
+    trade_date: date | str | Any,
+    rebalance_date: date | str | Any,
+    period_end_compact: str | None = None,
+) -> str:
+    """单期持仓 Wind EOD 起点：与全量同步 stage3 相同（开放期/已结束期均 bulk_eod_start）。"""
+    anchor = period_end_compact if period_end_compact else _dt_compact(trade_date)
+    return bulk_eod_start_compact(anchor, rebalance_date)
+
+
 def holding_eod_lookback_calendar_days() -> int:
     """日常增量持仓：自行情日向前日历天数（覆盖 ret_60 约 60 个交易日 + 缓冲）。"""
     n = int(getattr(settings, "holding_eod_lookback_calendar_days", 0) or 0)

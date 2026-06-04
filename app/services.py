@@ -2593,8 +2593,7 @@ def _holding_incremental_scope(
     hold_start_idx, anchor_rb = _nav_rb_idx_on_date(rb_sorted, last_nav_d)
     note = (
         f"末净值 {last_nav_c} → 锚定调仓 {_compact_date(anchor_rb)}，"
-        f"持仓仅开放调仓期拉 Wind（EOD 回溯约 "
-        f"{wind_bulk.holding_eod_lookback_calendar_days()} 自然日）"
+        "持仓仅开放调仓期+待定格期拉 Wind（EOD 计算与全量同步一致）"
     )
     return hold_start_idx, anchor_rb, last_nav_c, note
 
@@ -3517,12 +3516,11 @@ def _run_update_try_build_work_item(
             rb = rb_positions[i][0]
             next_rb = rb_positions[i + 1][0] if i + 1 < len(rb_positions) else None
             pe_c = _holding_period_end_compact(next_rb, trade_date)
-            if pe_c:
-                st = wind_bulk.bulk_eod_start_compact(pe_c, rb)
-            else:
-                st = wind_bulk.holding_eod_start_for_period(
-                    trade_date, rb, full_refresh=False
-                )
+            st = wind_bulk.holding_eod_start_wind_parity(
+                trade_date=trade_date,
+                rebalance_date=rb,
+                period_end_compact=pe_c,
+            )
             if st < start_c:
                 start_c = st
     else:
@@ -4813,11 +4811,7 @@ def run_update(
             wind_stock_codes: list[str] = list(
                 wi.get("wind_stock_codes") or stock_codes
             )
-            holding_desc_bars = (
-                wind_bulk.holding_eod_desc_max_bars()
-                if not full_refresh and wind_rb_indices
-                else 280
-            )
+            holding_desc_bars = wind_bulk.holding_wind_desc_max_bars()
             if skip_holdings:
                 prog(f"[{i_active}/{n_active}] 策略 {sid}：跳过持仓（已齐），仅补净值…")
             else:
@@ -4841,60 +4835,55 @@ def run_update(
                         )
                     if pl1:
                         last_nav_c = _last_nav_compact_for_update(db, sid)
-                        if (
-                            last_nav_c
-                            and _compact_date(latest_trade) <= last_nav_c
-                            and not full_refresh
-                        ):
-                            prog(
-                                f"[{i_active}/{n_active}] {sid}：净值已至 {last_nav_c}，无需补算"
-                            )
-                        else:
-                            lt_c = _compact_date(latest_trade)
-                            if full_refresh:
-                                nav_hint = f"全量重算 {pl1['start_c']}~{lt_c}（删库后从首调仓）"
-                            elif last_nav_c and len(last_nav_c) >= 8:
+                        lt_c = _compact_date(latest_trade)
+                        if full_refresh:
+                            nav_hint = f"全量重算 {pl1['start_c']}~{lt_c}（删库后从首调仓）"
+                        elif last_nav_c and len(last_nav_c) >= 8:
+                            if lt_c <= last_nav_c:
+                                nav_hint = (
+                                    f"末净值 {last_nav_c}，校验调仓并重放（如需）至 {lt_c}"
+                                )
+                            else:
                                 nav_hint = (
                                     f"末净值 {last_nav_c}（nav×本金 bootstrap），"
                                     f"仅补写之后交易日至 {lt_c}；不回放全历史"
                                 )
-                            else:
-                                nav_hint = f"首建全量 {pl1['start_c']}~{lt_c}"
-                            prog(
-                                f"[{i_active}/{n_active}] {sid}：净值 {nav_hint}"
-                                f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
+                        else:
+                            nav_hint = f"首建全量 {pl1['start_c']}~{lt_c}"
+                        prog(
+                            f"[{i_active}/{n_active}] {sid}：净值 {nav_hint}"
+                            f"（名义本金 {settings.strategy_nav_initial_capital:g} 元）…"
+                        )
+                        nav_mode = "full" if full_refresh else "incremental"
+                        ok_nav, wind = _rebuild_nav_for_strategy(
+                            db,
+                            wind,
+                            sid,
+                            nav_mode,
+                            latest_trade_c_cached=str(latest_trade),
+                            mysql_plan=pl1,
+                            wind_bundle=None,
+                            nav_full_rebuild=bool(full_refresh),
+                            nav_force_reset=bool(full_refresh),
+                            sync_job_id=sync_job_id,
+                            progress_cb=prog if sync_job_id is None else None,
+                        )
+                        nav_max_c = _strategy_nav_max_trade_compact(db, sid)
+                        if not ok_nav:
+                            raise RuntimeError(
+                                f"{sid} 净值重建未完成（增量与自动全量回退均失败："
+                                "请确认 Wind 可用；或勾选「全量重算净值」后重试；"
+                                "末净值日缺持仓快照时须先更新持仓）"
                             )
-                            nav_mode = "full" if full_refresh else "incremental"
-                            ok_nav, wind = _rebuild_nav_for_strategy(
-                                db,
-                                wind,
-                                sid,
-                                nav_mode,
-                                latest_trade_c_cached=str(latest_trade),
-                                mysql_plan=pl1,
-                                wind_bundle=None,
-                                nav_full_rebuild=bool(full_refresh),
-                                nav_force_reset=bool(full_refresh),
-                                sync_job_id=sync_job_id,
-                                progress_cb=prog if sync_job_id is None else None,
+                        if nav_max_c and lt_c and nav_max_c < lt_c:
+                            raise RuntimeError(
+                                f"{sid} 净值仅至 {nav_max_c}，未到 Wind 最新 {lt_c}"
+                                "（常见原因：末净值日无持仓快照导致增量尺度回滚；"
+                                "全量更新将删净值重算，或先跑持仓更新）"
                             )
-                            nav_max_c = _strategy_nav_max_trade_compact(db, sid)
-                            lt_c = _compact_date(latest_trade)
-                            if not ok_nav:
-                                raise RuntimeError(
-                                    f"{sid} 净值重建未完成（增量与自动全量回退均失败："
-                                    "请确认 Wind 可用；或勾选「全量重算净值」后重试；"
-                                    "末净值日缺持仓快照时须先更新持仓）"
-                                )
-                            if nav_max_c and lt_c and nav_max_c < lt_c:
-                                raise RuntimeError(
-                                    f"{sid} 净值仅至 {nav_max_c}，未到 Wind 最新 {lt_c}"
-                                    "（常见原因：末净值日无持仓快照导致增量尺度回滚；"
-                                    "全量更新将删净值重算，或先跑持仓更新）"
-                                )
-                            prog(
-                                f"[{i_active}/{n_active}] {sid}：净值已更新至 {nav_max_c or lt_c}"
-                            )
+                        prog(
+                            f"[{i_active}/{n_active}] {sid}：净值已更新至 {nav_max_c or lt_c}"
+                        )
                 except Exception as ex_nav:
                     _log.warning("nav rebuild failed for %s: %s", sid, ex_nav)
                     prog(
@@ -5081,14 +5070,11 @@ def run_update(
                         )
                         continue
                     # 本期收益：调仓日→下一调仓日（末期为最新交易日）；每期仅该期成分×短区间，可一次拉全
-                    if period_end_c:
-                        period_start_c = wind_bulk.bulk_eod_start_compact(
-                            period_end_c, rebalance
-                        )
-                    else:
-                        period_start_c = wind_bulk.holding_eod_start_for_period(
-                            trade_date, rebalance, full_refresh=False
-                        )
+                    period_start_c = wind_bulk.holding_eod_start_wind_parity(
+                        trade_date=trade_date,
+                        rebalance_date=rebalance,
+                        period_end_compact=period_end_c,
+                    )
                     eod_load_end_c = _holding_eod_load_end_compact(
                         snap_td, period_end_c, str(latest_trade)
                     )
@@ -6444,6 +6430,50 @@ def _nav_prior_trade_compact(trade_days: list[str], td_cmp: str) -> str | None:
     return prev
 
 
+def _nav_stale_rebalance_rewind_cmp(
+    db: Session,
+    sid: str,
+    rb_sorted: list[date],
+    trade_days: list[str],
+    append_after_c: str | None,
+) -> str | None:
+    """
+    positions 新增/修正调仓日后：若某调仓 R 的首个净值交易日缺失或 rebalance_date 不对，
+    返回应回退到的续算锚点（该调仓首交易日前一交易日）。
+    """
+    if not append_after_c or not rb_sorted or not trade_days:
+        return None
+    append_cmp = str(append_after_c).strip().replace("-", "")[:8]
+    if len(append_cmp) < 8:
+        return None
+    rewind_cmp: str | None = None
+    for rb in rb_sorted:
+        rb_cmp = _compact_date(rb)
+        if len(rb_cmp) < 8:
+            continue
+        first_td = _nav_first_trade_compact_on_or_after(trade_days, rb_cmp)
+        if not first_td or first_td > append_cmp:
+            continue
+        row = _nav_fetch_row_on_day(db, sid, first_td)
+        stale = False
+        if not row:
+            stale = True
+        elif row.get("rebalance_date") is None:
+            stale = True
+        else:
+            nav_rb = _row_sql_date(row["rebalance_date"])
+            nav_rb_cmp = _compact_date(nav_rb) if nav_rb else ""
+            stale = nav_rb_cmp != rb_cmp
+        if not stale:
+            continue
+        prior = _nav_prior_trade_compact(trade_days, first_td)
+        if prior and (rewind_cmp is None or prior < rewind_cmp):
+            rewind_cmp = prior
+    if rewind_cmp and rewind_cmp != append_cmp:
+        return rewind_cmp
+    return None
+
+
 def _nav_reconcile_append_after_stale_rebalance(
     db: Session,
     sid: str,
@@ -6455,30 +6485,13 @@ def _nav_reconcile_append_after_stale_rebalance(
     positions 新增/修正调仓日后：若某调仓 R 的首个净值交易日仍挂旧 rebalance_date，
     将续算锚点回退到该日前一交易日并重删其后净值，避免 6/1 仍显示上一期调仓日。
     """
-    if not append_after_c or not rb_sorted or not trade_days:
+    if not append_after_c:
         return append_after_c
-    append_cmp = str(append_after_c).strip().replace("-", "")[:8]
-    if len(append_cmp) < 8:
-        return append_after_c
-    rewind_cmp: str | None = None
-    for rb in rb_sorted:
-        rb_cmp = _compact_date(rb)
-        if len(rb_cmp) < 8:
-            continue
-        first_td = _nav_first_trade_compact_on_or_after(trade_days, rb_cmp)
-        if not first_td or first_td > append_cmp:
-            continue
-        row = _nav_fetch_row_on_day(db, sid, first_td)
-        if not row or row.get("rebalance_date") is None:
-            continue
-        nav_rb = _row_sql_date(row["rebalance_date"])
-        nav_rb_cmp = _compact_date(nav_rb) if nav_rb else ""
-        if nav_rb_cmp == rb_cmp:
-            continue
-        prior = _nav_prior_trade_compact(trade_days, first_td)
-        if prior and (rewind_cmp is None or prior < rewind_cmp):
-            rewind_cmp = prior
-    if rewind_cmp and rewind_cmp != append_cmp:
+    rewind_cmp = _nav_stale_rebalance_rewind_cmp(
+        db, sid, rb_sorted, trade_days, append_after_c
+    )
+    if rewind_cmp:
+        append_cmp = str(append_after_c).strip().replace("-", "")[:8]
         _log.info(
             "nav %s: stale rebalance_date before %s; rewind append %s -> %s",
             sid,
