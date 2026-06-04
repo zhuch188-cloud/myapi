@@ -112,6 +112,8 @@ class Settings(BaseSettings):
     holding_eod_lookback_calendar_days: int = 110
     # 持仓 5/20/60 日指标从 EOD 序列取的最近 K 线根数（日常增量默认 65）
     holding_eod_desc_max_bars: int = 65
+    # 日常净值 reconcile：仅校验最近 N 个调仓期（新增调仓只影响尾部；避免 125 期×每日点查）
+    nav_reconcile_recent_rebalance_periods: int = 3
     # 净值 EOD 动态分段：最新一期成分股数 × 每段月数 <= budget（阶段2 开算前按 CL1 最新期成分重算）
     nav_rebuild_stock_month_budget: int = 300
     # Render 上小预算会把 150 只左右策略切成 1 月/段，Wind 往返过多；用温和下限减少分段数。

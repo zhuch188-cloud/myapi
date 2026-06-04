@@ -184,7 +184,10 @@ def holding_eod_start_wind_parity(
     rebalance_date: date | str | Any,
     period_end_compact: str | None = None,
 ) -> str:
-    """单期持仓 Wind EOD 起点：与全量同步 stage3 相同（开放期/已结束期均 bulk_eod_start）。"""
+    """
+    单期持仓 Wind EOD 起点：与全量同步 stage3 相同（bulk_eod_start）。
+    开放期且调仓较近时起点=调仓日（非固定 420 日）；长开放期才扩至上年 1/1 等。
+    """
     anchor = period_end_compact if period_end_compact else _dt_compact(trade_date)
     return bulk_eod_start_compact(anchor, rebalance_date)
 
