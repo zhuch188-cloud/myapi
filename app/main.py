@@ -1690,6 +1690,90 @@ def _nav_period_start_nav_unit(
         return None
 
 
+def _nav_nav_bench_on_or_before(
+    db: Session, strategy_id: str, asof: date
+) -> tuple[float | None, float | None]:
+    """asof 当日或之前最近一条策略/基准净值（用于本期截止日）。"""
+    row = db.execute(
+        text(
+            f"""
+            SELECT nav_unit, benchmark_nav
+            FROM strategy_nav_daily
+            WHERE strategy_id=:sid
+              AND {sql_date_compact_expr("trade_date")} <= :acmp
+              AND nav_unit IS NOT NULL AND nav_unit > 0
+            ORDER BY {sql_order_date_desc("trade_date")}
+            LIMIT 1
+            """
+        ),
+        {"sid": strategy_id, "acmp": asof.strftime("%Y%m%d")},
+    ).mappings().first()
+    if not row:
+        return None, None
+    n1 = _safe_float(row.get("nav_unit"))
+    b1 = _safe_float(row.get("benchmark_nav"))
+    if b1 is None or b1 <= 0:
+        b2 = db.execute(
+            text(
+                f"""
+                SELECT benchmark_nav
+                FROM strategy_nav_daily
+                WHERE strategy_id=:sid
+                  AND {sql_date_compact_expr("trade_date")} <= :acmp
+                  AND benchmark_nav IS NOT NULL AND benchmark_nav > 0
+                ORDER BY {sql_order_date_desc("trade_date")}
+                LIMIT 1
+                """
+            ),
+            {"sid": strategy_id, "acmp": asof.strftime("%Y%m%d")},
+        ).mappings().first()
+        if b2:
+            b1 = _safe_float(b2.get("benchmark_nav"))
+    return n1, b1
+
+
+def _holding_period_nav_returns(
+    db: Session,
+    strategy_id: str,
+    rebalance_d: date,
+    end_d: date,
+) -> dict[str, float | None]:
+    """
+    持仓页当期：组合、基准、超额收益率（与净值页本期锚定一致）。
+    超额 = (策略期末/期初) / (基准期末/期初) - 1。
+    """
+    out: dict[str, float | None] = {
+        "period_portfolio_return": None,
+        "period_benchmark_return": None,
+        "period_excess_return": None,
+    }
+    rb_iso = rebalance_d.isoformat()[:10]
+    rk = _resolve_nav_rebalance_period_key(db, strategy_id, rb_iso)
+    rb_key = rk or rb_iso
+    n0, b0 = _anchor_from_rebalance_period(db, strategy_id, rb_key)
+    n1, b1 = _nav_nav_bench_on_or_before(db, strategy_id, end_d)
+    if n0 is not None and n0 > 0 and n1 is not None and n1 > 0:
+        out["period_portfolio_return"] = n1 / n0 - 1.0
+    if b0 is not None and b0 > 0 and b1 is not None and b1 > 0:
+        out["period_benchmark_return"] = b1 / b0 - 1.0
+    pr = out["period_portfolio_return"]
+    br = out["period_benchmark_return"]
+    if (
+        pr is not None
+        and br is not None
+        and n0 is not None
+        and b0 is not None
+        and n1 is not None
+        and b1 is not None
+        and n0 > 0
+        and b0 > 0
+        and n1 > 0
+        and b1 > 0
+    ):
+        out["period_excess_return"] = (n1 / n0) / (b1 / b0) - 1.0
+    return out
+
+
 def _nav_list_summary_from_desc_rows(
     rows_desc: list[Any],
     max_rb: date | None,
@@ -3020,6 +3104,9 @@ def strategy_holdings(
             ),
             {**hold_params, "limit": page_size, "offset": offset},
         ).mappings().all()
+    period_returns = _holding_period_nav_returns(
+        db, strategy_id, rebalance_d, snap_td
+    )
     return {
         "page": page,
         "page_size": page_size,
@@ -3030,6 +3117,7 @@ def strategy_holdings(
             "rebalance_periods": int(meta_row["rebalance_periods"] or 0),
             "current_rebalance_date": selected_rb,
             "wind_data_source": "sqlserver",
+            **period_returns,
         },
         "items": [dict(r) for r in rows],
     }

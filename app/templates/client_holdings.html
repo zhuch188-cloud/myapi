@@ -44,6 +44,19 @@
       td.sticky-col-2, th.sticky-col-2 { box-shadow: 1px 0 0 #e9eef5; }
       .ret-up { color: #d93026; font-weight: 600; }
       .ret-down { color: #0d8943; font-weight: 600; }
+      .period-metrics {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 20px;
+        margin: 8px 0 10px;
+        padding: 10px 12px;
+        background: #f8fafc;
+        border: 1px solid #e9eef5;
+        border-radius: 8px;
+        font-size: 13px;
+      }
+      .period-metrics .metric-label { color: #667085; margin-right: 4px; }
+      .period-metrics .metric-val { font-weight: 700; }
     </style>
   </head>
   <body>
@@ -69,6 +82,7 @@
           <span id="dataEndDate" class="muted">-</span>
         </div>
         <p id="holdingsMeta" class="muted meta-line"></p>
+        <div id="periodMetrics" class="period-metrics" style="display:none;"></div>
         <div class="scroll"><table id="holdingsTable"></table></div>
       </div>
     </div>
@@ -194,6 +208,22 @@
           reloadHoldings();
         }
       }
+      function updatePeriodMetrics(m) {
+        const box = document.getElementById("periodMetrics");
+        const pr = m.period_portfolio_return;
+        const br = m.period_benchmark_return;
+        const er = m.period_excess_return;
+        if (pr == null && br == null && er == null) {
+          box.style.display = "none";
+          box.innerHTML = "";
+          return;
+        }
+        box.style.display = "flex";
+        box.innerHTML =
+          '<span><span class="metric-label">组合本期</span><span class="metric-val ' + retClass(pr) + '">' + pct(pr) + "</span></span>" +
+          '<span><span class="metric-label">基准本期</span><span class="metric-val ' + retClass(br) + '">' + pct(br) + "</span></span>" +
+          '<span><span class="metric-label">超额本期</span><span class="metric-val ' + retClass(er) + '">' + pct(er) + "</span></span>";
+      }
       async function reloadHoldings() {
         if (!(await ensureViewerAuth())) return;
         const q = new URLSearchParams({ all_rows: "1" });
@@ -208,6 +238,7 @@
         latestTradeDate = m.latest_trade_date ? String(m.latest_trade_date).slice(0, 10) : "";
         updateDataEndDate();
         document.getElementById("holdingsMeta").textContent = "";
+        updatePeriodMetrics(m);
         const rowsHtml = (data.items || []).map(function (i) {
           const stockUrl = "/client/strategy/" + encodeURIComponent(STRATEGY_ID) + "/stock/" + encodeURIComponent(i.stock_code || "");
           return (
