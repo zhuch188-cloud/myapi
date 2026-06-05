@@ -27,28 +27,19 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import settings
 from app.timeutil import now, now_naive, today as beijing_today
-from app.bg_threads import (
-    active_background_thread_names,
-    join_background_threads,
-    register_shutdown_signals,
-    spawn_daemon,
-)
+from app.bg_threads import spawn_daemon
 from app.boot import boot_error, is_ready, start_background_boot
-from app.render_diag import log_render_runtime
 from app.db import DatabaseNotReadyError, TursoStreamBusyError
 
 _log = logging.getLogger(__name__)
-from app.access_logging import UserAccessLogMiddleware, client_access_path_sql_where
+from app.access_logging import UserAccessLogMiddleware
 from app.db import init_database, get_session
 from app.update_lock import strategy_update_mutex
 from app.sql_dialect import (
     list_table_columns,
     quote_ident as _sql_quote_ident,
-    normalize_sql_date_text,
     sql_curdate,
-    sql_curdate_days_ago,
     sql_date_compact_expr,
-    sql_days_ago,
     sql_hours_ago,
     sql_max_date_expr,
     sql_minutes_ago,
@@ -60,35 +51,25 @@ from app.sql_dialect import (
 )
 from app.mail import send_contact_us_message, send_password_reset_email, smtp_send_test
 from app.client_messages import insert_client_submission, list_client_submissions
-from app.client_safe import is_client_surface_path, public_message, sanitize_client_message
+from app.client_safe import public_message
 from app.auth import SlidingJWTAccessMiddleware, create_access_token, get_current_user, require_roles, norm_user_status
 from app import ark_client, stock_trend, wind_holders, wind_income, wind_sql
 from app.services import (
     execute_admin_sync_pipeline,
     import_strategy_files,
     normalize_code,
-    overlay_holding_display_close_from_wind,
     rebuild_nav_series,
-    resolve_holding_snapshot_trade_date,
-    strategy_market_holding_trade_date,
-    holding_snapshot_trade_date_for_period,
-    _group_strategy_positions_by_rebalance,
     run_admin_sync_background_task,
     run_update,
     create_strategy_import_job,
     get_strategy_import_job_row,
     run_strategy_import_background_task,
     strategy_import_job_is_resumable,
-    find_resumable_strategy_import_job,
-    count_strategy_positions_rows,
     admin_sync_job_is_resumable,
-    admin_sync_job_bootstrap_checkpoint,
     abandon_strategy_import_job,
     abandon_admin_sync_job,
     reconcile_stale_admin_sync_jobs,
     latest_rebalance_date_by_strategy,
-    _nav_rb_idx_on_date,
-    _row_sql_date,
 )
 from app.supplement_import import (
     CODE_COMPANY_PROFILE_EXCEL,
@@ -113,30 +94,8 @@ async def _app_lifespan(_app: FastAPI):
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    _log.info(
-        "app lifespan start pid=%s port=%s (Render 部署日志应出现本行，否则新版本未启动)",
-        os.getpid(),
-        os.environ.get("PORT", ""),
-    )
-    log_render_runtime("app lifespan start")
-    register_shutdown_signals()
     start_background_boot(scheduler, _scheduled_update)
     yield
-    alive = active_background_thread_names()
-    if alive:
-        _log.warning(
-            "lifespan shutdown（多为 Render 部署 SIGTERM）：后台任务 %s，等待最多 28s…",
-            alive,
-        )
-        try:
-            from app.services import mark_running_strategy_import_jobs_interrupted
-
-            mark_running_strategy_import_jobs_interrupted(
-                reason="部署/进程关闭中断（请点「续传」，勿新建全量）",
-            )
-        except Exception:
-            _log.exception("lifespan shutdown: 标记导入任务失败")
-        join_background_threads(timeout=28.0)
     if scheduler.running:
         scheduler.shutdown()
 
@@ -148,33 +107,13 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
 @app.exception_handler(DatabaseNotReadyError)
-def _database_not_ready_handler(request: Request, exc: DatabaseNotReadyError):
-    path = request.url.path if request and request.url else ""
-    if is_client_surface_path(path):
-        _log.warning("client-surface startup unavailable path=%s: %s", path, exc)
-        return JSONResponse(
-            status_code=503,
-            content={"detail": public_message("unavailable")},
-        )
-    return JSONResponse(
-        status_code=503,
-        content={"detail": sanitize_client_message(str(exc), fallback=str(exc)[:500])},
-    )
+def _database_not_ready_handler(_request: Request, exc: DatabaseNotReadyError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(TursoStreamBusyError)
-def _turso_stream_busy_handler(request: Request, exc: TursoStreamBusyError):
-    path = request.url.path if request and request.url else ""
-    if is_client_surface_path(path):
-        _log.warning("client-surface storage busy path=%s: %s", path, exc)
-        return JSONResponse(
-            status_code=503,
-            content={"detail": public_message("unavailable")},
-        )
-    return JSONResponse(
-        status_code=503,
-        content={"detail": sanitize_client_message(str(exc), fallback=str(exc)[:500])},
-    )
+def _turso_stream_busy_handler(_request: Request, exc: TursoStreamBusyError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 _SID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -261,112 +200,6 @@ def _detail_to_cn(detail: object) -> object:
 def _strategy_weight_display_mode_store() -> str:
     """strategy_configs.weight_display_mode 仅存 holding；净值与持仓日快照均按持仓权重。"""
     return "holding"
-
-
-def _strategy_rebalance_dates_list(
-    db: Session, strategy_id: str, *, latest_only: bool
-) -> list[str]:
-    """调仓日列表：以 strategy_positions 为准（每期一条快照，与 trade_date 语义解耦）。"""
-    _ = latest_only
-    rows = db.execute(
-        text(
-            f"""
-            SELECT DISTINCT rebalance_date
-            FROM strategy_positions
-            WHERE strategy_id=:sid
-            ORDER BY {sql_order_date_desc("rebalance_date")}
-            """
-        ),
-        {"sid": strategy_id},
-    ).mappings().all()
-    return [str(r["rebalance_date"]) for r in rows]
-
-
-def _strategy_holdings_from_positions(
-    db: Session,
-    strategy_id: str,
-    rebalance_date: str | None,
-) -> tuple[list[dict], dict]:
-    """全量导入后尚未跑持仓更新时，用 strategy_positions 展示权重（无行情指标）。"""
-    rb = (rebalance_date or "").strip() or None
-    if rb is None:
-        rb_row = db.execute(
-            text(
-                f"""
-                SELECT {sql_max_date_expr("rebalance_date")} AS rb
-                FROM strategy_positions WHERE strategy_id=:sid
-                """
-            ),
-            {"sid": strategy_id},
-        ).mappings().first()
-        rb = str(rb_row["rb"]) if rb_row and rb_row.get("rb") is not None else None
-    if not rb:
-        return [], {
-            "latest_trade_date": None,
-            "rebalance_periods": 0,
-            "current_rebalance_date": None,
-            "data_source": "positions_import",
-        }
-    rb_cmp = _bind_date_compact(rb)
-    nav_td_row = db.execute(
-        text(
-            f"SELECT {sql_max_date_expr('trade_date')} AS d "
-            "FROM strategy_nav_daily WHERE strategy_id=:sid"
-        ),
-        {"sid": strategy_id},
-    ).mappings().first()
-    latest_trade_date = nav_td_row["d"] if nav_td_row else None
-    periods = db.execute(
-        text(
-            """
-            SELECT COUNT(DISTINCT rebalance_date) AS c
-            FROM strategy_positions WHERE strategy_id=:sid
-            """
-        ),
-        {"sid": strategy_id},
-    ).scalar()
-    pos_rows = db.execute(
-        text(
-            f"""
-            SELECT stock_code, holding_weight, industry_neutral_weight
-            FROM strategy_positions
-            WHERE strategy_id=:sid
-              AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
-            ORDER BY holding_weight DESC, stock_code
-            """
-        ),
-        {"sid": strategy_id, "rb_cmp": rb_cmp},
-    ).mappings().all()
-    items: list[dict] = []
-    for r in pos_rows:
-        w = float(r.get("holding_weight") or 0.0)
-        items.append(
-            {
-                "trade_date": latest_trade_date,
-                "stock_code": r.get("stock_code"),
-                "stock_name": None,
-                "period_weight": w,
-                "latest_weight": w,
-                "latest_price": None,
-                "last_1d_pct": None,
-                "period_return": None,
-                "ret_5d": None,
-                "ret_20d": None,
-                "ret_60d": None,
-                "ret_ytd": None,
-                "market_cap": None,
-                "industry_name": None,
-                "pe": None,
-                "pb": None,
-                "rebalance_date": rb,
-            }
-        )
-    return items, {
-        "latest_trade_date": str(latest_trade_date or "") or None,
-        "rebalance_periods": int(periods or 0),
-        "current_rebalance_date": rb,
-        "data_source": "positions_import",
-    }
 
 
 @app.exception_handler(HTTPException)
@@ -1446,85 +1279,49 @@ def _display_strategy_category(raw: object | None) -> str:
     return s if s else "其他"
 
 
-def _api_trade_date_iso(val: object | None) -> str | None:
-    """API 展示用 YYYY-MM-DD（兼容 MAX 返回的 YYYYMMDD compact）。"""
-    return normalize_sql_date_text(val)
-
-
-def _bind_date_compact(val: object | None) -> str | None:
-    """SQL 绑定：与 sql_date_compact_expr 列比较的 YYYYMMDD。"""
-    iso = normalize_sql_date_text(val)
-    if iso:
-        return iso.replace("-", "")
-    s = str(val or "").strip().replace("-", "").replace("/", "")[:8]
-    return s if len(s) == 8 and s.isdigit() else None
-
-
 def _batch_nav_last_date_stock_count(db: Session, strategy_ids: list[str]) -> dict[str, dict]:
-    """
-    净值表最后交易日 + 该日最新调仓期持仓股票数。
-    两步查询：nav 表取末日（行数小）；holding 用 trade_date 等值走 idx_daily，仅扫该日分区。
-    """
+    """净值表最后交易日 + 该日「当前调仓期」持仓股票数（与净值行 rebalance_date 一致，否则取该日最大 rebalance_date）。"""
     if not strategy_ids:
         return {}
     quoted = ",".join("'" + s.replace("'", "''") + "'" for s in strategy_ids)
-    nav_rows = db.execute(
+    rows = db.execute(
         text(
             f"""
-            SELECT nd.strategy_id AS strategy_id, nd.trade_date AS last_trade_date
-            FROM strategy_nav_daily nd
-            INNER JOIN (
-                SELECT strategy_id, {sql_max_date_expr("trade_date")} AS mx
-                FROM strategy_nav_daily
-                WHERE strategy_id IN ({quoted})
-                GROUP BY strategy_id
-            ) mm ON mm.strategy_id = nd.strategy_id
-                AND {sql_date_compact_expr("nd.trade_date")} = mm.mx
+            SELECT n.strategy_id AS strategy_id, n.td AS last_trade_date,
+                   COUNT(DISTINCT h.stock_code) AS stock_cnt
+            FROM (
+                SELECT nd.strategy_id, nd.trade_date AS td, nd.rebalance_date AS nav_rb
+                FROM strategy_nav_daily nd
+                INNER JOIN (
+                    SELECT strategy_id, MAX(trade_date) AS mx
+                    FROM strategy_nav_daily
+                    WHERE strategy_id IN ({quoted})
+                    GROUP BY strategy_id
+                ) mm ON mm.strategy_id = nd.strategy_id AND nd.trade_date = mm.mx
+            ) n
+            LEFT JOIN strategy_holding_daily h
+              ON h.strategy_id = n.strategy_id
+             AND h.trade_date = n.td
+             AND h.rebalance_date = COALESCE(
+                    n.nav_rb,
+                    (
+                        SELECT MAX(x.rebalance_date)
+                        FROM strategy_holding_daily x
+                        WHERE x.strategy_id = n.strategy_id AND x.trade_date = n.td
+                    )
+                  )
+            GROUP BY n.strategy_id, n.td
             """
         )
     ).mappings().all()
     out: dict[str, dict] = {}
-    by_td: dict[str, list[str]] = {}
-    for r in nav_rows:
+    for r in rows:
         sid = str(r["strategy_id"])
-        td_raw = r.get("last_trade_date")
+        td = r.get("last_trade_date")
         out[sid] = {
-            "last_trade_date": str(td_raw)[:10] if td_raw is not None else None,
-            "stock_count": 0,
+            "last_trade_date": str(td)[:10] if td is not None else None,
+            "stock_count": int(r["stock_cnt"] or 0),
         }
-        td_bind = normalize_sql_date_text(td_raw)
-        if td_bind:
-            by_td.setdefault(td_bind, []).append(sid)
-    if not by_td:
-        return out
-
-    rb_h = sql_date_compact_expr("h.rebalance_date")
-    rb_inner = sql_date_compact_expr("rebalance_date")
-    for td_bind, sids in by_td.items():
-        q_sids = ",".join("'" + s.replace("'", "''") + "'" for s in sids)
-        hold_rows = db.execute(
-            text(
-                f"""
-                SELECT h.strategy_id AS strategy_id, COUNT(DISTINCT h.stock_code) AS stock_cnt
-                FROM strategy_holding_daily h
-                INNER JOIN (
-                    SELECT strategy_id, MAX({rb_inner}) AS mx_rb
-                    FROM strategy_holding_daily
-                    WHERE strategy_id IN ({q_sids})
-                      AND trade_date = :td
-                    GROUP BY strategy_id
-                ) m ON m.strategy_id = h.strategy_id
-                   AND h.trade_date = :td
-                   AND {rb_h} = m.mx_rb
-                GROUP BY h.strategy_id
-                """
-            ),
-            {"td": td_bind},
-        ).mappings().all()
-        for hr in hold_rows:
-            sid = str(hr["strategy_id"])
-            if sid in out:
-                out[sid]["stock_count"] = int(hr["stock_cnt"] or 0)
     return out
 
 
@@ -1539,256 +1336,20 @@ _NAV_LIST_SUMMARY_EMPTY: dict[str, Any] = {
 
 
 def _nav_list_trade_date_as_date(td: Any) -> date:
-    d = _row_sql_date(td)
-    if d is not None:
-        return d
     if isinstance(td, datetime):
         return td.date()
     if isinstance(td, date):
         return td
-    s = str(td).strip()[:10]
+    s = str(td)[:10]
     return date.fromisoformat(s)
 
 
-def _nav_list_period_rebalance_date(
-    db: Session, strategy_id: str, last_td: date
-) -> date | None:
-    """列表「本期」：截至最新净值日的有效调仓日（与净值增量锚定一致，取自 strategy_positions）。"""
-    row = db.execute(
-        text(
-            f"""
-            SELECT rebalance_date
-            FROM strategy_positions
-            WHERE strategy_id=:sid
-              AND {sql_date_compact_expr("rebalance_date")} <= :td_cmp
-            ORDER BY {sql_order_date_desc("rebalance_date")}
-            LIMIT 1
-            """
-        ),
-        {"sid": strategy_id, "td_cmp": last_td.strftime("%Y%m%d")},
-    ).mappings().first()
-    if not row:
-        return None
-    return _row_sql_date(row.get("rebalance_date"))
-
-
-def _nav_unit_trading_days_offset(
-    db: Session, strategy_id: str, asof: date, offset: int
-) -> float | None:
-    """asof（含）及之前第 offset 个交易日的 nav_unit；offset=5 与列表「5日」一致。"""
-    from app.nav_list_metrics_calc import _nav_unit_trading_days_offset as _offset_nav
-
-    return _offset_nav(db, strategy_id, asof, offset)
-
-
-def _nav_rolling_window_returns(
-    db: Session,
-    strategy_id: str,
-    *,
-    last_td: date | None = None,
-    last_nav: float | None = None,
-) -> dict[str, float | None]:
-    """滚动窗口收益（净值页可传 asof；列表快照用库内最新末日）。"""
-    from app.nav_list_metrics_calc import rolling_window_returns
-
-    return rolling_window_returns(
-        db, strategy_id, last_td=last_td, last_nav=last_nav
-    )
-
-
-def _nav_unit_last_before(db: Session, strategy_id: str, anchor_dt: date) -> float | None:
-    """严格早于 anchor_dt 的最近一条 nav_unit（与净值页 nav-metrics 本月/本年锚定一致）。"""
-    row = db.execute(
-        text(
-            f"""
-            SELECT nav_unit
-            FROM strategy_nav_daily
-            WHERE strategy_id=:sid
-              AND {sql_date_compact_expr("trade_date")} < :acmp
-            ORDER BY {sql_order_date_desc("trade_date")}
-            LIMIT 1
-            """
-        ),
-        {"sid": strategy_id, "acmp": anchor_dt.strftime("%Y%m%d")},
-    ).mappings().first()
-    if not row or row.get("nav_unit") is None:
-        return None
-    try:
-        v = float(row["nav_unit"])
-        return v if v > 0 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _nav_anchor_nav_unit_before_rows(rows_desc: list[Any], anchor_dt: date) -> float | None:
-    """rows_desc 按 trade_date 降序；取严格早于 anchor_dt 的最近一日 nav_unit（列表批量口径）。"""
-    for r in rows_desc:
-        td = _nav_list_trade_date_as_date(r["trade_date"])
-        if td is not None and td < anchor_dt:
-            try:
-                v = float(r["nav_unit"])
-                return v if v > 0 else None
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _nav_period_start_nav_from_rows(rows_asc: list[Any], period_rb: date) -> float | None:
-    """本期期初：与净值页调仓期锚定一致（该 rebalance_date 首期首条净值）。"""
-    rb_key = period_rb.isoformat()[:10]
-    for r in rows_asc:
-        rb_raw = r.get("rebalance_date")
-        if rb_raw is None:
-            continue
-        if str(rb_raw).strip()[:10] != rb_key:
-            continue
-        try:
-            v = float(r["nav_unit"])
-            if v > 0:
-                return v
-        except (TypeError, ValueError):
-            continue
-    for r in rows_asc:
-        td = _nav_list_trade_date_as_date(r["trade_date"])
-        if td is not None and td >= period_rb:
-            try:
-                v = float(r["nav_unit"])
-                return v if v > 0 else None
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _nav_period_start_nav_unit(
-    db: Session, strategy_id: str, period_rb: date
-) -> float | None:
-    """本期期初：与净值页「本期」累计锚定一致（调仓期首条净值行）。"""
-    sd = period_rb.isoformat()
-    rk = _resolve_nav_rebalance_period_key(db, strategy_id, sd)
-    if rk:
-        nu, _ = _anchor_from_rebalance_period(db, strategy_id, rk)
-        if nu is not None and nu > 0:
-            return float(nu)
-    rb_cmp = period_rb.strftime("%Y%m%d")
-    row = db.execute(
-        text(
-            f"""
-            SELECT nav_unit
-            FROM strategy_nav_daily
-            WHERE strategy_id=:sid
-              AND {sql_date_compact_expr("trade_date")} >= :rb_cmp
-            ORDER BY {sql_order_date_asc("trade_date")}
-            LIMIT 1
-            """
-        ),
-        {"sid": strategy_id, "rb_cmp": rb_cmp},
-    ).mappings().first()
-    if not row or row.get("nav_unit") is None:
-        return None
-    try:
-        v = float(row["nav_unit"])
-        return v if v > 0 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _nav_nav_bench_on_or_before(
-    db: Session, strategy_id: str, asof: date
-) -> tuple[float | None, float | None]:
-    """asof 当日或之前最近一条策略/基准净值（用于本期截止日）。"""
-    row = db.execute(
-        text(
-            f"""
-            SELECT nav_unit, benchmark_nav
-            FROM strategy_nav_daily
-            WHERE strategy_id=:sid
-              AND {sql_date_compact_expr("trade_date")} <= :acmp
-              AND nav_unit IS NOT NULL AND nav_unit > 0
-            ORDER BY {sql_order_date_desc("trade_date")}
-            LIMIT 1
-            """
-        ),
-        {"sid": strategy_id, "acmp": asof.strftime("%Y%m%d")},
-    ).mappings().first()
-    if not row:
-        return None, None
-    n1 = _safe_float(row.get("nav_unit"))
-    b1 = _safe_float(row.get("benchmark_nav"))
-    if b1 is None or b1 <= 0:
-        b2 = db.execute(
-            text(
-                f"""
-                SELECT benchmark_nav
-                FROM strategy_nav_daily
-                WHERE strategy_id=:sid
-                  AND {sql_date_compact_expr("trade_date")} <= :acmp
-                  AND benchmark_nav IS NOT NULL AND benchmark_nav > 0
-                ORDER BY {sql_order_date_desc("trade_date")}
-                LIMIT 1
-                """
-            ),
-            {"sid": strategy_id, "acmp": asof.strftime("%Y%m%d")},
-        ).mappings().first()
-        if b2:
-            b1 = _safe_float(b2.get("benchmark_nav"))
-    return n1, b1
-
-
-def _holding_period_nav_returns(
-    db: Session,
-    strategy_id: str,
-    rebalance_d: date,
-    end_d: date,
-) -> dict[str, float | None]:
-    """
-    持仓页当期：组合、基准、超额收益率（与净值页本期锚定一致）。
-    超额 = (策略期末/期初) / (基准期末/期初) - 1。
-    """
-    out: dict[str, float | None] = {
-        "period_portfolio_return": None,
-        "period_benchmark_return": None,
-        "period_excess_return": None,
-    }
-    rb_iso = rebalance_d.isoformat()[:10]
-    rk = _resolve_nav_rebalance_period_key(db, strategy_id, rb_iso)
-    rb_key = rk or rb_iso
-    n0, b0 = _anchor_from_rebalance_period(db, strategy_id, rb_key)
-    n1, b1 = _nav_nav_bench_on_or_before(db, strategy_id, end_d)
-    if n0 is not None and n0 > 0 and n1 is not None and n1 > 0:
-        out["period_portfolio_return"] = n1 / n0 - 1.0
-    if b0 is not None and b0 > 0 and b1 is not None and b1 > 0:
-        out["period_benchmark_return"] = b1 / b0 - 1.0
-    pr = out["period_portfolio_return"]
-    br = out["period_benchmark_return"]
-    if (
-        pr is not None
-        and br is not None
-        and n0 is not None
-        and b0 is not None
-        and n1 is not None
-        and b1 is not None
-        and n0 > 0
-        and b0 > 0
-        and n1 > 0
-        and b1 > 0
-    ):
-        out["period_excess_return"] = (n1 / n0) / (b1 / b0) - 1.0
-    return out
-
-
 def _nav_list_summary_from_desc_rows(
-    rows_desc: list[Any],
-    max_rb: date | None,
-    *,
-    period_start_nav: float | None = None,
+    rows_desc: list[Any], max_rb: date | None
 ) -> tuple[float, float | None, float | None, float | None, float | None, float | None] | None:
     """
     rows_desc: 同一 strategy 的 nav 行，按 trade_date 降序（与 SQL ORDER BY trade_date DESC 一致）。
     返回 (last_nav, last_1d, last_5d_ret, period_ret, month_ret, year_ret)；无数据返回 None。
-
-    本期：末净值 / 调仓日（含）起首个交易日净值 - 1。
-    本月/本年：末净值 / 严格早于月初、年初的最近交易日净值 - 1（与 nav-metrics 一致）；无锚定时为 None（不用 1.0 兜底）。
-    5日：末净值 / 前第 5 个交易日净值 - 1（仅策略列表快照；净值页按查询区间末日另算）。
     """
     if not rows_desc:
         return None
@@ -1797,61 +1358,106 @@ def _nav_list_summary_from_desc_rows(
     last_1d_return = _safe_float(top.get("daily_ret"))
 
     last_td = _nav_list_trade_date_as_date(top["trade_date"])
-    if last_td is None:
-        return None
+    month_cut = last_td.replace(day=1)
+    year_cut = date(last_td.year, 1, 1)
+
+    anchor_m_nav = None
+    anchor_y_nav = None
+    for r in rows_desc:
+        td = _nav_list_trade_date_as_date(r["trade_date"])
+        if td < month_cut and anchor_m_nav is None:
+            anchor_m_nav = float(r["nav_unit"])
+        if td < year_cut and anchor_y_nav is None:
+            anchor_y_nav = float(r["nav_unit"])
+        if anchor_m_nav is not None and anchor_y_nav is not None:
+            break
+
+    dm = _nav_metric_denominator(anchor_m_nav)
+    dy = _nav_metric_denominator(anchor_y_nav)
+    month_ret = last_nav / dm - 1.0
+    year_ret = last_nav / dy - 1.0
+
     last_5d_return = None
     if len(rows_desc) > 5:
         n5 = float(rows_desc[5]["nav_unit"])
         if n5 > 0:
             last_5d_return = last_nav / n5 - 1.0
-    month_cut = last_td.replace(day=1)
-    year_cut = date(last_td.year, 1, 1)
-    anchor_m_nav = _nav_anchor_nav_unit_before_rows(rows_desc, month_cut)
-    anchor_y_nav = _nav_anchor_nav_unit_before_rows(rows_desc, year_cut)
-    month_ret = (
-        last_nav / anchor_m_nav - 1.0
-        if anchor_m_nav is not None and anchor_m_nav > 0
-        else None
-    )
-    year_ret = (
-        last_nav / anchor_y_nav - 1.0
-        if anchor_y_nav is not None and anchor_y_nav > 0
-        else None
-    )
 
     period_ret = None
     if max_rb is not None:
-        p0 = period_start_nav
-        if p0 is None or p0 <= 0:
-            rows_asc = list(reversed(rows_desc))
-            p0 = _nav_period_start_nav_from_rows(rows_asc, max_rb)
-        if p0 is not None and p0 > 0:
-            period_ret = last_nav / p0 - 1.0
+        first_nav_after = None
+        for r in reversed(rows_desc):
+            td = _nav_list_trade_date_as_date(r["trade_date"])
+            if td >= max_rb:
+                first_nav_after = float(r["nav_unit"])
+                break
+        if first_nav_after is not None and first_nav_after > 0:
+            period_ret = last_nav / first_nav_after - 1.0
+        elif last_nav > 0:
+            period_ret = last_nav / 1.0 - 1.0
 
     return last_nav, last_1d_return, last_5d_return, period_ret, month_ret, year_ret
 
 
-def _strategy_nav_list_summary_bounded(db: Session, strategy_id: str) -> dict[str, Any]:
-    """策略列表快照口径（实现见 nav_list_metrics_calc）。"""
-    from app.nav_list_metrics_calc import compute_strategy_list_metrics_snapshot
-
-    return compute_strategy_list_metrics_snapshot(db, strategy_id)
-
-
 def _batch_strategy_nav_list_summaries(db: Session, strategy_ids: list[str]) -> dict[str, dict[str, Any]]:
     """
-    策略列表页汇总；每策略 bounded 点查，避免 WHERE strategy_id IN (...) 扫全历史 nav 行。
+    与 _strategy_nav_list_summary 相同口径；供策略列表页使用。
+
+    一次读取 strategy_nav_daily（无 ORDER BY，避免大结果集 filesort），在内存中按策略排序并聚合；
+    max_rb 取净值行中 rebalance_date 的最大值（与导入后持仓期键一致，且避免再扫 strategy_positions）。
     """
     ids = [str(x).strip() for x in strategy_ids if str(x or "").strip()]
     out: dict[str, dict[str, Any]] = {sid: dict(_NAV_LIST_SUMMARY_EMPTY) for sid in ids}
+    if not ids:
+        return out
+    quoted = ",".join("'" + s.replace("'", "''") + "'" for s in ids)
+
+    nav_rows = db.execute(
+        text(
+            f"""
+            SELECT strategy_id, trade_date, nav_unit, daily_ret, rebalance_date
+            FROM strategy_nav_daily
+            WHERE strategy_id IN ({quoted})
+            """
+        )
+    ).mappings().all()
+
+    by_sid: defaultdict[str, list[Any]] = defaultdict(list)
+    max_rb_by: dict[str, date | None] = {}
+    for row in nav_rows:
+        sid = str(row["strategy_id"]).strip()
+        by_sid[sid].append(row)
+        rd = row.get("rebalance_date")
+        if rd is not None:
+            d = _nav_list_trade_date_as_date(rd)
+            cur = max_rb_by.get(sid)
+            if cur is None or d > cur:
+                max_rb_by[sid] = d
+
     for sid in ids:
-        out[sid] = _strategy_nav_list_summary_bounded(db, sid)
+        rows = by_sid.get(sid, [])
+        if not rows:
+            continue
+        rows.sort(key=lambda r: _nav_list_trade_date_as_date(r["trade_date"]), reverse=True)
+        pack = _nav_list_summary_from_desc_rows(rows, max_rb_by.get(sid))
+        if pack is None:
+            continue
+        last_nav, last_1d_return, last_5d_return, period_ret, month_ret, year_ret = pack
+        out[sid] = {
+            "latest_nav": _round_nav_unit(last_nav),
+            "last_1d_return": last_1d_return,
+            "last_5d_return": last_5d_return,
+            "period_since_rebalance_return": period_ret,
+            "month_return": month_ret,
+            "year_return": year_ret,
+        }
     return out
 
 
 def _strategy_nav_list_summary(db: Session, strategy_id: str) -> dict:
-    """策略列表快照专用：库内最新净值日的 1日/5日/本期/本月/本年。"""
-    return _strategy_nav_list_summary_bounded(db, strategy_id)
+    """最新净值、本期（最近调仓日以来）、1日/5日（净值序列相邻交易日）、本月、本年收益；口径与净值页 nav-metrics 中月/年一致。"""
+    m = _batch_strategy_nav_list_summaries(db, [strategy_id])
+    return m.get(str(strategy_id).strip(), dict(_NAV_LIST_SUMMARY_EMPTY))
 
 
 def _require_visible_strategy(db: Session, strategy_id: str) -> dict:
@@ -1872,13 +1478,51 @@ def _require_visible_strategy(db: Session, strategy_id: str) -> dict:
 
 
 _SCHEDULED_UPDATE_MAX_ATTEMPTS = 5
-"""兼容旧引用；运行时以 site_settings / 环境变量为准。"""
+"""每日定时任务内，单次调度最多执行更新次数（含首次）；失败后间隔几秒再试，避免瞬时故障。"""
+_SCHEDULED_UPDATE_RETRY_SLEEP_SEC = 8
 
 
 def _scheduled_update():
-    from app.scheduled_update_config import run_update_with_retries
+    from app.db import SessionLocalFactory
+    import logging
 
-    run_update_with_retries("SCHEDULED", "system", log_prefix="Scheduled update")
+    import app.services as _svc
+
+    log = logging.getLogger(__name__)
+    if not wind_sql.use_remote_sqlserver():
+        log.warning("Skip scheduled update: Wind SQL Server not configured or unavailable")
+        return
+    if _svc._job_running:
+        log.info("Skip scheduled update: run_update already active (manual sync/update in progress)")
+        return
+
+    last_exc: BaseException | None = None
+    for attempt in range(1, _SCHEDULED_UPDATE_MAX_ATTEMPTS + 1):
+        db = SessionLocalFactory()
+        try:
+            run_update(db, "SCHEDULED", "system")
+            if attempt > 1:
+                log.info("Scheduled update succeeded on attempt %s/%s", attempt, _SCHEDULED_UPDATE_MAX_ATTEMPTS)
+            return
+        except Exception as ex:
+            last_exc = ex
+            log.warning(
+                "Scheduled update attempt %s/%s failed: %s",
+                attempt,
+                _SCHEDULED_UPDATE_MAX_ATTEMPTS,
+                ex,
+                exc_info=attempt >= _SCHEDULED_UPDATE_MAX_ATTEMPTS,
+            )
+        finally:
+            db.close()
+        if attempt < _SCHEDULED_UPDATE_MAX_ATTEMPTS:
+            time.sleep(_SCHEDULED_UPDATE_RETRY_SLEEP_SEC)
+
+    log.error(
+        "Scheduled update exhausted %s attempts; last error: %s",
+        _SCHEDULED_UPDATE_MAX_ATTEMPTS,
+        last_exc,
+    )
 
 
 @app.get("/health/live")
@@ -1889,30 +1533,23 @@ def health_live():
 
 @app.get("/health")
 def health(verbose: bool = False):
-    """存活探针：默认轻量（与 /health/live 一致）。详细 Wind/DB 用 ?verbose=1。"""
-    db_ready = is_ready()
-    err = boot_error()
-    if not verbose:
-        return {
-            "ok": db_ready and not err,
-            "live": True,
-            "db_ready": db_ready,
-            "service": "strategy-showcase-python",
-        }
     wind_ok = wind_sql.use_remote_sqlserver()
-    wind_st = wind_sql.wind_status()
+    wind_st = wind_sql.wind_status() if verbose else None
     turso_url = (settings.turso_database_url or "").strip()
     wind_configured = bool((settings.wind_sqlserver_server or "").strip())
+    db_ready = is_ready()
+    err = boot_error()
     out: dict[str, Any] = {
         "ok": db_ready and not err and (not wind_configured or wind_ok),
         "db_ready": db_ready,
         "db_error": err,
         "service": "strategy-showcase-python",
-        "turso_configured": bool(turso_url),
+        "turso_configured": bool(turso_url and (settings.turso_auth_token or "").strip()),
         "wind_data_source": "sqlserver" if wind_ok else "disabled",
         "wind_sqlserver_ready": wind_ok,
-        "wind_sqlserver": wind_st,
     }
+    if verbose:
+        out["wind_sqlserver"] = wind_st
     return out
 
 
@@ -2722,32 +2359,43 @@ def public_feedback_submit(
 
 @app.get("/api/strategies")
 def list_strategies(user=Depends(get_current_user), db: Session = Depends(get_session)):
-    username = user["username"]
     rows = db.execute(
         text(
             """
-            SELECT c.strategy_id, c.strategy_name, c.benchmark_code, c.benchmark_name,
-                   c.strategy_intro, c.strategy_category, c.rebalance_frequency,
-                   m.latest_nav, m.last_1d_return, m.last_5d_return,
-                   m.period_since_rebalance_return, m.month_return, m.year_return,
-                   m.last_trade_date, m.stock_count_on_last_date,
-                   CASE WHEN f.strategy_id IS NULL THEN 0 ELSE 1 END AS is_followed
-            FROM strategy_configs c
-            LEFT JOIN strategy_list_metrics m ON m.strategy_id = c.strategy_id
-            LEFT JOIN user_strategy_follows f
-              ON f.strategy_id = c.strategy_id AND f.username = :username
-            WHERE c.is_visible=1 AND c.status='enabled'
-            ORDER BY c.updated_at DESC
+            SELECT strategy_id, strategy_name, benchmark_code, benchmark_name, strategy_intro,
+                   strategy_category, rebalance_frequency
+            FROM strategy_configs
+            WHERE is_visible=1 AND status='enabled'
+            ORDER BY updated_at DESC
+            """
+        )
+    ).mappings().all()
+    username = user["username"]
+    follow_rows = db.execute(
+        text(
+            """
+            SELECT strategy_id FROM user_strategy_follows WHERE username=:u
             """
         ),
-        {"username": username},
+        {"u": username},
     ).mappings().all()
+    followed_set = {str(r["strategy_id"]) for r in follow_rows}
+    sids = [str(r["strategy_id"]) for r in rows]
+    summaries = _batch_strategy_nav_list_summaries(db, sids)
     items = []
     for r in rows:
         d = dict(r)
-        d["is_followed"] = bool(d.get("is_followed"))
+        sid = d["strategy_id"]
+        d["is_followed"] = sid in followed_set
         d["display_category"] = _display_strategy_category(d.get("strategy_category"))
+        d.update(summaries.get(str(sid), dict(_NAV_LIST_SUMMARY_EMPTY)))
         items.append(d)
+    nav_meta = _batch_nav_last_date_stock_count(db, [str(x["strategy_id"]) for x in items])
+    for d in items:
+        sid = str(d["strategy_id"])
+        m = nav_meta.get(sid) or {}
+        d["last_trade_date"] = m.get("last_trade_date")
+        d["stock_count_on_last_date"] = m.get("stock_count")
     followed = [x for x in items if x["is_followed"]]
     return {"items": items, "followed": followed, "role": user["role"]}
 
@@ -2812,22 +2460,9 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
             """
         )
     ).mappings().first()
-    latest_td = _api_trade_date_iso(td_row["d"]) if td_row else None
+    latest_td = td_row["d"] if td_row else None
     if latest_td is None:
-        n_row = db.execute(
-            text(
-                f"""
-                SELECT MAX(z.td) AS d
-                FROM (
-                    SELECT {sql_max_date_expr("trade_date")} AS td
-                    FROM strategy_nav_daily
-                    WHERE strategy_id IN ({quoted_visible})
-                    GROUP BY strategy_id
-                ) z
-                """
-            )
-        ).mappings().first()
-        latest_td = _api_trade_date_iso(n_row["d"]) if n_row else None
+        return {"latest_trade_date": None, "followed_top": [], "categories": [], "category_tops": {}}
 
     def _build_top(strategy_ids: list[str], lim: int) -> list[dict]:
         """每个策略：最新 trade_date + 该日 MAX(rebalance_date) 的持仓（与 strategy_holdings 默认本期一致）。"""
@@ -2840,8 +2475,6 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
             ph.append(f":{k}")
             binds[k] = sid
         in_clause = ",".join(ph)
-        td_cmp = sql_date_compact_expr("h.trade_date")
-        rb_cmp = sql_date_compact_expr("h.rebalance_date")
         rows = db.execute(
             text(
                 f"""
@@ -2852,15 +2485,15 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
                     FROM strategy_holding_daily
                     WHERE strategy_id IN ({in_clause})
                     GROUP BY strategy_id
-                ) lt ON lt.strategy_id = h.strategy_id AND {td_cmp} = lt.td
+                ) lt ON lt.strategy_id = h.strategy_id AND h.trade_date = lt.td
                 INNER JOIN (
                     SELECT strategy_id, trade_date, {sql_max_date_expr("rebalance_date")} AS rb
                     FROM strategy_holding_daily
                     WHERE strategy_id IN ({in_clause})
                     GROUP BY strategy_id, trade_date
                 ) lr ON lr.strategy_id = h.strategy_id
-                    AND {td_cmp} = {sql_date_compact_expr("lr.trade_date")}
-                    AND {rb_cmp} = lr.rb
+                    AND lr.trade_date = h.trade_date
+                    AND h.rebalance_date = lr.rb
                 WHERE h.strategy_id IN ({in_clause})
                 """
             ),
@@ -2927,7 +2560,7 @@ def stock_leaderboard(user=Depends(get_current_user), db: Session = Depends(get_
         category_tops[cat] = _build_top(by_category[cat], 10)
 
     return {
-        "latest_trade_date": latest_td,
+        "latest_trade_date": str(latest_td),
         "followed_top": _build_top(followed_ids, 10),
         "categories": category_order,
         "category_tops": category_tops,
@@ -2987,139 +2620,113 @@ def strategy_holdings(
     if int(all_rows or 0) != 1 and page_size not in (20, 50, 100):
         raise HTTPException(status_code=400, detail="page_size must be 20, 50, or 100")
 
-    market_td = strategy_market_holding_trade_date(db, strategy_id)
-    latest_trade_date = _api_trade_date_iso(market_td)
-    if market_td is None:
-        pos_items, pos_meta = _strategy_holdings_from_positions(
-            db, strategy_id, rebalance_date
-        )
-        if not pos_items:
-            return {
-                "page": page,
-                "page_size": page_size,
-                "total": 0,
-                "meta": {
-                    "latest_trade_date": None,
-                    "rebalance_periods": 0,
-                    "current_rebalance_date": None,
-                    "wind_data_source": "sqlserver",
-                },
-                "items": [],
-            }
-        meta_out = {
-            "latest_trade_date": pos_meta.get("latest_trade_date"),
-            "rebalance_periods": pos_meta.get("rebalance_periods", 0),
-            "current_rebalance_date": pos_meta.get("current_rebalance_date"),
-            "wind_data_source": "sqlserver",
-        }
-        if int(all_rows or 0) == 1:
-            return {
-                "page": 1,
-                "page_size": len(pos_items),
-                "total": len(pos_items),
-                "meta": meta_out,
-                "items": pos_items,
-            }
-        offset = (page - 1) * page_size
-        page_items = pos_items[offset : offset + page_size]
-        return {
-            "page": page,
-            "page_size": page_size,
-            "total": len(pos_items),
-            "meta": meta_out,
-            "items": page_items,
-        }
-
-    selected_rb_raw = rebalance_date.strip() if rebalance_date else None
-    if selected_rb_raw == "":
-        selected_rb_raw = None
-    rebalance_d: date | None = None
-    if selected_rb_raw:
-        rb_iso = normalize_sql_date_text(selected_rb_raw)
-        if rb_iso:
-            try:
-                rebalance_d = datetime.strptime(rb_iso, "%Y-%m-%d").date()
-            except ValueError:
-                rebalance_d = None
-    snap_td, rebalance_d = resolve_holding_snapshot_trade_date(
-        db, strategy_id, rebalance_d, market_td
-    )
-    td_cmp = _bind_date_compact(snap_td)
-    rb_cmp = _bind_date_compact(rebalance_d)
-    selected_rb = _api_trade_date_iso(rebalance_d)
-
-    total = db.execute(
+    latest_td_row = db.execute(
         text(
-            f"""
-            SELECT COUNT(*) AS c FROM strategy_holding_daily h
-            WHERE h.strategy_id=:sid
-              AND {sql_date_compact_expr("h.trade_date")} = :td_cmp
-              AND {sql_date_compact_expr("h.rebalance_date")} = :rb_cmp
-            """
-        ),
-        {"sid": strategy_id, "td_cmp": td_cmp, "rb_cmp": rb_cmp},
-    ).mappings().first()["c"]
-    meta_row = db.execute(
-        text(
-            f"""
-            SELECT COUNT(DISTINCT rebalance_date) AS rebalance_periods
-            FROM strategy_positions
-            WHERE strategy_id=:sid
-            """
+            f"SELECT {sql_max_date_expr('trade_date')} AS d "
+            "FROM strategy_holding_daily WHERE strategy_id=:sid"
         ),
         {"sid": strategy_id},
     ).mappings().first()
-    hold_params = {"sid": strategy_id, "td_cmp": td_cmp, "rb_cmp": rb_cmp}
+    latest_trade_date = latest_td_row["d"] if latest_td_row else None
+    if latest_trade_date is None:
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total": 0,
+            "meta": {
+                "latest_trade_date": None,
+                "rebalance_periods": 0,
+                "current_rebalance_date": None,
+                "wind_data_source": "sqlserver",
+            },
+            "items": [],
+        }
+
+    selected_rb = rebalance_date.strip() if rebalance_date else None
+    if selected_rb == "":
+        selected_rb = None
+    if selected_rb is None:
+        rb_row = db.execute(
+            text(
+                f"""
+                SELECT {sql_max_date_expr("rebalance_date")} AS rb
+                FROM strategy_holding_daily
+                WHERE strategy_id=:sid AND trade_date=:td
+                """
+            ),
+            {"sid": strategy_id, "td": latest_trade_date},
+        ).mappings().first()
+        selected_rb = str(rb_row["rb"]) if rb_row and rb_row.get("rb") is not None else None
+
+    total = db.execute(
+        text(
+            """
+            SELECT COUNT(*) AS c FROM strategy_holding_daily h
+            WHERE h.strategy_id=:sid
+              AND h.trade_date=:td
+              AND (:rb IS NULL OR h.rebalance_date=:rb)
+            """
+        ),
+        {"sid": strategy_id, "td": latest_trade_date, "rb": selected_rb},
+    ).mappings().first()["c"]
+    meta_row = db.execute(
+        text(
+            """
+            SELECT
+              MAX(trade_date) AS latest_trade_date,
+              COUNT(DISTINCT rebalance_date) AS rebalance_periods
+            FROM strategy_holding_daily h
+            WHERE h.strategy_id=:sid
+              AND h.trade_date=:td
+            """
+        ),
+        {"sid": strategy_id, "td": latest_trade_date},
+    ).mappings().first()
     if int(all_rows or 0) == 1:
         rows = db.execute(
             text(
-                f"""
+                """
                 SELECT
                   trade_date, stock_code, stock_name, period_weight, latest_weight, latest_price,
                   last_1d_pct, period_return, ret_5d, ret_20d, ret_60d, ret_ytd,
                   market_cap, industry_name, pe, pb, rebalance_date
                 FROM strategy_holding_daily
                 WHERE strategy_id=:sid
-                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                  AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
+                  AND trade_date=:td
+                  AND (:rb IS NULL OR rebalance_date=:rb)
                 ORDER BY latest_weight DESC, stock_code
                 """
             ),
-            hold_params,
+            {"sid": strategy_id, "td": latest_trade_date, "rb": selected_rb},
         ).mappings().all()
     else:
         offset = (page - 1) * page_size
         rows = db.execute(
             text(
-                f"""
+                """
                 SELECT
                   trade_date, stock_code, stock_name, period_weight, latest_weight, latest_price,
                   last_1d_pct, period_return, ret_5d, ret_20d, ret_60d, ret_ytd,
                   market_cap, industry_name, pe, pb, rebalance_date
                 FROM strategy_holding_daily
                 WHERE strategy_id=:sid
-                  AND {sql_date_compact_expr("trade_date")} = :td_cmp
-                  AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
+                  AND trade_date=:td
+                  AND (:rb IS NULL OR rebalance_date=:rb)
                 ORDER BY latest_weight DESC, stock_code
                 LIMIT :limit OFFSET :offset
                 """
             ),
-            {**hold_params, "limit": page_size, "offset": offset},
+            {"sid": strategy_id, "td": latest_trade_date, "rb": selected_rb, "limit": page_size, "offset": offset},
         ).mappings().all()
-    period_returns = _holding_period_nav_returns(
-        db, strategy_id, rebalance_d, snap_td
-    )
     return {
         "page": page,
         "page_size": page_size,
         "total": int(total),
         "meta": {
-            "latest_trade_date": latest_trade_date,
-            "snapshot_trade_date": _api_trade_date_iso(snap_td),
+            "latest_trade_date": str(meta_row["latest_trade_date"] or "") or None,
             "rebalance_periods": int(meta_row["rebalance_periods"] or 0),
             "current_rebalance_date": selected_rb,
             "wind_data_source": "sqlserver",
-            **period_returns,
         },
         "items": [dict(r) for r in rows],
     }
@@ -3133,10 +2740,35 @@ def strategy_rebalance_dates(
     db: Session = Depends(get_session),
 ):
     _ = user
-    items = _strategy_rebalance_dates_list(
-        db, strategy_id, latest_only=bool(int(latest_only or 0))
-    )
-    return {"items": items}
+    if int(latest_only or 0) == 1:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT DISTINCT rebalance_date
+                FROM strategy_holding_daily
+                WHERE strategy_id=:sid
+                  AND trade_date = (
+                    SELECT {sql_max_date_expr("trade_date")}
+                    FROM strategy_holding_daily WHERE strategy_id=:sid
+                  )
+                ORDER BY {sql_order_date_desc("rebalance_date")}
+                """
+            ),
+            {"sid": strategy_id},
+        ).mappings().all()
+    else:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT DISTINCT rebalance_date
+                FROM strategy_positions
+                WHERE strategy_id=:sid
+                ORDER BY {sql_order_date_desc("rebalance_date")}
+                """
+            ),
+            {"sid": strategy_id},
+        ).mappings().all()
+    return {"items": [str(r["rebalance_date"]) for r in rows]}
 
 
 @app.get("/api/strategies/{strategy_id}/stocks/{stock_code}")
@@ -3151,99 +2783,65 @@ def strategy_stock_profile(
     if not code or len(code) > 32:
         raise HTTPException(status_code=400, detail="invalid stock_code")
 
-    market_td = strategy_market_holding_trade_date(db, strategy_id)
-    if market_td is None:
-        raise HTTPException(status_code=404, detail="stock not found")
-    snap_td, open_rb = resolve_holding_snapshot_trade_date(
-        db, strategy_id, None, market_td
-    )
-    td_cmp = _bind_date_compact(snap_td)
-    rb_cmp = _bind_date_compact(open_rb)
-    if not td_cmp or not rb_cmp:
+    latest_td_row = db.execute(
+        text(
+            f"SELECT {sql_max_date_expr('trade_date')} AS d "
+            "FROM strategy_holding_daily WHERE strategy_id=:sid"
+        ),
+        {"sid": strategy_id},
+    ).mappings().first()
+    latest_trade_date = latest_td_row["d"] if latest_td_row else None
+    if latest_trade_date is None:
         raise HTTPException(status_code=404, detail="stock not found")
 
     latest = db.execute(
         text(
-            f"""
+            """
             SELECT
               trade_date, rebalance_date, stock_code, stock_name, period_weight, latest_weight,
               latest_price, last_1d_pct, period_return, ret_5d, ret_20d, ret_60d, ret_ytd,
               market_cap, industry_name, pe, pb
             FROM strategy_holding_daily
-            WHERE strategy_id=:sid
-              AND {sql_date_compact_expr("trade_date")} = :td_cmp
-              AND {sql_date_compact_expr("rebalance_date")} = :rb_cmp
-              AND stock_code=:code
+            WHERE strategy_id=:sid AND trade_date=:td AND stock_code=:code
             LIMIT 1
             """
         ),
-        {"sid": strategy_id, "td_cmp": td_cmp, "rb_cmp": rb_cmp, "code": code},
+        {"sid": strategy_id, "td": latest_trade_date, "code": code},
     ).mappings().first()
     if not latest:
         raise HTTPException(status_code=404, detail="stock not found")
-    latest = dict(latest)
 
-    rb_positions, _, _ = _group_strategy_positions_by_rebalance(db, strategy_id)
-    hold_rows = db.execute(
+    hist = db.execute(
         text(
-            f"""
-            SELECT rebalance_date, trade_date, period_return
-            FROM strategy_holding_daily
-            WHERE strategy_id=:sid AND stock_code=:code
             """
-        ),
-        {"sid": strategy_id, "code": code},
-    ).mappings().all()
-    hold_by_key: dict[tuple[str, str], Any] = {}
-    for hr in hold_rows:
-        k = (
-            _bind_date_compact(hr.get("rebalance_date")) or "",
-            _bind_date_compact(hr.get("trade_date")) or "",
-        )
-        if k[0] and k[1]:
-            hold_by_key[k] = hr.get("period_return")
-    pos_rows = db.execute(
-        text(
-            f"""
-            SELECT rebalance_date, holding_weight
-            FROM strategy_positions
-            WHERE strategy_id=:sid AND stock_code=:code
-            ORDER BY {sql_order_date_desc("rebalance_date")}
+            SELECT
+              p.rebalance_date AS snapshot_date,
+              p.holding_weight AS period_weight,
+              d.period_return
+            FROM strategy_positions p
+            LEFT JOIN (
+              SELECT x.rebalance_date, x.period_return
+              FROM strategy_holding_daily x
+              INNER JOIN (
+                SELECT rebalance_date, MAX(trade_date) AS max_td
+                FROM strategy_holding_daily
+                WHERE strategy_id=:sid AND stock_code=:code
+                GROUP BY rebalance_date
+              ) m
+                ON x.rebalance_date = m.rebalance_date
+               AND x.trade_date = m.max_td
+               AND x.strategy_id = :sid
+               AND x.stock_code = :code
+            ) d
+              ON d.rebalance_date = p.rebalance_date
+            WHERE p.strategy_id=:sid AND p.stock_code=:code
+            ORDER BY p.rebalance_date DESC
             LIMIT 60
             """
         ),
         {"sid": strategy_id, "code": code},
     ).mappings().all()
-    hist_items: list[dict] = []
-    for pr in pos_rows:
-        rb_d = pr.get("rebalance_date")
-        if rb_d is None:
-            continue
-        rb_iso = normalize_sql_date_text(rb_d)
-        if not rb_iso:
-            continue
-        try:
-            rb_date = datetime.strptime(rb_iso, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        next_rb: date | None = None
-        for i, (rb, _) in enumerate(rb_positions):
-            if _bind_date_compact(rb) != _bind_date_compact(rb_date):
-                continue
-            if i + 1 < len(rb_positions):
-                next_rb = rb_positions[i + 1][0]
-            break
-        canon_td = holding_snapshot_trade_date_for_period(
-            rb_date, next_rb, market_td
-        )
-        ck = (_bind_date_compact(rb_date) or "", _bind_date_compact(canon_td) or "")
-        hist_items.append(
-            {
-                "snapshot_date": rb_iso,
-                "period_weight": pr.get("holding_weight"),
-                "period_return": hold_by_key.get(ck),
-            }
-        )
+    hist_items = [dict(r) for r in hist]
     company_profile = _fetch_supplement_company_profile(db, code)
 
     trend_payload: dict | None = None
@@ -3257,11 +2855,6 @@ def strategy_stock_profile(
         try:
             wind = wind_sql.open_wind(db)
             try:
-                wind, disp_close = overlay_holding_display_close_from_wind(
-                    wind, db, code, td_cmp
-                )
-                if disp_close is not None:
-                    latest["latest_price"] = disp_close
                 trend_payload = stock_trend.compute_stock_index_year_trend(wind, code)
             except Exception as e:
                 trend_payload = {"error": str(e)}
@@ -3285,7 +2878,7 @@ def strategy_stock_profile(
         top10_holders = {"error": "Wind 未配置", "items": []}
 
     return {
-        "latest": latest,
+        "latest": dict(latest),
         "history": hist_items,
         "company_profile": company_profile,
         "trend": trend_payload,
@@ -3693,26 +3286,52 @@ def strategy_nav_metrics(
     if win_day_pairs:
         win_rate = sum(1 for dr, br in win_day_pairs if dr >= br) / len(win_day_pairs)
 
-    # 5日/本月/本年：按当前查询区间末日即时计算（不读 strategy_list_metrics）
-    as_of_td = _nav_list_trade_date_as_date(last["trade_date"])
-    rolling = _nav_rolling_window_returns(
-        db, strategy_id, last_td=as_of_td, last_nav=last_nav
-    )
-    week_ret = rolling["last_5d_return"]
-    month_ret = rolling["month_return"]
-    year_ret = rolling["year_return"]
+    end_td = _to_date(last.get("trade_date"))
+
+    def _anchor_nav(anchor_dt: date) -> float | None:
+        row = db.execute(
+            text(
+                """
+                SELECT nav_unit
+                FROM strategy_nav_daily
+                WHERE strategy_id=:sid
+                  AND trade_date < :anchor
+                ORDER BY trade_date DESC
+                LIMIT 1
+                """
+            ),
+            {"sid": strategy_id, "anchor": anchor_dt},
+        ).mappings().first()
+        if not row or row.get("nav_unit") is None:
+            return None
+        return float(row["nav_unit"])
+
+    week_ret = None
+    month_ret = None
+    year_ret = None
+    if end_td is not None and last_nav is not None and last_nav > 0:
+        week_start = end_td - timedelta(days=end_td.weekday())
+        m_start = end_td.replace(day=1)
+        y_start = end_td.replace(month=1, day=1)
+        base_w = _anchor_nav(week_start)
+        base_m = _anchor_nav(m_start)
+        base_y = _anchor_nav(y_start)
+        dw = _nav_metric_denominator(base_w)
+        dm = _nav_metric_denominator(base_m)
+        dy = _nav_metric_denominator(base_y)
+        week_ret = last_nav / dw - 1.0
+        month_ret = last_nav / dm - 1.0
+        year_ret = last_nav / dy - 1.0
 
     return {
         "ok": True,
         "items_count": n_days,
-        "metrics_as_of_trade_date": as_of_td.isoformat() if as_of_td else None,
         "metrics": {
             "cum_return": cum_ret,
             "annual_return": ann_ret,
             "annual_volatility": ann_vol,
             "max_drawdown": max_dd,
             "week_return": week_ret,
-            "last_5d_return": week_ret,
             "month_return": month_ret,
             "year_return": year_ret,
             "win_rate": win_rate,
@@ -4036,7 +3655,6 @@ def delete_strategy(
     db.execute(text("DELETE FROM strategy_positions WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.execute(text("DELETE FROM strategy_holding_daily WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.execute(text("DELETE FROM strategy_nav_daily WHERE strategy_id=:sid"), {"sid": strategy_id})
-    db.execute(text("DELETE FROM strategy_list_metrics WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.execute(text("DELETE FROM strategy_configs WHERE strategy_id=:sid"), {"sid": strategy_id})
     db.commit()
     return {"ok": True, "deleted_strategy_id": strategy_id}
@@ -4067,7 +3685,6 @@ def delete_strategies(
     db.execute(text(f"DELETE FROM strategy_positions WHERE strategy_id IN ({q2})"))
     db.execute(text(f"DELETE FROM strategy_holding_daily WHERE strategy_id IN ({q2})"))
     db.execute(text(f"DELETE FROM strategy_nav_daily WHERE strategy_id IN ({q2})"))
-    db.execute(text(f"DELETE FROM strategy_list_metrics WHERE strategy_id IN ({q2})"))
     db.execute(text(f"DELETE FROM strategy_configs WHERE strategy_id IN ({q2})"))
     db.commit()
     return {"ok": True, "deleted_count": len(hit_ids), "deleted_strategy_ids": hit_ids}
@@ -4099,7 +3716,6 @@ def admin_import(
         from app.timeutil import now_naive
 
         resume_ts = now_naive().strftime("%Y-%m-%d %H:%M:%S")
-        im = str(job.get("import_mode") or "full")
         db.execute(
             text(
                 f"""
@@ -4108,33 +3724,20 @@ def admin_import(
                     started_at={sql_now()},
                     progress_at={sql_now()},
                     finished_at=NULL,
-                    completed_strategy_ids_json='[]',
-                    imported_count=0,
-                    checkpoint_json=NULL,
                     message=:m
                 WHERE id=:id
                 """
             ),
-            {
-                "id": job_id,
-                "m": f"续传已入队（{resume_ts}，模式 {im}；从断点继续，非从头导入）",
-            },
+            {"id": job_id, "m": f"续传已入队（{resume_ts}）"},
         )
         db.commit()
-        _log.info("strategy import RESUME job=%s mode=%s", job_id, im)
-        spawn_daemon(
-            f"strategy-import-{job_id}",
-            run_strategy_import_background_task,
-            job_id,
-            resume=True,
-        )
+        background_tasks.add_task(run_strategy_import_background_task, job_id, resume=True)
         return {
             "ok": True,
             "queued": True,
             "resumed": True,
             "import_job_id": job_id,
-            "import_mode": im,
-            "message": f"已续传策略导入任务 #{job_id}（模式 {im}）",
+            "message": f"已续传策略导入任务 #{job_id}，请轮询 GET /api/admin/import-jobs/{job_id}",
         }
     if bool(body.get("background")):
         if not ids:
@@ -4142,16 +3745,6 @@ def admin_import(
                 status_code=400,
                 detail="background import requires non-empty strategy_ids",
             )
-        if mode == "full":
-            row_count = count_strategy_positions_rows(db, ids)
-            if row_count > 0 and not bool(body.get("confirm_wipe")):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"库内已有 {row_count} 行持仓，全量将先清空再导入。"
-                        "若确要重来请传 confirm_wipe:true；中断后请对同一任务点「续传」。"
-                    ),
-                )
         job_id = create_strategy_import_job(
             db,
             strategy_ids=ids,
@@ -4159,18 +3752,7 @@ def admin_import(
             triggered_by=str(user.get("username") or "admin"),
         )
         db.commit()
-        _log.info(
-            "strategy import NEW job=%s mode=%s strategies=%s (full=先DELETE库内持仓)",
-            job_id,
-            mode,
-            ids,
-        )
-        spawn_daemon(
-            f"strategy-import-{job_id}",
-            run_strategy_import_background_task,
-            job_id,
-            resume=False,
-        )
+        background_tasks.add_task(run_strategy_import_background_task, job_id, resume=False)
         return {
             "ok": True,
             "queued": True,
@@ -4369,14 +3951,8 @@ def admin_sync_job_resume(
     st = str(row.get("status") or "").upper()
     if st not in ("FAILED",):
         raise HTTPException(status_code=400, detail=f"仅 FAILED 任务可续传（当前 {st}）")
-    row_d = dict(row)
-    if not admin_sync_job_is_resumable(row_d):
-        raise HTTPException(status_code=400, detail="该同步任务不可续传")
     if not row.get("checkpoint_json"):
-        try:
-            admin_sync_job_bootstrap_checkpoint(db, job_id, do_commit=False)
-        except ValueError as ex:
-            raise HTTPException(status_code=404, detail=str(ex)) from ex
+        raise HTTPException(status_code=400, detail="无断点记录，请重新发起同步")
     row_run = db.execute(text("SELECT id FROM admin_sync_jobs WHERE status='RUNNING' LIMIT 1")).first()
     if row_run and int(row_run[0]) != job_id:
         raise HTTPException(status_code=409, detail=f"已有同步任务 RUNNING id={row_run[0]}")
@@ -4399,7 +3975,7 @@ def admin_sync_job_resume(
             WHERE id=:id
             """
         ),
-        {"id": job_id, "m": f"续传已入队（{resume_ts}，模式 {import_mode}）"},
+        {"id": job_id, "m": f"续传已入队（{resume_ts}）"},
     )
     db.commit()
     spawn_daemon(
@@ -4574,24 +4150,17 @@ def admin_update(
 
 
 @app.get("/api/admin/update-jobs")
-def update_jobs(
-    limit: int = 50,
-    user=Depends(require_roles("admin", "editor")),
-    db: Session = Depends(get_session),
-):
+def update_jobs(user=Depends(require_roles("admin", "editor")), db: Session = Depends(get_session)):
     _ = user
-    if limit < 1 or limit > 100:
-        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
     rows = db.execute(
         text(
             """
             SELECT id, job_type, status, triggered_by, started_at, finished_at, message, progress_at
             FROM strategy_update_jobs
             ORDER BY id DESC
-            LIMIT :lim
+            LIMIT 50
             """
-        ),
-        {"lim": int(limit)},
+        )
     ).mappings().all()
     return {"items": [dict(r) for r in rows]}
 
@@ -5324,22 +4893,19 @@ def admin_users_list(
     if items:
         ids = [int(r["id"]) for r in items]
         in_list = ",".join(str(i) for i in ids)
-        client_where = client_access_path_sql_where("path")
         crow = db.execute(
             text(
                 f"""
-                SELECT user_id, COUNT(*) AS client_request_count
+                SELECT user_id, COUNT(*) AS page_request_count
                 FROM user_access_logs
                 WHERE user_id IN ({in_list})
-                  AND {client_where}
                 GROUP BY user_id
                 """
             )
         ).mappings().all()
-        cmap = {int(r["user_id"]): int(r.get("client_request_count") or 0) for r in crow}
+        cmap = {int(r["user_id"]): int(r.get("page_request_count") or 0) for r in crow}
         for it in items:
-            it["client_request_count"] = cmap.get(int(it["id"]), 0)
-            it["page_request_count"] = it["client_request_count"]
+            it["page_request_count"] = cmap.get(int(it["id"]), 0)
     return {"items": items}
 
 
@@ -5461,31 +5027,31 @@ def admin_access_overview(
 
     usage_today = db.execute(
         text(
-            f"""
+            """
             SELECT COALESCE(SUM(u.api_requests), 0) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date = {sql_curdate()}
+            WHERE u.usage_date = date('now')
             """
         )
     ).mappings().first()
     usage_7d = db.execute(
         text(
-            f"""
+            """
             SELECT COALESCE(SUM(u.api_requests), 0) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= {sql_curdate_days_ago(6)}
+            WHERE u.usage_date >= date('now', '-6 days')
             """
         )
     ).mappings().first()
     usage_30d = db.execute(
         text(
-            f"""
+            """
             SELECT COALESCE(SUM(u.api_requests), 0) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= {sql_curdate_days_ago(29)}
+            WHERE u.usage_date >= date('now', '-29 days')
             """
         )
     ).mappings().first()
@@ -5495,65 +5061,27 @@ def admin_access_overview(
 
     dv7 = db.execute(
         text(
-            f"""
+            """
             SELECT COUNT(DISTINCT u.user_id) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= {sql_curdate_days_ago(6)}
+            WHERE u.usage_date >= date('now', '-6 days')
             """
         )
     ).mappings().first()
     dv30 = db.execute(
         text(
-            f"""
+            """
             SELECT COUNT(DISTINCT u.user_id) AS c
             FROM user_usage_daily u
             INNER JOIN users usr ON usr.id = u.user_id AND usr.role = 'viewer'
-            WHERE u.usage_date >= {sql_curdate_days_ago(29)}
+            WHERE u.usage_date >= date('now', '-29 days')
             """
         )
     ).mappings().first()
     distinct_viewers_7d = int((dv7 or {}).get("c") or 0)
     distinct_viewers_30d = int((dv30 or {}).get("c") or 0)
     avg_req_per_active_7d = round(api_7d / distinct_viewers_7d, 2) if distinct_viewers_7d else 0.0
-
-    client_path_sql = client_access_path_sql_where("ual.path")
-    client_req_7d_row = db.execute(
-        text(
-            f"""
-            SELECT COUNT(*) AS c
-            FROM user_access_logs ual
-            INNER JOIN users usr ON usr.id = ual.user_id AND usr.role = 'viewer'
-            WHERE ual.created_at >= {sql_days_ago(6)}
-              AND {client_path_sql}
-            """
-        )
-    ).mappings().first()
-    client_req_today_row = db.execute(
-        text(
-            f"""
-            SELECT COUNT(*) AS c
-            FROM user_access_logs ual
-            INNER JOIN users usr ON usr.id = ual.user_id AND usr.role = 'viewer'
-            WHERE date(ual.created_at) = {sql_curdate()}
-              AND {client_path_sql}
-            """
-        )
-    ).mappings().first()
-    client_dv7_row = db.execute(
-        text(
-            f"""
-            SELECT COUNT(DISTINCT ual.user_id) AS c
-            FROM user_access_logs ual
-            INNER JOIN users usr ON usr.id = ual.user_id AND usr.role = 'viewer'
-            WHERE ual.created_at >= {sql_days_ago(6)}
-              AND {client_path_sql}
-            """
-        )
-    ).mappings().first()
-    client_requests_today = int((client_req_today_row or {}).get("c") or 0)
-    client_requests_7d = int((client_req_7d_row or {}).get("c") or 0)
-    client_distinct_viewers_7d = int((client_dv7_row or {}).get("c") or 0)
 
     lv7 = db.execute(
         text(
@@ -5610,11 +5138,6 @@ def admin_access_overview(
             "last_7_days": api_7d,
             "last_30_days": api_30d,
         },
-        "client_browse_requests": {
-            "today": client_requests_today,
-            "last_7_days": client_requests_7d,
-            "distinct_viewers_7d": client_distinct_viewers_7d,
-        },
         "distinct_active_viewers_by_requests": {
             "last_7_days": distinct_viewers_7d,
             "last_30_days": distinct_viewers_30d,
@@ -5629,10 +5152,10 @@ def admin_access_overview(
         "viewer_devices_avg_idle_hours": viewer_devices_avg_idle_hours,
         "access_token_expire_minutes": int(settings.access_token_expire_minutes),
         "notes": [
-            "客户端浏览：策略列表/详情、净值、持仓、个股、关注、联系与反馈等 /api/strategies/*、/api/client/* 请求，携带有效 JWT 且响应返回后写入 user_access_logs。",
-            "API 请求日累计（user_usage_daily）：仅 viewer，每次成功鉴权的客户端相关接口调用 +1（自然日按北京时间）。",
+            "API 请求按自然日累计，仅统计 viewer：每次携带 JWT 并成功鉴权的接口调用记 1 次（同一页面多次接口会计多次）。",
             "前端若在请求头附带 X-Device-Token，会同步刷新对应设备的最近活跃时间，便于观察黏性。",
-            "访问明细见用户管理 → 用户详情 → 客户端浏览记录。",
+            "访问令牌有效期为单次登录可持有的最长时间，不等于实际在线时长；真实活跃强度可看上方 API 请求量。",
+            "各角色按请求路径的访问明细在用户管理 → 用户详情中查看（表 user_access_logs）。",
         ],
     }
 
@@ -5653,105 +5176,6 @@ def admin_access_overview(
         "client_allow_register": _client_register_allowed(db),
         "client_contact_enabled": _client_contact_enabled(db),
         "client_feedback_enabled": _client_feedback_enabled(db),
-    }
-
-
-@app.get("/api/admin/scheduled-update-settings")
-def admin_get_scheduled_update_settings(
-    user=Depends(require_roles("admin", "editor")),
-):
-    from app.scheduled_update_config import (
-        next_daily_update_run_iso,
-        scheduled_update_config_payload,
-    )
-
-    return {
-        "ok": True,
-        **scheduled_update_config_payload(
-            next_run_at=next_daily_update_run_iso(scheduler),
-        ),
-    }
-
-
-@app.post("/api/admin/scheduled-update-settings")
-def admin_save_scheduled_update_settings(
-    payload: dict,
-    request: Request,
-    user=Depends(require_roles("admin")),
-    db: Session = Depends(get_session),
-):
-    from app.boot import reschedule_daily_update_job
-    from app.scheduled_update_config import (
-        DAILY_JOB_CRON_KEY,
-        RESTART_AUTO_UPDATE_KEY,
-        SCHEDULED_UPDATE_MAX_ATTEMPTS_KEY,
-        SCHEDULED_UPDATE_RETRY_SLEEP_KEY,
-        build_daily_job_cron,
-        next_daily_update_run_iso,
-        restart_auto_update_enabled,
-        scheduled_update_config_payload,
-    )
-
-    p = payload or {}
-    detail_audit: dict[str, Any] = {}
-    if any(k in p for k in ("hour", "minute", "weekdays", "daily_job_cron")):
-        if "daily_job_cron" in p and str(p.get("daily_job_cron") or "").strip():
-            cron = str(p["daily_job_cron"]).strip()
-        else:
-            wd_raw = p.get("weekdays")
-            weekdays: list[int] = []
-            if isinstance(wd_raw, list):
-                for x in wd_raw:
-                    try:
-                        weekdays.append(int(x))
-                    except (TypeError, ValueError):
-                        pass
-            if not weekdays:
-                weekdays = list(range(5))
-            cron = build_daily_job_cron(
-                p.get("minute", 0),
-                p.get("hour", 17),
-                weekdays,
-            )
-        _site_setting_upsert(db, DAILY_JOB_CRON_KEY, cron)
-        detail_audit["daily_job_cron"] = cron
-    if "max_attempts" in p:
-        try:
-            n = max(1, min(20, int(p.get("max_attempts") or 5)))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="max_attempts invalid")
-        _site_setting_upsert(db, SCHEDULED_UPDATE_MAX_ATTEMPTS_KEY, str(n))
-        detail_audit["max_attempts"] = n
-    if "retry_sleep_sec" in p:
-        try:
-            sec = max(1, min(600, int(p.get("retry_sleep_sec") or 8)))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="retry_sleep_sec invalid")
-        _site_setting_upsert(db, SCHEDULED_UPDATE_RETRY_SLEEP_KEY, str(sec))
-        detail_audit["retry_sleep_sec"] = sec
-    if "restart_auto_update" in p:
-        raw_ra = p.get("restart_auto_update")
-        if isinstance(raw_ra, str):
-            ra_on = raw_ra.strip().lower() not in ("0", "false", "no", "off", "")
-        else:
-            ra_on = bool(raw_ra)
-        _site_setting_upsert(db, RESTART_AUTO_UPDATE_KEY, "1" if ra_on else "0")
-        detail_audit["restart_auto_update"] = ra_on
-    if detail_audit:
-        _audit_log(
-            db,
-            action="admin_scheduled_update_settings",
-            actor_user_id=user.get("id"),
-            detail=detail_audit,
-            request=request,
-        )
-        db.commit()
-        reschedule_daily_update_job(scheduler, _scheduled_update)
-    return {
-        "ok": True,
-        **scheduled_update_config_payload(
-            next_run_at=next_daily_update_run_iso(scheduler),
-        ),
     }
 
 
@@ -6014,11 +5438,10 @@ def admin_user_detail(
 
     acc_rows = db.execute(
         text(
-            f"""
+            """
             SELECT created_at, path, method, status_code
             FROM user_access_logs
             WHERE user_id=:uid
-              AND {client_access_path_sql_where("path")}
             ORDER BY id DESC
             LIMIT 100
             """
@@ -6027,65 +5450,10 @@ def admin_user_detail(
     ).mappings().all()
     access_logs = [dict(r) for r in acc_rows]
 
-    usage_rows = db.execute(
-        text(
-            f"""
-            SELECT usage_date, api_requests
-            FROM user_usage_daily
-            WHERE user_id=:uid
-              AND usage_date >= {sql_curdate_days_ago(29)}
-            ORDER BY usage_date DESC
-            """
-        ),
-        {"uid": user_id},
-    ).mappings().all()
-    usage_daily = [dict(r) for r in usage_rows]
-    client_req_total = db.execute(
-        text(
-            f"""
-            SELECT COUNT(*) AS c
-            FROM user_access_logs
-            WHERE user_id=:uid
-              AND {client_access_path_sql_where("path")}
-            """
-        ),
-        {"uid": user_id},
-    ).mappings().first()
-    client_req_7d = db.execute(
-        text(
-            f"""
-            SELECT COUNT(*) AS c
-            FROM user_access_logs
-            WHERE user_id=:uid
-              AND created_at >= {sql_days_ago(6)}
-              AND {client_access_path_sql_where("path")}
-            """
-        ),
-        {"uid": user_id},
-    ).mappings().first()
-    usage_sum_7d_row = db.execute(
-        text(
-            f"""
-            SELECT COALESCE(SUM(api_requests), 0) AS c
-            FROM user_usage_daily
-            WHERE user_id=:uid
-              AND usage_date >= {sql_curdate_days_ago(6)}
-            """
-        ),
-        {"uid": user_id},
-    ).mappings().first()
-    client_activity = {
-        "request_total": int((client_req_total or {}).get("c") or 0),
-        "requests_last_7d": int((client_req_7d or {}).get("c") or 0),
-        "usage_daily": usage_daily,
-        "usage_sum_7d": int((usage_sum_7d_row or {}).get("c") or 0),
-    }
-
     return {
         "user": base,
         "devices": devices,
         "access_logs": access_logs,
-        "client_activity": client_activity,
         "login_events": login_events,
         "login_stats": {
             "fail_24h": int(agg_d.get("fail_24h") or 0),

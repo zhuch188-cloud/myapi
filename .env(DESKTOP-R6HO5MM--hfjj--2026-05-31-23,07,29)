@@ -1,0 +1,40 @@
+APP_NAME=Strategy Showcase (Python)
+HOST=0.0.0.0
+PORT=8000
+JWT_SECRET=replace-this-in-prod
+ACCESS_TOKEN_EXPIRE_MINUTES=10080
+
+SERVER_UPLOAD_ROOT=./server-data
+
+TURSO_DATABASE_URL=libsql://supplementcompanyprofiles-zhuch188-cloud.aws-us-west-2.turso.io
+TURSO_AUTH_TOKEN=eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3Nzg5MTI4NjQsImlkIjoiMDE5ZTJlZjgtZWEwMS03Y2I3LTg0ZTMtYjg5MTljMzVhNDE2IiwicmlkIjoiYTI0MzE2NDMtZTQyMy00NTE3LTg2MzEtOTU1NjhhYmZhN2RhIn0.ZareVuqHBCv5uUfV_RsL23konjTeP-UB5UG5Ymq7HM2-bPI_Sy9pNxGjOFNzYzPVNWh1yGlGxh61nD4AnWoDDQ
+# 本地嵌入式副本（同步到 Turso）；留空则纯远程。路径建议纯 ASCII。
+TURSO_LOCAL_REPLICA=
+
+STRATEGY_ROOT_DIR=D:\360云盘\指数部\展示项目\financial-product-bs\server-data
+DAILY_JOB_CRON=0 17 * * 0-4
+
+# 远程 Wind（SQL Server / WindDB）
+WIND_SQLSERVER_SERVER=111.229.130.90,16555
+WIND_SQLSERVER_DATABASE=winddb
+WIND_SQLSERVER_USER=hffund
+WIND_SQLSERVER_PASSWORD="HfFund2025#"
+WIND_SQLSERVER_DRIVER=ODBC Driver 17 for SQL Server
+
+# 忘记密码邮件 —— 网易 163（发件仅用 SMTP；POP3/IMAP 给 Outlook 收信用）
+# POP3: pop.163.com（SSL）  IMAP: imap.163.com（SSL）  SMTP: smtp.163.com（SSL）
+# SMTP_PASSWORD 须填 163「客户端授权码」，不是网页登录密码（需在邮箱设置里开启 SMTP/POP/IMAP 并生成授权码）
+SMTP_HOST=smtp.163.com
+SMTP_PORT=465
+SMTP_USE_SSL=true
+SMTP_USE_TLS=false
+SMTP_USER=zhuxdong@163.com
+SMTP_PASSWORD=YFuZ7m4th3rXR2rz
+SMTP_FROM_ADDR=zhuxdong@163.com
+# PASSWORD_RESET_PUBLIC_BASE_URL=https://你的对外域名
+
+# 火山方舟 Ark（豆包 doubao-seed 2.0 mini 等，推理接入点 ep-xxx）
+ARK_API_KEY=ark-02f7ba06-dd5e-453b-9f89-a899013a0b58-5be6b
+ARK_MODEL=ep-20260503233446-p4d2p
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+

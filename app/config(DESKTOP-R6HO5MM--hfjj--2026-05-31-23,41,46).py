@@ -45,14 +45,7 @@ class Settings(BaseSettings):
     # RUNNING 超过该分钟数且 progress_at 未更新，视为僵死，可续传
     supplement_import_stale_running_minutes: int = 12
     # 定时数据更新：分 时 日 月 星期（APScheduler：星期一=0，周一至周五为 0-4；触发时区见 app.timeutil.BEIJING_TZ）
-    # 可在后台首页仪表盘覆盖写入 site_settings；未配置时用此默认值
     daily_job_cron: str = "0 17 * * 0-4"
-    # 单次定时触发内失败后的重试次数（含首次）；间隔见 scheduled_update_retry_sleep_sec
-    scheduled_update_max_attempts: int = 5
-    scheduled_update_retry_sleep_sec: int = 8
-    # 服务重启前若有进行中的 strategy_update_jobs，启动后延迟 N 秒自动重新 run_update
-    restart_auto_update_enabled: bool = True
-    restart_auto_update_delay_sec: int = 15
     # 火山方舟（豆包等）：个股 AI 摘要等使用。ARK_MODEL 为控制台「推理接入点」ID（ep-xxx）或模型名
     ark_api_key: str = ""
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
@@ -90,53 +83,34 @@ class Settings(BaseSettings):
     wind_eod_stock_chunk: int = 0
     # 低内存：数据更新按「每个调仓期 × 该期成分股小批」拉 EOD 并立即落库（峰值≈单期持仓，Wind 重复读可接受）
     update_eod_per_rebalance_chunk: bool = True
-    # 策略 Excel 导入：持仓 UPSERT 批大小（低内存自动压至 ≤200）
+    # 策略 Excel 导入：持仓 UPSERT 批大小（减少逐行往返）
     strategy_import_position_batch_size: int = 500
-    # 大 Excel：openpyxl 流式 + 只读必要列（Render 512MB 务必开启）
+    # 大 Excel（如沪深300增强）：openpyxl 流式读行，避免整表进 pandas（阶段1 导入）
     strategy_excel_streaming_import: bool = True
-    # 文件大于该 MB 时启用流式；0= xlsx/xlsm 始终流式
+    # 文件大于该 MB 时启用流式导入；0=始终流式
     strategy_excel_streaming_min_mb: int = 0
-    # 流式每批行数；Render 建议 200～400（默认 600，低内存自动 ≤200）
-    strategy_excel_import_row_batch: int = 600
-    # 策略 Excel 只读前 N 列（标准模板 A～E：日期/代码/持仓权重/行业权重/分类或调仓频率）
-    strategy_excel_read_max_col: int = 5
+    # 流式 Excel 每批行数；Render 低内存建议 200～500（默认随 wind_low_memory_mode 自动缩小）
+    strategy_excel_import_row_batch: int = 2500
     # 净值重建：每 N 个交易日落库一批（仅阶段2 nav_accum；不减小 day_map 峰值）
     nav_rebuild_persist_chunk: int = 400
     # 低内存下分段拉 Wind EOD 算净值（避免全区间 day_map 一次驻留）
     nav_rebuild_year_segments: bool = True
-    # 日常增量净值：末净值日×本金 bootstrap，仅补写之后交易日；失败不回退全量重放
+    # 日常增量净值：以库内最后净值日对应调仓期为锚，自该期首交易日起拉 Wind 并补之后各日
     nav_incremental_from_current_period: bool = True
-    # 增量模拟交易日数 ≤ 该值时不分段拉 EOD（仅拉 append 日～最新日）
-    nav_incremental_max_sim_days: int = 31
     # 日常增量持仓：开放调仓期 EOD 自行情日向前日历天数（默认 110，覆盖约 60 个交易日）
     holding_eod_lookback_calendar_days: int = 110
     # 持仓 5/20/60 日指标从 EOD 序列取的最近 K 线根数（日常增量默认 65）
     holding_eod_desc_max_bars: int = 65
-    # 日常净值 reconcile：仅校验最近 N 个调仓期（新增调仓只影响尾部；避免 125 期×每日点查）
-    nav_reconcile_recent_rebalance_periods: int = 3
     # 净值 EOD 动态分段：最新一期成分股数 × 每段月数 <= budget（阶段2 开算前按 CL1 最新期成分重算）
     nav_rebuild_stock_month_budget: int = 300
-    # Render 上小预算会把 150 只左右策略切成 1 月/段，Wind 往返过多；用温和下限减少分段数。
-    nav_rebuild_stock_month_budget_floor: int = 360
     # 动态月数上限（0=不设顶，仅受 budget 约束）；对应环境变量 NAV_REBUILD_EOD_MONTHS_MAX
     nav_rebuild_eod_months_max: int = 0
     # 兼容旧配置：>0 且未设 MAX 时作为动态月数上限；不再固定为每段 1 个月
     nav_rebuild_eod_months: int = 0
     # 启动时跳过 Turso 日期格式一次性迁移（OOM 时可先 true 让服务起来，再本地跑 normalize_turso_dates.py）
-    skip_startup_date_normalization: bool = True
+    skip_startup_date_normalization: bool = False
     # 管理端 API 等待 Turso 流锁的最长时间（秒）；全量同步跑净值时其它接口可能排队
     turso_stream_lock_api_timeout_seconds: int = 90
-    # viewer 日活 API 计数写入间隔（秒）；0=每次带 JWT 的客户端接口调用均 +1
-    viewer_usage_write_interval_seconds: int = 0
-    viewer_device_seen_write_interval_seconds: int = 600
-    # 补充数据导入进度每 N 批写一次，避免远程库进度刷新造成写放大
-    supplement_import_progress_every_batches: int = 4
-    # 策略 Excel 导入：每 N 批写一次进度/checkpoint（降低 Turso 请求频率）
-    strategy_import_progress_every_batches: int = 8
-    # 单批 UPSERT 失败时最大重试次数
-    strategy_import_batch_retry: int = 5
-    # Excel/库内行数达到该阈值：跳过续传前全表 heal、跳过结束时盲补写；校验复用导入扫描缓存（少遍读 Excel）
-    strategy_import_heavy_row_threshold: int = 8000
 
 
 settings = Settings()

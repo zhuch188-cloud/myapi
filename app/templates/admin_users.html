@@ -97,7 +97,7 @@
           </select>
           <button onclick="loadUsers()">查询</button>
           <span id="msg" class="muted"></span>
-          <span class="muted" style="font-size:12px;">列表「页面请求次数」为 <code>user_access_logs</code> 累计条数（携带有效 JWT、响应返回后写入，与详情中 HTTP 访问一致）。</span>
+          <span class="muted" style="font-size:12px;">列表「客户端浏览次数」统计策略/净值/持仓等客户端 API 请求（携带有效 JWT，响应返回后写入）。</span>
         </div>
         <div class="scroll"><table id="tb"></table></div>
       </div>
@@ -202,6 +202,20 @@
             `7d 失败 ${stats.fail_7d ?? 0} / 成功 ${stats.success_7d ?? 0}；` +
             `30d 失败 ${stats.fail_30d ?? 0}`
           );
+          const ca = d.client_activity || {};
+          html += kv("客户端活跃",
+            `累计浏览 ${ca.request_total ?? 0} 次；近7日浏览 ${ca.requests_last_7d ?? 0} 次；` +
+            `近7日 API 计数 ${ca.usage_sum_7d ?? 0}`
+          );
+          const usageDaily = ca.usage_daily || [];
+          if (usageDaily.length) {
+            html += `<div class="section-title">近30日 API 日计数</div>`;
+            html += `<div class="scroll"><table class="detail-table"><thead><tr><th>日期</th><th>请求数</th></tr></thead><tbody>`;
+            usageDaily.forEach(row => {
+              html += `<tr><td>${esc(row.usage_date)}</td><td>${esc(row.api_requests ?? 0)}</td></tr>`;
+            });
+            html += `</tbody></table></div>`;
+          }
           html += kv("最近轨迹时间",
             `最近成功 ${esc(stats.last_success_login_event_at || "-")}；最近失败 ${esc(stats.last_fail_login_event_at || "-")}`
           );
@@ -224,8 +238,8 @@
             </tr>`;
           });
           html += `</tbody></table></div>`;
-          html += `<div class="section-title">HTTP 访问（最近 100 条）</div>`;
-          html += `<p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45;">携带有效 JWT 的接口与页面请求（响应返回后写入）；不展示 IP/UA，避免与上方设备表、下方登录轨迹重复。</p>`;
+          html += `<div class="section-title">客户端浏览记录（最近 100 条）</div>`;
+          html += `<p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45;">策略列表、净值、持仓、个股、关注、联系与反馈等客户端 API；携带有效 JWT，响应返回后写入。</p>`;
           html += `<div class="scroll"><table class="detail-table"><thead><tr>
             <th>时间</th><th>方法</th><th>路径</th><th>状态</th>
           </tr></thead><tbody>`;
@@ -296,7 +310,7 @@
           document.getElementById("tb").innerHTML = `
             <thead><tr>
               <th>ID</th><th>用户名</th><th>昵称</th><th>手机</th><th>邮箱</th><th>角色</th><th>状态</th><th>系统密码</th>
-              <th>改密时间</th><th>最近登录</th><th>IP</th><th>页面请求次数</th><th>操作</th>
+              <th>改密时间</th><th>最近登录</th><th>IP</th><th>客户端浏览次数</th><th>操作</th>
             </tr></thead>
             <tbody>${items.map(i => `<tr>
               <td>${i.id}</td><td>${esc(i.username)}</td><td>${esc(i.nickname || "-")}</td>
@@ -304,7 +318,7 @@
               <td>${esc(i.role)}</td><td>${esc(i.status)}</td>
               <td>${Number(i.password_is_system_generated) ? "是" : "否"}</td>
               <td>${i.password_changed_at || "-"}</td><td>${i.last_login_at || "-"}</td>
-              <td>${i.last_login_ip || "-"}</td><td>${i.page_request_count ?? 0}</td>
+              <td>${i.last_login_ip || "-"}</td><td>${i.client_request_count ?? i.page_request_count ?? 0}</td>
               <td>
                 <button class="secondary" onclick="openDetail(${i.id})">详情</button>
                 <button class="secondary" onclick="setStatus(${i.id},'active')">启用</button>

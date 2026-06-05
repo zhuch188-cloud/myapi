@@ -1,0 +1,44 @@
+{# 客户端页专用：fetch 错误脱敏，不展示服务商/路径/IP/邮箱等 #}
+window.__FP_CLIENT_SURFACE__ = true;
+function sanitizeClientMessage(raw) {
+  const fb = "操作未能完成，请稍后重试。若持续失败请联系管理员。";
+  if (raw == null) return fb;
+  let s = String(raw).trim();
+  if (!s) return fb;
+  const low = s.toLowerCase();
+  const bad = [
+    "turso", "libsql", "hrana", "sqlalchemy", "odbc", "sql server", "winddb", "wind_sql",
+    "render.com", "smtp", "server-data", "traceback", "savepoint", "sqlite error",
+    "operationalerror", "connection refused", "18456", "msodbcsql", "volces", "ark.cn",
+    "auth_token", "jwt_secret", ":\\\\", "/users/", "/home/", ".xlsx", ".env"
+  ];
+  if (bad.some((k) => low.includes(k))) return fb;
+  s = s.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gi, "[已隐藏]");
+  s = s.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[已隐藏]");
+  s = s.replace(/https?:\/\/[^\s"'<>]+/gi, "[链接已隐藏]");
+  if (s.length > 200) s = s.slice(0, 200) + "…";
+  return s || fb;
+}
+function formatFetchError(err) {
+  const raw = err && err.message != null ? String(err.message) : String(err || "");
+  if (raw.indexOf("无法连上本服务（浏览器未收到有效响应）") !== -1) {
+    return sanitizeClientMessage(raw);
+  }
+  const low = raw.trim().toLowerCase();
+  if (
+    low === "failed to fetch" ||
+    low === "typeerror: failed to fetch" ||
+    low.includes("networkerror when attempting to fetch") ||
+    low.includes("load failed")
+  ) {
+    return "无法连接服务，请检查网络后重试。";
+  }
+  if (/^\s*\{/.test(raw) || /"detail"\s*:/.test(raw)) {
+    try {
+      const j = JSON.parse(raw);
+      if (j && j.detail) return sanitizeClientMessage(j.detail);
+    } catch (e) {}
+  }
+  return sanitizeClientMessage(raw);
+}
+{% include 'partials/js_fetch_err_sliding_token.html' %}

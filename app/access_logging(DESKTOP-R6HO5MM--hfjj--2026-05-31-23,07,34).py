@@ -1,4 +1,4 @@
-"""JWT 鉴权请求的访问日志（管理端操作 + 客户端浏览 API）。"""
+"""JWT 鉴权请求的访问日志（管理员在「访问日志」页查看）。"""
 from __future__ import annotations
 
 import logging
@@ -24,51 +24,7 @@ _SKIP_PATHS: frozenset[str] = frozenset(
 _SKIP_PREFIXES: tuple[str, ...] = (
     "/static/",
     "/api/public/",
-    "/health",
-    "/api/admin/import-jobs",
-    "/api/admin/sync-jobs",
-    "/api/admin/update-jobs",
 )
-
-# 客户端浏览相关 API（携带 JWT 的 viewer 活跃统计与明细）
-_CLIENT_LOG_PREFIXES: tuple[str, ...] = (
-    "/api/strategies",
-    "/api/client/",
-)
-_CLIENT_LOG_EXACT: frozenset[str] = frozenset(
-    {
-        "/api/auth/me",
-        "/api/auth/profile",
-    }
-)
-
-
-def is_client_browse_path(path: str) -> bool:
-    p = path or ""
-    if p in _CLIENT_LOG_EXACT:
-        return True
-    for prefix in _CLIENT_LOG_PREFIXES:
-        if p.startswith(prefix):
-            return True
-    return False
-
-
-def client_access_path_sql_where(column: str = "path") -> str:
-    """生成 SQL 片段：匹配客户端浏览路径（含带 query 的 path）。"""
-    parts: list[str] = []
-    for prefix in _CLIENT_LOG_PREFIXES:
-        esc = prefix.replace("'", "''")
-        parts.append(f"{column} LIKE '{esc}%'")
-    for exact in sorted(_CLIENT_LOG_EXACT):
-        esc = exact.replace("'", "''")
-        parts.append(f"({column} = '{esc}' OR {column} LIKE '{esc}?%')")
-    return "(" + " OR ".join(parts) + ")"
-
-
-def _should_log_path(path: str) -> bool:
-    if path.startswith("/api/admin") or path.startswith("/admin"):
-        return True
-    return is_client_browse_path(path)
 
 
 def _client_ip(request: Request) -> str:
@@ -156,8 +112,6 @@ class UserAccessLogMiddleware(BaseHTTPMiddleware):
             if request.method == "OPTIONS":
                 return response
             path = request.url.path or ""
-            if not _should_log_path(path):
-                return response
             if _should_skip_path(path):
                 return response
             auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
@@ -207,8 +161,4 @@ class UserAccessLogMiddleware(BaseHTTPMiddleware):
         return response
 
 
-__all__ = [
-    "UserAccessLogMiddleware",
-    "client_access_path_sql_where",
-    "is_client_browse_path",
-]
+__all__ = ["UserAccessLogMiddleware"]

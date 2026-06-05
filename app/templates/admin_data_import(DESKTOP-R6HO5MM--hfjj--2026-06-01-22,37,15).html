@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_name }} - 数据导入</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1b2430; }
+      .container { max-width: 1300px; margin: 0 auto; padding: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(20,33,61,.08); }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      input, button, select, textarea { padding: 8px 10px; border: 1px solid #ccd3de; border-radius: 8px; }
+      textarea { width: min(920px, 100%); min-height: 64px; font-family: inherit; }
+      button { background: #2463eb; color: #fff; border: none; cursor: pointer; }
+      button.secondary { background: #667085; }
+      .muted { color: #667085; }
+      .nav a { margin-right: 12px; color: #2463eb; text-decoration: none; font-weight: 600; }
+      .row.nav { width: 100%; box-sizing: border-box; background: #edf3ff; border: 1px solid #dbe6ff; }
+      button.logout-soft {
+        margin-left: auto; padding: 6px 12px; border-radius: 8px; border: 1px solid #e2e8f0;
+        background: #f1f5f9; color: #94a3b8; font-size: 13px; cursor: pointer;
+      }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid #e9eef5; padding: 6px; text-align: left; }
+      .scroll { overflow-x: auto; }
+      td.msg-cell { white-space: normal; word-break: break-word; max-width: 420px; }
+      th[title] { cursor: help; text-decoration: underline dotted #94a3b8; text-underline-offset: 2px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card row nav">
+        <strong>后台管理</strong>
+        <a href="/admin">首页仪表盘</a>
+        <a href="/admin/strategies">策略配置</a>
+        <a href="/admin/holdings">持仓与更新</a>
+        <a href="/admin/nav-check">净值</a>
+        <a href="/admin/data-import">数据导入</a>
+        <a href="/admin/users">用户管理</a>
+        <a href="/admin/client-messages">留言管理</a>
+        <button type="button" class="logout-soft" onclick="logout()">退出</button>
+        <span id="profile" class="muted"></span>
+      </div>
+      <div class="card">
+        <h4 style="margin:0 0 8px">补充数据导入</h4>
+        <p class="muted" style="margin:0 0 10px">
+          支持 <strong>.xlsx / .xls / .xlsm / .csv</strong>。任务在<strong>后台</strong>执行。
+          <strong>已扫行</strong> = 文件读到第几行；<strong>写入成功</strong> = 唯一键有效且已入库（≠ 库表总行数，相同键只更新）。
+          纯远程 Turso 时单批写入约 0.5～2 分钟，<strong>已扫行/写入成功 暂时不变属正常</strong>，摘会出现「正在写入远程库…」。
+          超过约 12 分钟仍无变化会被标为 <code>FAILED</code>，可点<strong>续传</strong>；若不再继续可点<strong>放弃</strong>，该批次不可续传。
+          Render 部署请配置 <code>SERVER_UPLOAD_ROOT</code>，先上传再导入（同区写 Turso）。
+        </p>
+        <div class="row">
+          <label>① 上传</label>
+          <input id="supplementUploadFile" type="file" accept=".xlsx,.xls,.xlsm,.csv" style="display:none" />
+          <button type="button" class="secondary" onclick="document.getElementById('supplementUploadFile').click()">选择文件</button>
+          <button type="button" class="secondary" onclick="uploadSupplementToServer()">上传到服务器（覆盖）</button>
+          <span id="serverFileStatus" class="muted"></span>
+        </div>
+        <div class="row">
+          <label>导入类型</label>
+          <select id="defCode" onchange="onDefinitionChange()"></select>
+          <button type="button" class="secondary" onclick="fillDefaultPath()">填入路径</button>
+        </div>
+        <div class="row" style="margin-top:8px;align-items:flex-start">
+          <label style="padding-top:8px">② 路径</label>
+          <textarea id="filePath" placeholder="留空则优先读服务器已上传文件；本机开发可填本地绝对路径"></textarea>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label>唯一键列</label>
+          <input id="uniqueCol" style="min-width:320px" placeholder="与文件表头一致；多列用英文逗号分隔，如 证券代码,公告日期" />
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button type="button" onclick="runImport()">开始导入</button>
+          <button type="button" class="secondary" onclick="loadAll()">刷新列表</button>
+          <span id="runMsg" class="muted"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h4 style="margin:0 0 8px">已注册导入项</h4>
+        <div class="scroll"><table id="defTb"></table></div>
+      </div>
+      <div class="card">
+        <h4 style="margin:0 0 4px">最近批次</h4>
+        <p class="muted" style="margin:0 0 8px;font-size:12px;line-height:1.45">
+          列「已扫行」与「写入成功」可能相差很大（大量行唯一键为空会计入「跳过」）。卡在某一数字时先看摘要是否含「正在写入远程库」。
+        </p>
+        <div class="scroll"><table id="batchTb"></table></div>
+      </div>
+    </div>
+    <script>
+{% include 'partials/js_fetch_err.html' %}
+      let token = localStorage.getItem("token") || "";
+      let definitions = [];
+      let serverUploadEnabled = false;
+      function authHeaders(extra = {}) { return { ...extra, ...(token ? { Authorization: "Bearer " + token } : {}) }; }
+      function ensureAuth() { if (!token) location.href = "/admin-login"; }
+      function logout() { localStorage.removeItem("token"); localStorage.removeItem("profile"); localStorage.removeItem("device_token"); location.href = "/admin-login"; }
+      function esc(s) {
+        return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      }
+      function formatBatchStatusLine(b, batchId) {
+        const st = String(b.status || "");
+        const rr = Number(b.resume_from_row || 0);
+        const rt = b.rows_total != null ? Number(b.rows_total) : null;
+        const ok = b.rows_ok ?? 0;
+        const fail = b.rows_fail ?? 0;
+        const scan = rt != null ? `${rr}/${rt}` : String(rr);
+        const tail = (b.message || "").trim();
+        let line = `批次 #${batchId} · ${st} · 已扫行 ${scan} · 写入成功 ${ok} · 跳过 ${fail}`;
+        if (st === "RUNNING" && tail.includes("正在写入远程库")) {
+          line += " · 远程写入中（请等待 1～2 分钟）";
+        }
+        if (tail) line += ` — ${tail.slice(0, 160)}`;
+        return line;
+      }
+      async function api(path, options = {}) {
+        const opts = { ...options };
+        const h = authHeaders(opts.headers || {});
+        if (opts.body && typeof opts.body === "string" && !h["Content-Type"]) {
+          h["Content-Type"] = "application/json";
+        }
+        let res;
+        try {
+          res = await fetch(path, { ...opts, headers: h });
+        } catch (e) {
+          throw new Error(formatFetchError(e));
+        }
+        const raw = await res.text();
+        let body = null;
+        try { body = raw ? JSON.parse(raw) : null; } catch (_) { body = { detail: raw }; }
+        if (!res.ok) {
+          const d = (body && body.detail) ? body.detail : raw || `HTTP ${res.status}`;
+          throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+        }
+        return body;
+      }
+      function fillDefSelect() {
+        const sel = document.getElementById("defCode");
+        sel.innerHTML = (definitions || []).map(d => {
+          const dis = Number(d.enabled) ? "" : "（已禁用）";
+          return `<option value="${esc(d.code)}">${esc(d.display_name || d.code)}${dis}</option>`;
+        }).join("") || `<option value="">（无）</option>`;
+      }
+      function defaultUniqueColFromMeta(d) {
+        if (!d || !d.meta_json) return "";
+        const m = d.meta_json;
+        if (Array.isArray(m.unique_source_columns) && m.unique_source_columns.length)
+          return m.unique_source_columns.join(",");
+        if (m.unique_source_column) return String(m.unique_source_column);
+        return "";
+      }
+      function displayUniqueColMeta(x) {
+        const m = x.meta_json;
+        if (!m) return "（自动）";
+        if (Array.isArray(m.unique_source_columns) && m.unique_source_columns.length)
+          return esc(m.unique_source_columns.join("，"));
+        if (m.unique_source_column && String(m.unique_source_column).trim())
+          return esc(String(m.unique_source_column));
+        return "（自动）";
+      }
+      function fillDefaultPath() {
+        const code = (document.getElementById("defCode").value || "").trim();
+        const d = (definitions || []).find(x => x.code === code);
+        const p = (d && (d.effective_default_path || d.default_file_path)) || "";
+        document.getElementById("filePath").value = p;
+      }
+      function formatServerFileHint(sf) {
+        if (!sf) return "服务器上尚无文件，请先上传";
+        return `服务器文件：${sf.size_mb} MB · 更新于 ${sf.modified_at || "-"}`;
+      }
+      async function refreshServerFileStatus() {
+        const el = document.getElementById("serverFileStatus");
+        const code = (document.getElementById("defCode").value || "").trim();
+        if (!code) { el.textContent = ""; return; }
+        try {
+          const d = await api("/api/admin/data-import/server-file?code=" + encodeURIComponent(code));
+          el.textContent = formatServerFileHint(d.file);
+        } catch (e) {
+          el.textContent = formatFetchError(e);
+        }
+      }
+      async function uploadSupplementToServer() {
+        const msg = document.getElementById("runMsg");
+        const code = (document.getElementById("defCode").value || "").trim();
+        const ipt = document.getElementById("supplementUploadFile");
+        const f = ipt.files && ipt.files[0];
+        if (!code) { msg.textContent = "请选择导入类型"; return; }
+        if (!f) { msg.textContent = "请先选择文件"; return; }
+        const fd = new FormData();
+        fd.append("code", code);
+        fd.append("file", f);
+        try {
+          msg.textContent = "上传中…";
+          const res = await fetch("/api/admin/data-import/upload", {
+            method: "POST",
+            headers: authHeaders({}),
+            body: fd,
+          });
+          const raw = await res.text();
+          let body = null;
+          try { body = raw ? JSON.parse(raw) : null; } catch (_) { body = { detail: raw }; }
+          if (!res.ok) throw new Error((body && body.detail) || raw || `HTTP ${res.status}`);
+          document.getElementById("filePath").value = body.path || "";
+          msg.textContent = `已上传并覆盖：${body.path || ""}`;
+          await loadDefinitions();
+          await refreshServerFileStatus();
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      async function loadDefinitions() {
+        const d = await api("/api/admin/data-import/definitions");
+        definitions = d.items || [];
+        serverUploadEnabled = !!d.server_upload_enabled;
+        fillDefSelect();
+        const rows = definitions.map(x => {
+          return `<tr>
+          <td>${esc(x.code)}</td>
+          <td>${esc(x.display_name)}</td>
+          <td class="msg-cell">${esc(x.effective_default_path || x.default_file_path || "-")}${x.server_file ? `<br/><span class="muted">已上传 ${x.server_file.size_mb}MB</span>` : ""}</td>
+          <td>${displayUniqueColMeta(x)}</td>
+          <td>${Number(x.enabled) ? "是" : "否"}</td>
+          <td class="msg-cell">${esc(x.description || "-")}</td>
+        </tr>`;
+        }).join("");
+        document.getElementById("defTb").innerHTML = `
+          <thead><tr><th>代码</th><th>名称</th><th>默认路径</th><th>默认唯一键列</th><th>启用</th><th>说明</th></tr></thead>
+          <tbody>${rows || "<tr><td colspan='6' class='muted'>暂无</td></tr>"}</tbody>`;
+        if (definitions.length && !(document.getElementById("filePath").value || "").trim()) {
+          fillDefaultPath();
+        }
+        onDefinitionChange();
+        await refreshServerFileStatus();
+      }
+      function onDefinitionChange() {
+        fillDefaultPath();
+        const code = (document.getElementById("defCode").value || "").trim();
+        const d = (definitions || []).find(x => x.code === code);
+        document.getElementById("uniqueCol").value = defaultUniqueColFromMeta(d);
+        refreshServerFileStatus();
+      }
+      const TERMINAL_BATCH = new Set(["SUCCESS", "FAILED", "ABANDONED"]);
+
+      async function resumeBatch(batchId) {
+        const msg = document.getElementById("runMsg");
+        try {
+          const ret = await api(`/api/admin/data-import/batches/${batchId}/resume`, { method: "POST" });
+          msg.textContent = ret.message || `批次 #${batchId} 续传已提交`;
+          await pollBatchUntilDone(batchId);
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      async function abandonBatch(batchId) {
+        if (!confirm(`确定放弃批次 #${batchId}？放弃后不可续传。`)) return;
+        const msg = document.getElementById("runMsg");
+        try {
+          const ret = await api(`/api/admin/data-import/batches/${batchId}/abandon`, { method: "POST" });
+          msg.textContent = ret.message || `批次 #${batchId} 已放弃`;
+          await loadBatches();
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      let highlightBatchId = 0;
+
+      async function fetchBatchById(batchId) {
+        const d = await api("/api/admin/data-import/batches?limit=80");
+        return (d.items || []).find(b => Number(b.id) === Number(batchId)) || null;
+      }
+
+      async function loadBatches() {
+        const d = await api("/api/admin/data-import/batches?limit=50");
+        const items = d.items || [];
+        document.getElementById("batchTb").innerHTML = `
+          <thead><tr>
+            <th>ID</th><th>类型</th><th>状态</th>
+            <th title="Excel 已扫描到的行号（含唯一键无效、未写入的行）">已扫行</th>
+            <th title="唯一键有效且已 UPSERT 的行数；不等于 supplement_company_profiles 表总行数">写入成功</th>
+            <th title="唯一键为空或拼不出，未写入">跳过</th>
+            <th>时间</th><th>摘要</th><th>操作</th>
+          </tr></thead>
+          <tbody>${items.map(b => {
+            const hi = highlightBatchId && Number(b.id) === Number(highlightBatchId);
+            const rowStyle = hi ? ' style="background:#eef4ff"' : "";
+            const rt = b.rows_total != null ? Number(b.rows_total) : null;
+            const rr = Number(b.resume_from_row || 0);
+            const scanned = rt != null ? `${rr} / ${rt}` : (rr > 0 ? String(rr) : "—");
+            const resumeBtn = b.resumable
+              ? `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px;margin-right:4px" onclick="resumeBatch(${b.id})">续传</button>`
+                + `<button type="button" class="secondary" style="padding:4px 8px;font-size:12px" onclick="abandonBatch(${b.id})">放弃</button>`
+              : "";
+            return `<tr${rowStyle}>
+            <td>${b.id}</td>
+            <td>${esc(b.definition_code)}</td>
+            <td>${esc(b.status)}</td>
+            <td>${esc(scanned)}</td>
+            <td>${b.rows_ok ?? 0}</td>
+            <td>${b.rows_fail ?? 0}</td>
+            <td>${esc(b.created_at)}</td>
+            <td class="msg-cell">${esc((b.message || "").slice(0, 400))}</td>
+            <td>${resumeBtn}</td>
+          </tr>`;
+          }).join("") || "<tr><td colspan='9' class='muted'>暂无批次</td></tr>"}</tbody>`;
+        return items;
+      }
+
+      async function pollBatchUntilDone(batchId) {
+        const msg = document.getElementById("runMsg");
+        highlightBatchId = batchId;
+        const maxTicks = 7200;
+        for (let i = 0; i < maxTicks; i++) {
+          const b = await fetchBatchById(batchId);
+          await loadBatches();
+          if (b) {
+            msg.textContent = formatBatchStatusLine(b, batchId);
+            if (TERMINAL_BATCH.has(String(b.status || ""))) {
+              highlightBatchId = 0;
+              return b;
+            }
+          } else {
+            msg.textContent = `批次 #${batchId} 处理中…`;
+          }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        highlightBatchId = 0;
+        msg.textContent = `批次 #${batchId} 仍在执行；若超过 12 分钟无变化请刷新列表后点续传`;
+        return null;
+      }
+      async function loadAll() {
+        const msg = document.getElementById("runMsg");
+        try {
+          msg.textContent = "加载中…";
+          await loadDefinitions();
+          await loadBatches();
+          msg.textContent = "";
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        }
+      }
+      async function runImport() {
+        const msg = document.getElementById("runMsg");
+        const btn = document.querySelector('button[onclick="runImport()"]');
+        const code = (document.getElementById("defCode").value || "").trim();
+        if (!code) { msg.textContent = "请选择导入类型"; return; }
+        const file_path = (document.getElementById("filePath").value || "").trim();
+        const rawU = (document.getElementById("uniqueCol").value || "").trim();
+        const unique_source_columns = rawU
+          ? rawU.split(/[,，;；]/).map(s => s.trim()).filter(Boolean)
+          : [];
+        msg.textContent = "提交任务…";
+        if (btn) btn.disabled = true;
+        try {
+          const ret = await api("/api/admin/data-import/run", {
+            method: "POST",
+            body: JSON.stringify({ code, file_path, unique_source_columns, background: true }),
+          });
+          if (ret.queued && ret.batch_id) {
+            msg.textContent = ret.message || `批次 #${ret.batch_id} 已入队`;
+            await pollBatchUntilDone(ret.batch_id);
+          } else {
+            msg.textContent = ret.message || JSON.stringify(ret);
+            await loadBatches();
+          }
+        } catch (e) {
+          msg.textContent = formatFetchError(e);
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+      }
+      ensureAuth();
+      const pf = JSON.parse(localStorage.getItem("profile") || "{}");
+      document.getElementById("profile").textContent = `${pf.username || ""} (${pf.role || ""})`;
+      loadAll();
+    </script>
+{% include 'partials/site_disclaimer.html' %}
+  </body>
+</html>
